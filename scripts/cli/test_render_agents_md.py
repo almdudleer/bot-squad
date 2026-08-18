@@ -242,6 +242,94 @@ def test_absolute_ops_path_no_arrow(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Deploy block: the clean-tree gate is PER TARGET (T-0722, from T-0721)
+# ---------------------------------------------------------------------------
+
+# The EXACT two lines the template shipped until T-0722. They are false for any
+# project with a deploy clone (`is_clean_for_target` returns True
+# unconditionally when `uses_deploy_clone(target)`), and this CLI overwrites
+# <repo>/AGENTS.md — so a single manual render used to put the claim back
+# everywhere, looking like "the template restored the canon". These are kept
+# VERBATIM so the test reds on the REVERT, not merely on a wording change.
+_REVERTED_CLAIM_LINES = (
+    "- Queues a deploy. The monitor processes it within ~60s when the tree is clean.",
+    "- Tree clean = `git status --porcelain` empty (logs/cache excluded).",
+)
+# Substrings of it that would survive a re-wrap of those lines.
+_REVERTED_CLAIM_PHRASES = ("when the tree is clean", "Tree clean =")
+
+
+def _deploy_block(rendered: str) -> str:
+    """Slice the '## Deploy' section out of a rendered AGENTS.md."""
+    start = rendered.index("## Deploy")
+    end = rendered.index("Hold deploys without killing the worker", start)
+    return rendered[start:end]
+
+
+def _flat(text: str) -> str:
+    """Whitespace-normalised, so an assertion survives re-wrapping."""
+    return " ".join(text.split())
+
+
+def test_deploy_block_never_reverts_to_the_blanket_clean_tree_claim(tmp_path):
+    """T-0722: the template must not print an unconditional 'processed when the
+    tree is clean' / 'Tree clean = ...' pair again — for either kind of
+    project. Asserted on the fieldless synthetic project AND on watchrobot's
+    real config (the render that would overwrite the file T-0721 fixed)."""
+    cfg = _synthetic_config(tmp_path)
+    _seed_vision(tmp_path, "synthetic")
+    _seed_vision(tmp_path, "watchrobot")
+    renders = {
+        "synthetic": ram.render("synthetic", cfg, tmp_path),
+        "watchrobot": ram.render("watchrobot", _CONFIG_DIR, tmp_path),
+    }
+    for slug, out in renders.items():
+        block = _deploy_block(out)
+        for line in _REVERTED_CLAIM_LINES:
+            assert line not in block, f"{slug}: reverted line {line!r}"
+        for phrase in _REVERTED_CLAIM_PHRASES:
+            assert phrase not in _flat(block), f"{slug}: reverted phrase {phrase!r}"
+
+
+def test_deploy_block_splits_the_gate_by_target(tmp_path):
+    """DoD 1: the gate is stated PER TARGET, naming the code that decides it —
+    so a reader can check their own project instead of trusting a blanket
+    sentence."""
+    cfg = _synthetic_config(tmp_path)
+    _seed_vision(tmp_path, "synthetic")
+    block = _flat(_deploy_block(ram.render("synthetic", cfg, tmp_path)))
+    assert "clean-tree gate is PER TARGET" in block
+    assert "is_clean_for_target" in block
+    assert "uses_deploy_clone(target)" in block
+    # both arms present: gate OFF behind a deploy clone, LIVE for in-place
+    assert "returns `True` UNCONDITIONALLY" in block
+    assert "IN PLACE is the one the gate is live for" in block
+    assert "git merge --ff-only" in block
+    # and the constraint that actually applies behind a deploy clone
+    assert "PUBLICATION, not cleanliness" in block
+
+
+def test_deploy_block_is_true_for_a_project_without_a_deploy_clone(tmp_path):
+    """DoD 1: no watchrobot specifics. The synthetic project has neither
+    `repo_deploy` nor `repo_master`, so its gate is live on EVERY target — the
+    rendered text must say so and must not describe another project's clones,
+    targets or recipe log lines."""
+    cfg = _synthetic_config(tmp_path)
+    _seed_vision(tmp_path, "synthetic")
+    block = _deploy_block(ram.render("synthetic", cfg, tmp_path))
+    flat = _flat(block)
+    assert "neither `repo_deploy` nor `repo_master`" in flat
+    assert "deploys in place on EVERY target" in flat
+    for leaked in ("watchrobot", "signal-tracker", "building in place",
+                   "VCS_REF", "~/watchrobot"):
+        assert leaked not in block, leaked
+    # `staging`/`prod` may appear only as this project's configured targets,
+    # never as the subject of a gate claim.
+    assert "for `staging` it does not exist" not in flat
+    assert "`prod` is the target the gate is live for" not in flat
+
+
+# ---------------------------------------------------------------------------
 # The two REAL projects against the REAL registry
 # ---------------------------------------------------------------------------
 

@@ -329,10 +329,29 @@ full texts under `{ops}/vision/initiatives/`.)
 ## Deploy
 
 `ops/bot-squad-bin/deploy <target> "<reason>"` — targets: {deploy_targets_md}.
-- Queues a deploy. The monitor processes it within ~60s when the tree is clean.
-- Tree clean = `git status --porcelain` empty (logs/cache excluded).
-- TG-pings on success/failure.
-- You don't manage the loop. Commit, squash, request, walk away.
+- Queues a deploy; the monitor picks it up within ~60s. TG-pings on
+  success/failure. You don't manage the loop — commit, squash, request, walk away.
+- **The clean-tree gate is PER TARGET — check yours before you wait on it.**
+  bot-squad's `worker/bot_squad_worker/deploy.py` `is_clean_for_target` returns
+  `True` UNCONDITIONALLY for a target whose recipe runs in a separate,
+  origin-synced deploy clone (`Project.uses_deploy_clone(target)`: exec clone ≠
+  the clone you edit). Deliberate — gating the shared clone HOL-blocked every
+  team's deploy on one team's WIP (T-0225). For such a target a dirty tree,
+  yours or a peer's, delays nothing and is no reason to wait or micro-commit.
+- **A target that deploys IN PLACE is the one the gate is live for**: exec clone
+  = the clone you edit, so `git status --porcelain` must be empty (logs/cache
+  excluded) AND local commits not on origin BLOCK the run — the recipe's
+  `git merge --ff-only` would wipe them. A project with neither `repo_deploy`
+  nor `repo_master` in bot-squad's `config/projects.toml` deploys in place on
+  EVERY target, so there the gate is live everywhere.
+- **Where a deploy clone is used, the real constraint is PUBLICATION, not
+  cleanliness.** The run force-syncs that clone to `origin/{deploy_branch}`, so
+  an unpushed commit is simply OMITTED from the build — a log advisory names it,
+  nothing fails. Ask "is it pushed?", never "is the tree clean?".
+- **What actually got built is in the RUN LOG** (the recipe's own build-identity
+  lines), NOT the job record's `target_sha` — that is an enqueue-time echo of a
+  local ref resolved without a fetch, while the recipe re-fetches origin at
+  build time (T-0699).
 
 Hold deploys without killing the worker: `ops/bot-squad-bin/pause-deploys
 "<reason>"` writes a `PAUSED.json` marker the monitor honors — queued + new
@@ -440,6 +459,13 @@ def main() -> None:
         action="store_true",
         help="Print rendered content without writing",
     )
+    parser.add_argument(
+        "--diff",
+        action="store_true",
+        help="Print the unified diff against the on-disk AGENTS.md and exit "
+             "WITHOUT writing (the review artifact of a real run, without "
+             "touching a shared working tree)",
+    )
     args = parser.parse_args()
 
     config_dir = Path(args.config_dir)
@@ -472,6 +498,10 @@ def main() -> None:
         tofile=f"b/{agents_md.name}",
     )
     sys.stdout.writelines(diff)
+
+    if args.diff:
+        print(f"\n--diff: nothing written to {agents_md}")
+        return
 
     agents_md.write_text(new_content)
     print(f"\nWritten: {agents_md}")

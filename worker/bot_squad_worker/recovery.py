@@ -329,7 +329,10 @@ def _do_respawn(cfg: Any, row: dict) -> None:
         log.warning("recovery: re-driving crashed %s (%s) from artifact %s",
                     sid, row.get("role"), artifact_path)
         # row carries sid/task_id/role/window — the rec shape _relaunch expects.
-        _autocompact._relaunch_from_artifact(cfg, slug, row, artifact_path)
+        # T-0909: name RECOVERY as the producer, not the graceful-compact path
+        # whose relaunch machinery this reuses.
+        _autocompact._relaunch_from_artifact(
+            cfg, slug, row, artifact_path, dispatched_by="recovery-respawn")
     else:
         from bot_squad_worker import sessions as _sessions
         task_id = row.get("task_id")

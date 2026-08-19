@@ -278,10 +278,14 @@ def harness(monkeypatch):
     monkeypatch.setattr(A, "_inject_handoff", lambda sid, art_path, role=None, *, relaunch=True: calls["handoff"].append((sid, art_path, role, relaunch)))
     monkeypatch.setattr(A, "_inject_context_handoff", lambda sid, task_id, *, relaunch=True: calls["ctx_handoff"].append((sid, task_id, relaunch)))
     monkeypatch.setattr(A, "_suspend_session", lambda cfg, slug, sid: calls["suspend"].append(sid))
+    # `**kw` deliberately (T-0909) — see test_recovery.py for why a hand-mirrored
+    # stub signature is the wrong thing to pin.
     monkeypatch.setattr(A, "_relaunch_from_artifact",
-                        lambda cfg, slug, rec, art_path: calls["spawn"].append((rec["sid"], art_path)))
+                        lambda cfg, slug, rec, art_path, **kw:
+                        calls["spawn"].append((rec["sid"], art_path)))
     monkeypatch.setattr(A, "_relaunch_from_ticket",
-                        lambda cfg, slug, rec, task_md: calls["spawn_ticket"].append((rec["sid"], task_md)))
+                        lambda cfg, slug, rec, task_md, **kw:
+                        calls["spawn_ticket"].append((rec["sid"], task_md)))
     monkeypatch.setattr(A, "_resolve_compact_target",
                         lambda cfg, slug, rec: state["target"])
     monkeypatch.setattr(A, "_artifact_mtime", lambda path: state["artifact_mtime"])
@@ -426,7 +430,7 @@ def test_finalize_relaunch_failure_alerts_operator_not_silent(harness, monkeypat
     monkeypatch.setattr(A, "_alert_orphaned_handoff",
                         lambda cfg, slug, sid, reason: alerts.append((sid, reason)))
 
-    def _boom(cfg, slug, rec, task_md):
+    def _boom(cfg, slug, rec, task_md, **kw):
         raise RuntimeError("tmux exploded")
     monkeypatch.setattr(A, "_relaunch_from_ticket", _boom)
 

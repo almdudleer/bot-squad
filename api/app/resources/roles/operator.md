@@ -350,23 +350,34 @@ Dispatch-specific, not in `--help`:
 - **`--window` names the FEATURE, not the ticket id** (the id is already
   bound); that name is what the board shows.
 
-### Size the model to the ticket — `--model sonnet` on simple work (T-0866)
-
-Every spawn now lands an explicit `--model` and `--effort` (T-0871): omitting
-them no longer means "whatever the CLI picks", it means **bot-squad's own
-configured default for that role**, from `system_settings.toml` `[models]` /
-`[effort]`. So the defaults are safe — but they are keyed to ROLE, and role is
-a poor proxy for how hard a ticket is. That gap is yours to close at dispatch:
+### Size the model to the ticket — `bsq spawn` now REFUSES an unstated choice (T-0909)
 
 > «надо почаще юзать соннет для простых задач» — stakeholder, 2026-08-11
+> «мне нужно, чтобы оператор динамически управлял тем, кого он спавнит, и
+> старался по возможности использовать соннет» — stakeholder, 2026-08-18
 
-**Pass `--model sonnet` when the ticket is simple.** Measured on T-0866: 74.7%
-of a 30-day bill ran on Opus, on a spend that is 70.5% cache-read — and because
-cache-read, cache-write and input are all priced off the model's *input* rate,
-Opus → Sonnet is ~-40% across the whole line, not just on output. It is the
-largest single lever available at dispatch time, roughly 6x the effort knob.
+**This section used to be advice. It is now a gate, because the advice was
+measured and did not hold.** T-0866 wrote it here and T-0871 made every spawn
+state an explicit `--model`. Over the eight days that followed, the worker
+journal recorded **198 dev dispatches: 104 passed `--model opus` by hand, 92
+took the opus role default, and ONE ran Sonnet.** The flag was used ~50x more
+often to pin the premium model than to step down. A rule that lives only in a
+role contract does not hold; this one moved to where a machine checks it.
 
-Simple enough for `sonnet` — reach for it by default on these:
+**What `bsq spawn` does now, on a claude `--role dev` dispatch:**
+
+| you type | what happens |
+|---|---|
+| `--model sonnet` | spawns. The cheap path is the frictionless one. |
+| (no `--model`) | **refused** — a silent default is the state this fixed. |
+| `--model opus` | **refused** — premium needs a stated reason. |
+| `--model opus --why "<reason>"` | spawns; the reason is recorded. |
+
+The reason lands on the session md and in `data/_worker/model_dispatch.ndjson`,
+and comes back out of `bsq model compliance` — so "why did this ticket need
+Opus" is answerable from data, by you or by him.
+
+**Simple enough for `--model sonnet` — reach for it by default on these:**
 
 - a one-file edit, a copy/wording change, a config or constant change
 - a mechanical refactor or rename with a test already pinning the behavior
@@ -374,14 +385,26 @@ Simple enough for `sonnet` — reach for it by default on these:
 - a read-only audit or a "check whether X is true" investigation
 - anything where the ticket already states the fix and the DoD is the diff
 
-Keep the `opus` default (just omit `--model`) when the ticket needs judgement
-the brief does not contain: cross-module design, a bug whose CAUSE is unknown,
-anything touching the spawn/recycle lifecycle or the message bus, or a scope
-where being wrong is expensive to unwind.
+**Premium (`--model opus --why …`)** when the ticket needs judgement the brief
+does not contain: cross-module design, a bug whose CAUSE is unknown, anything
+touching the spawn/recycle lifecycle or the message bus, or a scope where being
+wrong is expensive to unwind.
+
+Why it is worth the friction: measured on T-0866, 74.7% of a 30-day bill ran on
+Opus, on a spend that is 70.5% cache-read — and because cache-read, cache-write
+and input are all priced off the model's *input* rate, Opus → Sonnet is ~-40%
+across the whole line, not just on output. It is the largest single lever
+available at dispatch, roughly 6x the effort knob.
 
 Wrong once is cheap — the dev tells you, and a re-spawn costs one command.
-Systematically defaulting every ticket to Opus is what the measurement caught,
-so **when it is a close call, take Sonnet.**
+So **when it is a close call, take Sonnet.**
+
+**Your compliance number.** `bsq model compliance` (also printed in your
+session-start banner) scores your last N dev dispatches and lists every premium
+one with the reason you gave. It counts automated dispatches (routines, the
+API, re-drives) too — they spend the same money — with a `by source` breakdown
+so you can tell your own choices from a config default. An empty ledger reports
+"no dispatches recorded", never a percentage computed from nothing.
 
 ## Decision discipline
 

@@ -20,7 +20,7 @@ make obvious:
 |------|------|
 | `bsq inbox wait [--timeout N]` | opt-in long-poll; `--timeout` capped at 7200s (2h) |
 | `bsq peer send <to> "<text>"` | also nudges the recipient's live pane — see "check mail" below |
-| `bsq spawn <ticket>` | defaults to AUTO-RESUMING a matching expert session, not a fresh spawn (T-0150) — `--fresh` forces new. `--prompt`/`--prompt-file` **REPLACE** the deterministic brief (role contract + ticket scope/DoD + prior guidance), they don't add to it — omit them unless the custom text carries all of that itself |
+| `bsq spawn <ticket>` | **REFUSES a dev dispatch that does not state its model** (T-0909): `--model sonnet` on simple work, `--model opus --why "<reason>"` when the ticket needs judgement the brief lacks. Defaults to AUTO-RESUMING a matching expert session, not a fresh spawn (T-0150) — `--fresh` forces new. `--prompt`/`--prompt-file` **REPLACE** the deterministic brief (role contract + ticket scope/DoD + prior guidance), they don't add to it — omit them unless the custom text carries all of that itself |
 | `bsq task new "<title>"` | allocates the id atomically — never hand-pick `T-NNNN` |
 
 ## The "check mail" signal (primary channel)

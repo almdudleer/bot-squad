@@ -65,6 +65,9 @@ def test_registry_lists_only_allowed_actions():
         "list_sessions", "telemetry_get",
         "pause_session", "suspend_session", "resume_session",
         "spawn_session",
+        # T-0909: the model-dispatch compliance number, off the shared ledger
+        # every spawn/resume appends to (`bsq model compliance`).
+        "model_compliance",
         # T-0478 (M2/F2.4): user-conversation intake-session ensure/spawn.
         "ensure_user_conversation",
         "scheduler_state", "inject_input",

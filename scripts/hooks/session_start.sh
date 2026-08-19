@@ -842,6 +842,33 @@ for _, meta in tasks:
 PY
 fi
 
+# 3b. What the fleet's recent dispatches actually cost (T-0909, operator only).
+#
+# The policy — "size the model to the ticket, prefer sonnet for simple work"
+# (T-0866) — lived only as prose in operator.md for a week and did not hold:
+# of 198 dev dispatches measured over that week, ONE ran Sonnet. `bsq spawn`
+# now refuses an unstated model choice, and this is the other half — the number
+# the operator SEES, so drift is self-evident at boot instead of silent.
+#
+# Deliberately routed through `bsq` rather than reading the ledger inline: one
+# implementation of the number, not a third copy of the pricing table. Wrapped
+# in `timeout` because a session start must never hang on the worker socket,
+# and failure is silent (no banner beats a scary banner about a missing file).
+if [ "$ROLE" = "operator" ] && command -v bsq >/dev/null 2>&1; then
+    _mc="$(timeout 5 bsq model compliance --limit 25 --role dev 2>/dev/null || true)"
+    if [ -n "$_mc" ]; then
+        print_section "MODEL SPEND — YOUR LAST 25 DEV DISPATCHES (T-0909)"
+        echo "$_mc"
+        echo
+        echo "\`bsq spawn\` REFUSES a dev dispatch that does not state its model:"
+        echo "  simple ticket -> \`--model sonnet\` (one-file edit, mechanical refactor,"
+        echo "                   test-add, read-only audit, DoD already states the fix)"
+        echo "  needs judgement the brief lacks -> \`--model opus --why \"<reason>\"\`"
+        echo "The reason is recorded and read back above. Close call -> take Sonnet."
+    fi
+    unset _mc
+fi
+
 # 4. Active sessions
 if [ -d "$DATA/sessions" ]; then
     active=$(grep -l 'status: active' "$DATA/sessions"/*.md 2>/dev/null | wc -l)

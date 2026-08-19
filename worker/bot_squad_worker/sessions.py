@@ -1964,6 +1964,33 @@ def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None,
     new_pane = max(new_panes, key=lambda p: int(p.pane_id.lstrip("%")) if p.pane_id.lstrip("%").isdigit() else 0)
     new_sid = compute_sid(user, new_pane.window, new_pane.pane_id)
 
+    # T-0909: a resume spends on the model it resumes ON, so it lands in the
+    # same ledger as a spawn — kind="resume" keeps the two separable. Excluding
+    # resumes would make the compliance number read a corpus smaller than the
+    # spend it claims to describe.
+    if provider_name == "claude":
+        try:
+            from bot_squad_worker import model_dispatch as _model_dispatch
+            _model_dispatch.record(
+                cfg.data_dir,
+                kind="resume",
+                slug=slug,
+                sid=new_sid,
+                window=window,
+                task_id=str(meta.get("task_id") or "").strip(),
+                role=_resume_role,
+                provider=provider_name,
+                model=resume_model,
+                source=_resume_model_source,
+                effort=resume_effort,
+                effort_source=_resume_effort_source,
+                reason=str(meta.get("model_reason") or "").strip(),
+                dispatched_by="resume",
+            )
+        except Exception:
+            log.warning("resume %s/%s: model-dispatch ledger write failed",
+                        slug, sid, exc_info=True)
+
     # Update metadata
     # T-0575: this resurrect CONSUMES the recycle-v2 "remembered" state — drop
     # it so decide_dispatch never offers an already-resumed session again.
@@ -2387,6 +2414,8 @@ def spawn(
     model: str | None = None,
     provider: str | None = None,
     effort: str | None = None,
+    model_reason: str | None = None,
+    dispatched_by: str | None = None,
 ) -> dict:
     """Spawn a new Claude session in the project's repo.
 
@@ -2408,6 +2437,15 @@ def spawn(
     :func:`_resolve_claude_effort`), and effort is additionally CLAMPED to
     :data:`fleet_model.EFFORT_CEILING` — including an explicit ``effort``
     argument, which is deliberately not a way to bypass the ceiling.
+
+    T-0909: ``model_reason`` is the free-text justification a dispatcher gives
+    for reaching past the step-down model (``bsq spawn --why``). It is not
+    validated or interpreted here — it is stamped on the session md and written
+    to :mod:`model_dispatch`'s ledger so "why did this run on Opus" is
+    answerable from data instead of from a role contract nobody is measured
+    against. ``dispatched_by`` names the surface that asked (``bsq spawn``,
+    ``routine``, ``api``…), which is what separates an agent's CHOICE from an
+    automated caller's config default in the compliance number.
 
     Opens a new tmux window, starts claude (no resume), and optionally
     sends an initial_prompt after a short delay.
@@ -2682,6 +2720,37 @@ def spawn(
     new_pane = max(new_panes, key=lambda p: int(p.pane_id.lstrip("%")) if p.pane_id.lstrip("%").isdigit() else 0)
     new_sid = compute_sid(user, new_pane.window, new_pane.pane_id)
 
+    # T-0909: one durable line per dispatch. The `log.info` above says the same
+    # thing to the journal, which rotates and needs privileges to read; this is
+    # the copy `bsq model compliance` and the operator's session-start banner
+    # read, and it is what this ticket's before/after number is computed from.
+    # Never raises (see model_dispatch.record).
+    try:
+        from bot_squad_worker import model_dispatch as _model_dispatch
+        _model_dispatch.record(
+            cfg.data_dir,
+            kind="spawn",
+            slug=slug,
+            sid=new_sid,
+            window=window,
+            task_id=(task_id or "").strip(),
+            role=_role,
+            provider=_provider_name,
+            model=_model,
+            source=_model_source,
+            effort=_effort,
+            effort_source=_effort_source,
+            reason=(model_reason or "").strip(),
+            dispatched_by=(dispatched_by or "").strip(),
+        )
+    except Exception:
+        # Belt AND braces: `record` swallows its own errors, but the guarantee
+        # "a cost-control ledger can never fail a spawn" must not depend on the
+        # module a future edit might make raise (an import error, a signature
+        # change). Pinned by test_a_broken_ledger_does_not_break_the_spawn.
+        log.warning("spawn %s/%s: model-dispatch ledger write failed",
+                    slug, window, exc_info=True)
+
     # T-0078: pre-stamp tmux_session on the SessionMd so the field is
     # populated even before the SessionStart hook fires (and survives the
     # hook's rewrite, which now preserves tmux_session via env passthrough).
@@ -2734,6 +2803,11 @@ def spawn(
             seed_meta["effort"] = _effort
         if _model_source:
             seed_meta["model_source"] = _model_source
+        # T-0909: the stated reason for a premium model rides the md too, so a
+        # session can be asked "why are you on Opus" without a ledger lookup.
+        _reason_clean = (model_reason or "").strip()
+        if _reason_clean:
+            seed_meta["model_reason"] = _reason_clean[:500]
     if _explicit_choice and _provider_name == "claude":
         seed_meta["model"] = _model
     elif _provider_name == "codex":

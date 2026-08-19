@@ -2173,7 +2173,44 @@ _SPAWN_SESSION_ALLOWED = _SPAWN_SESSION_REQUIRED | {
     # default. Clamped to fleet_model.EFFORT_CEILING like any other path —
     # this is an override of the LEVEL, not of the ceiling.
     "effort",
+    # T-0909: the stated justification for reaching past the step-down model,
+    # and the surface that asked. Neither changes what is launched — they make
+    # the choice auditable (session md + the model_dispatch ledger).
+    "model_reason",
+    "dispatched_by",
 }
+
+
+_MODEL_COMPLIANCE_ALLOWED = {"limit", "role", "kinds", "slug"}
+
+
+def _action_model_compliance(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0909: what the last N dispatches actually ran, off the shared ledger.
+
+    Read-only, coordinator-scoped: the ledger is ONE file in the shared install
+    data dir covering every project, so a per-user fan-out would answer the
+    same question N times (same reasoning as ``telemetry_get``).
+    """
+    extra = set(params) - _MODEL_COMPLIANCE_ALLOWED
+    if extra:
+        raise ActionError(f"model_compliance got unexpected params: {sorted(extra)}")
+    cfg = _get_config()
+    from bot_squad_worker import model_dispatch as _model_dispatch
+    kinds = params.get("kinds")
+    if isinstance(kinds, str):
+        kinds = [k.strip() for k in kinds.split(",") if k.strip()]
+    try:
+        limit = int(params.get("limit") or 50)
+    except (TypeError, ValueError):
+        raise ActionError("model_compliance: limit must be an integer")
+    comp = _model_dispatch.compliance(
+        cfg.data_dir,
+        limit=limit,
+        role=str(params.get("role") or "dev"),
+        kinds=tuple(kinds) if kinds else ("spawn",),
+        slug=str(params.get("slug") or ""),
+    )
+    return {"ok": True, **comp, "summary": _model_dispatch.summary_line(comp)}
 
 
 def _action_spawn_session(params: dict[str, Any]) -> dict[str, Any]:
@@ -2233,6 +2270,8 @@ def _action_spawn_session(params: dict[str, Any]) -> dict[str, Any]:
         model=params.get("model"),
         provider=params.get("provider"),
         effort=params.get("effort"),
+        model_reason=params.get("model_reason"),
+        dispatched_by=params.get("dispatched_by"),
     )
 
 
@@ -5588,6 +5627,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "suspend_session": _action_suspend_session,
     "resume_session": _action_resume_session,
     "spawn_session": _action_spawn_session,
+    # T-0909: the model-dispatch compliance number (bsq model compliance).
+    "model_compliance": _action_model_compliance,
     # T-0478 (M2/F2.4): ensure a user-conversation session attends a user.
     "ensure_user_conversation": _action_ensure_user_conversation,
     "scheduler_state": _action_scheduler_state,
@@ -5764,6 +5805,8 @@ ACTION_MODES: dict[str, str] = {
     "suspend_session": "tmux_only",
     "resume_session": "tmux_only",
     "spawn_session": "tmux_only",
+    # T-0909: ONE shared ledger for the whole install, like telemetry_get.
+    "model_compliance": "coordinator_only",
     "ensure_user_conversation": "tmux_only",
     "scheduler_state": "coordinator_only",
     # T-0759: reads the SHARED install data dir (one outbound spool + witness

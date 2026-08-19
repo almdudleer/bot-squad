@@ -146,7 +146,16 @@ exempt.
 
 **`bsq spawn` is the supported dev-spawn path — there is no other one.**
 
-    bsq spawn T-NNNN --window <feature-name> --initiative <your-init.md>
+    bsq spawn T-NNNN --window <feature-name> --initiative <your-init.md> --model sonnet
+
+**It refuses a dev dispatch that does not state its model (T-0909).** Pass
+`--model sonnet` on simple work — a one-file edit, a mechanical refactor with a
+test already pinning the behavior, a test-add, a read-only audit, anything where
+the ticket already states the fix. Reaching for the premium tier costs a stated
+reason: `--model opus --why "<what about THIS ticket the brief cannot carry>"`,
+which is recorded and read back by `bsq model compliance`. Close call → Sonnet.
+The rule and the measurement behind it are in `operator.md` → "Size the model to
+the ticket"; this is the same gate, applied to your dev spawns.
 
 `bsq spawn` resolves the slug/socket/wire shape and assembles the
 deterministic brief for the ticket itself — role contract, scope, DoD,

@@ -416,6 +416,8 @@ async def create_project(
             "slug": slug,
             "window": "operator",
             "initial_prompt": operator_brief,
+            # T-0909: attributable in the dispatch ledger.
+            "dispatched_by": "api:create_project",
         }
         if admin.get("username"):
             spawn_params["owner"] = admin["username"]

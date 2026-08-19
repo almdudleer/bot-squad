@@ -319,8 +319,13 @@ def test_boot_reconcile_fresh_crash_on_unpaused_project_still_respawns(
 
     relaunches = []
     monkeypatch.setattr(S, "live_pane_map", lambda *a, **k: {})
+    # `**kw` deliberately (T-0909): a stub mirroring the real signature by hand
+    # goes stale the moment a caller passes a new kwarg, and it fails as a
+    # missing respawn rather than as a signature error — a long way from the
+    # cause. Same reason as test_constant_teams._fake_spawn.
     monkeypatch.setattr(A, "_relaunch_from_artifact",
-                        lambda cfg, slug, row, art: relaunches.append(row["sid"]) or {"ok": True})
+                        lambda cfg, slug, row, art, **kw:
+                        relaunches.append(row["sid"]) or {"ok": True})
     monkeypatch.setattr(S, "archive_session", lambda *a, **k: {"ok": True})
 
     out = R.boot_reconcile(cfg)

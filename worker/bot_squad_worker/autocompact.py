@@ -629,7 +629,8 @@ def _inherited_model_choice(meta: dict) -> tuple:
     return model, effort, reason
 
 
-def _relaunch(cfg: Any, slug: str, rec: dict, make_prompt) -> None:
+def _relaunch(cfg: Any, slug: str, rec: dict, make_prompt,
+              dispatched_by: str = "autocompact-relaunch") -> None:
     """Relaunch a FRESH incarnation re-bound to the SAME assignment (binding
     continuity — task_id/initiative/parent_sid/owner carried from the
     predecessor's session md so reconcilers don't see an orphan).
@@ -664,7 +665,7 @@ def _relaunch(cfg: Any, slug: str, rec: dict, make_prompt) -> None:
         model=model,
         effort=effort,
         model_reason=model_reason,
-        dispatched_by="autocompact-relaunch",
+        dispatched_by=dispatched_by,
     )
 
 
@@ -677,13 +678,23 @@ def _relaunch_from_ticket(cfg: Any, slug: str, rec: dict, task_md: str | None) -
                   task_md_path=task_md))
 
 
-def _relaunch_from_artifact(cfg: Any, slug: str, rec: dict, artifact_path: str) -> None:
+def _relaunch_from_artifact(cfg: Any, slug: str, rec: dict, artifact_path: str,
+                            dispatched_by: str = "autocompact-relaunch") -> None:
     """Relaunch a FRESH incarnation booting from the role artifact — the
     task-LESS half (operator state-doc / per-assignment role file), and the path
-    T-0471 crash recovery reuses for any session that still has an artifact."""
+    T-0471 crash recovery reuses for any session that still has an artifact.
+
+    T-0909: ``dispatched_by`` is a parameter precisely BECAUSE recovery reuses
+    this function. Hardcoding "autocompact-relaunch" here would file every
+    crash recovery under the graceful-compact producer, and the ledger's whole
+    job is to say who actually produced a dispatch — a label that names the
+    mechanism it borrowed rather than the caller that ran it is the failure the
+    breakdown exists to prevent.
+    """
     _relaunch(cfg, slug, rec, lambda role, task_id, assignment_id:
               boot_prompt_from_artifact(role=role, assignment_id=assignment_id,
-                                        artifact_path=artifact_path))
+                                        artifact_path=artifact_path),
+              dispatched_by=dispatched_by)
 
 
 # --- executor ---------------------------------------------------------------

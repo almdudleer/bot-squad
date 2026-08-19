@@ -305,3 +305,39 @@ def test_the_choice_survives_generation_after_generation(tmp_path, monkeypatch):
     recs = MD.read(cfg.data_dir)
     assert [r["model"] for r in recs] == ["sonnet"] * 3
     assert recs[-1]["reason"] == "one-file copy change"
+
+
+def test_recovery_is_labelled_as_recovery_not_as_autocompact(tmp_path, monkeypatch):
+    """Crash recovery REUSES `_relaunch_from_artifact`. A hardcoded producer
+    label there would file every crash respawn under the graceful-compact path,
+    and the breakdown's whole job is to say who actually produced a dispatch —
+    a label naming the borrowed mechanism instead of the caller is exactly the
+    failure it exists to prevent ([[feedback_provenance_from_mechanism_not_surface]]).
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    cfg = _make_cfg(tmp_path, repo)
+    from bot_squad_worker.sessions import _write_session_metadata, _session_file
+
+    sid = "S-alice-w-p2"
+    artifact = tmp_path / "artifact.md"
+    artifact.write_text("forward state", encoding="utf-8")
+    _write_session_metadata(
+        _session_file(cfg.data_dir, "test-project", sid),
+        {"sid": sid, "status": "active", "window": "w", "cwd": str(repo),
+         "task_id": "T-0909", "role": "dev"})
+    captured: list[str] = []
+    _stub_tmux(monkeypatch, repo, "w", captured)
+    AC._relaunch_from_artifact(
+        cfg, "test-project",
+        {"sid": sid, "role": "dev", "task_id": "T-0909", "window": "w"},
+        str(artifact), dispatched_by="recovery-respawn")
+
+    assert MD.read(cfg.data_dir)[-1]["dispatched_by"] == "recovery-respawn"
+
+
+def test_the_graceful_path_still_labels_itself_autocompact(tmp_path, monkeypatch):
+    """The other side of the same coin: making the label a parameter must not
+    turn the default caller into an unattributed one."""
+    _, recs = _relaunch_cmd(tmp_path, monkeypatch, {})
+    assert recs[-1]["dispatched_by"] == "autocompact-relaunch"

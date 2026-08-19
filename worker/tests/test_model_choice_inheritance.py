@@ -262,3 +262,46 @@ def test_negative_control_inheritance_becomes_a_blanket_downgrade(tmp_path):
         "downgrade")
     assert mut._inherited_model_choice({"model_source": "config:dev"})[0] == "sonnet"
     assert AC._inherited_model_choice({"model_source": "config:dev"})[0] is None
+
+
+def test_the_choice_survives_generation_after_generation(tmp_path, monkeypatch):
+    """The real-world shape: `watchrobot/t0757-gate` and `watchrobot/phase2-merge`
+    each ran ELEVEN relaunch generations in nine days. A carry-forward that only
+    survived one hop would still lose the choice by generation 3, so this drives
+    the chain through the successor's OWN md rather than asserting on hop one.
+
+    The mechanism it depends on: `spawn` stamps `model` on the successor's md
+    whenever the model was explicit — and an inherited model IS explicit — so
+    generation N+1 reads what generation N wrote.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    cfg = _make_cfg(tmp_path, repo)
+    from bot_squad_worker.sessions import _write_session_metadata, _session_file
+    from bot_squad_worker.sessions import _read_session_metadata
+
+    sid = "S-alice-w-p2"
+    _write_session_metadata(
+        _session_file(cfg.data_dir, "test-project", sid),
+        {"sid": sid, "status": "active", "window": "w", "cwd": str(repo),
+         "task_id": "T-0909", "role": "dev",
+         "model": "sonnet", "model_source": "explicit",
+         "model_reason": "one-file copy change"})
+
+    seen = []
+    for _ in range(3):
+        captured: list[str] = []
+        _stub_tmux(monkeypatch, repo, "w", captured)
+        AC._relaunch(cfg, "test-project",
+                     {"sid": sid, "role": "dev", "task_id": "T-0909", "window": "w"},
+                     lambda role, task_id, aid: "boot prompt")
+        seen.append(captured[0])
+        # The successor's md becomes the next generation's predecessor.
+        mds = sorted((cfg.data_dir / "test-project" / "sessions").glob("*.md"))
+        sid = _read_session_metadata(mds[-1])["sid"]
+
+    assert all("--model sonnet" in c for c in seen), seen
+    assert not any("--model opus" in c for c in seen), seen
+    recs = MD.read(cfg.data_dir)
+    assert [r["model"] for r in recs] == ["sonnet"] * 3
+    assert recs[-1]["reason"] == "one-file copy change"

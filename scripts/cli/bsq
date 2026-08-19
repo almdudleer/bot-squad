@@ -30,6 +30,7 @@ Verbs:
   bsq msg-route list/set/clear      where each automated message TYPE is delivered (T-0799)
   bsq drive off/on/status           operator-only: your own drive continuity toggle (T-0655)
   bsq model set/clear/status         durable per-session agent/model override (T-0678)
+  bsq model compliance               what the last N dev dispatches actually ran (T-0909)
   bsq commit -m MSG <files..>       stage explicit paths + safe-commit
   bsq commit --hunks [--patch P]    co-edited file: commit ONLY your hunks via a temp index
 
@@ -1283,6 +1284,144 @@ def _spawn_provider(args) -> str:
     return _project_provider_default()
 
 
+# --------------------------------------------------------------------------
+# T-0909 — the dispatch-time model gate.
+#
+# THE MEASUREMENT THIS REPLACES. T-0866 wrote the policy («надо почаще юзать
+# соннет для простых задач») into `operator.md` as prose, and T-0871 gave every
+# spawn an explicit `--model`. Eight days of the worker journal say the prose
+# did not hold and the flag did not help: of 198 dev dispatches, 104 passed
+# `--model opus` BY HAND, 92 fell through to the opus role default, and ONE ran
+# Sonnet. The flag was being used ~50x more often to pin the premium model than
+# to step down.
+#
+# So the rule moves out of the role contract and into a place a machine checks
+# (see [[feedback_prose_is_not_a_control]]). The asymmetry is the whole design:
+# the step-down model is the frictionless path (`--model sonnet`, nothing else
+# to type) and the premium model costs one sentence of justification, which is
+# then RECORDED — so "why did this ticket need Opus" is answerable from data.
+# Omitting `--model` is refused rather than silently defaulting, because a
+# default that nobody states is exactly the state this ticket found.
+#
+# Scope is deliberately narrow: claude-provider `--role dev` spawns. Every
+# other role either already defaults to a step-down model (teamlead, qa,
+# user-conversation) or is a rare, system-owned dispatch (operator).
+
+#: Model classes priced above Sonnet. A DELIBERATE, HAND-MAINTAINED MIRROR of
+#: `worker/bot_squad_worker/model_dispatch.PREMIUM_CLASSES` — this CLI never
+#: imports the worker package (see the `_derive_role` note above for why).
+#: `scripts/cli/test_bsq_model_gate.py` fails if the two drift.
+_PREMIUM_MODEL_CLASSES = ("opus", "fable")
+_ECONOMY_MODEL_CLASSES = ("sonnet", "haiku")
+
+#: Roles whose dispatch must state a model. See the scope note above.
+_MODEL_GATED_ROLES = ("dev",)
+
+#: A reason shorter than this is not a reason. Measured intent, not a guess at
+#: a good length: it is long enough that "x", "-", "opus" and the model name
+#: itself are refused, and short enough that a real clause ("cause unknown,
+#: touches the spawn lifecycle") passes on the first try.
+_MODEL_REASON_MIN_LEN = 15
+
+
+def _model_class(value: str) -> str:
+    """Pricing class of a model value — bare alias or pinned id, "" if unknown.
+
+    Substring matching so `claude-opus-4-8`, `opus[1m]` and a future
+    `claude-opus-6` all read as `opus` without re-editing this table.
+    """
+    v = (value or "").strip().lower()
+    if not v:
+        return ""
+    for cls in ("sonnet", "opus", "fable", "haiku"):
+        if cls in v:
+            return cls
+    return ""
+
+
+_MODEL_GATE_CHECKLIST = """\
+Simple enough for `--model sonnet` — reach for it by default on these:
+  - a one-file edit, a copy/wording change, a config or constant change
+  - a mechanical refactor or rename with a test already pinning the behavior
+  - adding a test to a spec somebody else already wrote
+  - a read-only audit or a "check whether X is true" investigation
+  - anything where the ticket already states the fix and the DoD is the diff
+Premium (`--model opus --why "<reason>"`) when the ticket needs judgement the
+brief does not contain: cross-module design, a bug whose CAUSE is unknown,
+anything touching the spawn/recycle lifecycle or the message bus, or a scope
+where being wrong is expensive to unwind. When it is a close call, take Sonnet
+(T-0866, stakeholder: «надо почаще юзать соннет для простых задач»)."""
+
+
+def _gate_model_choice(args, ticket: str) -> str:
+    """Refuse a dev dispatch that has not STATED its model choice (T-0909).
+
+    Returns the `--why` reason to record (possibly ""). Raises via `die` — the
+    refusal names the exact re-run, so a dispatching agent fixes it in one
+    round trip instead of reading a paragraph it has already read.
+    """
+    role = (getattr(args, "role", None) or "dev").strip()
+    if role not in _MODEL_GATED_ROLES:
+        return (getattr(args, "why", None) or "").strip()
+    if _spawn_provider(args) != "claude":
+        return (getattr(args, "why", None) or "").strip()
+
+    model = (getattr(args, "model", None) or "").strip()
+    why = (getattr(args, "why", None) or "").strip()
+    cls = _model_class(model)
+
+    if not model:
+        die(f"spawn {ticket}: a dev dispatch must STATE its model (T-0909).\n"
+            f"  cheap path : bsq spawn {ticket} --model sonnet\n"
+            f"  premium    : bsq spawn {ticket} --model opus --why \"<reason>\"\n"
+            f"\n{_MODEL_GATE_CHECKLIST}")
+    if cls in _PREMIUM_MODEL_CLASSES and not why:
+        die(f"spawn {ticket}: --model {model} is the premium tier — say why "
+            f"this ticket needs it (T-0909).\n"
+            f"  bsq spawn {ticket} --model {model} --why \"<reason>\"\n"
+            f"  or step down: bsq spawn {ticket} --model sonnet\n"
+            f"\n{_MODEL_GATE_CHECKLIST}")
+    if cls in _PREMIUM_MODEL_CLASSES and len(why) < _MODEL_REASON_MIN_LEN:
+        die(f"spawn {ticket}: --why {why!r} is too short to be a reason "
+            f"(min {_MODEL_REASON_MIN_LEN} chars, T-0909). Name what about THIS "
+            f"ticket the brief cannot carry — it is recorded and read back by "
+            f"`bsq model compliance`.")
+    return why
+
+
+#: The params T-0909 added to `spawn_session`. Named here (not inline) so the
+#: fallback below strips exactly what it sends and cannot drift from it.
+_T0909_SPAWN_PARAMS = ("model_reason", "dispatched_by")
+
+
+def _post_spawn_session(params: dict) -> dict:
+    """Spawn, degrading to the pre-T-0909 param shape on an older worker.
+
+    NOT hypothetical. `bsq` is a SYMLINK into the dev clone, so a CLI edit is
+    live for every session on this host the instant it is written, while the
+    worker only picks the matching change up at the next deploy.
+    `_action_spawn_session` rejects any param it does not know BY NAME —
+    measured against the live worker while writing this: `spawn_session got
+    unexpected params: ['model_reason']`. Sending them unconditionally would
+    have broken EVERY dispatch on the host for the length of that window.
+
+    The fallback is narrow on purpose: only that one error, and it drops only
+    the two params this ticket added. The spawn still happens; only the audit
+    trail is thinner until the worker catches up.
+    """
+    try:
+        return post("spawn_session", params, timeout=90, fatal=False)
+    except WorkerError as exc:
+        if "unexpected params" not in str(exc):
+            die(str(exc))
+        legacy = {k: v for k, v in params.items()
+                  if k not in _T0909_SPAWN_PARAMS}
+        print("note: this worker predates T-0909's dispatch ledger — spawning "
+              "without the recorded reason (deploy the worker to restore it).",
+              file=sys.stderr)
+        return post("spawn_session", legacy, timeout=90)
+
+
 def cmd_spawn(args) -> None:
     # T-0892: WHICH project's T-NNNN. Resolving it by `$PWD` spawned a paid
     # session onto the same-numbered ticket of another board — the shared
@@ -1388,6 +1527,11 @@ def cmd_spawn(args) -> None:
         _resume_expert(slug, expert, all_tickets, brief, args.dry_run)
         return
 
+    # T-0909: the fresh-spawn branch is where a NEW model decision is actually
+    # made, so the gate lives here — a resumed expert (returned above) keeps
+    # the model it is already warm on, and lands in the ledger as kind=resume.
+    _model_reason = _gate_model_choice(args, ticket)
+
     params = {"slug": slug, "window": window, "initial_prompt": initial_prompt, "task_id": ticket}
     if initiative:
         params["initiative"] = initiative
@@ -1395,6 +1539,9 @@ def cmd_spawn(args) -> None:
         params["owner"] = args.owner
     if args.model:
         params["model"] = args.model
+    if _model_reason:
+        params["model_reason"] = _model_reason
+    params["dispatched_by"] = "bsq spawn"
     if args.provider:
         params["provider"] = args.provider
     # T-0871: explicit reasoning-effort override. Still clamped worker-side to
@@ -1416,7 +1563,15 @@ def cmd_spawn(args) -> None:
                           **params}, indent=2))
         return
 
-    res = post("spawn_session", params, timeout=90)
+    # T-0909 / FORWARD COMPATIBILITY, and it is not hypothetical: `bsq` is a
+    # SYMLINK into the dev clone, so a CLI edit is live for every session on
+    # this host the instant it is written, while the worker only picks the
+    # matching change up at the next deploy. `_action_spawn_session` rejects
+    # any param it does not know BY NAME, so shipping `model_reason` /
+    # `dispatched_by` unconditionally would break every dispatch in the window
+    # between the two. Send them, and fall back to the old shape on exactly
+    # that error — the spawn still happens, only the audit trail is thinner.
+    res = _post_spawn_session(params)
     sid = res.get("sid")
     print(f"spawned {sid} (window={window}, task={ticket}"
           + (f", bundle={','.join(bundle)}" if bundle else "") + ")")
@@ -3365,6 +3520,58 @@ def cmd_model_set(args) -> None:
 
 def cmd_model_clear(args) -> None:
     _set_model(args, "")
+
+
+#: How many stated reasons the compliance view lists. The number itself is the
+#: signal; the reasons are a sample for judging whether they are real.
+_MODEL_COMPLIANCE_REASONS_SHOWN = 5
+
+
+def cmd_model_compliance(args) -> None:
+    """T-0909: what the last N dispatches actually ran, off the shared ledger.
+
+    This is the DoD's verification instrument and the operator's drift signal.
+    It reads `data/_worker/model_dispatch.ndjson` (written by every spawn and
+    resume) rather than `data/*/sessions/*.md` — session mds are DELETED when a
+    session is reaped, which is exactly how this ticket's first pass measured
+    "zero explicit model choices, ever" against a journal that said 104.
+    """
+    res = post("model_compliance", {
+        "limit": args.limit,
+        "role": args.role,
+        "kinds": args.kinds,
+        **({"slug": args.slug} if getattr(args, "slug", None) else {}),
+    })
+    n = res.get("n") or 0
+    print(res.get("summary") or "")
+    if not n:
+        return
+    by_source = res.get("by_source") or {}
+    if by_source:
+        print("  by source: " + ", ".join(
+            f"{k}={v}" for k, v in sorted(by_source.items(), key=lambda kv: -kv[1])))
+    window = f"{res.get('oldest_ts', '')[:16]} .. {res.get('newest_ts', '')[:16]}"
+    print(f"  window:    {window}")
+    reasons = res.get("premium_reasons") or []
+    if reasons:
+        # Only dispatches that STATED a reason are listed, newest last, capped.
+        # The rest are counted on one line. Measured while walking this through:
+        # printing every premium dispatch put 20 lines of "(none recorded)" into
+        # the operator's session-start banner — the pre-gate and automated
+        # dispatches are the majority, and they have nothing to read.
+        stated = [r for r in reasons if (r.get("reason") or "").strip()]
+        silent = len(reasons) - len(stated)
+        if stated:
+            shown = stated[-_MODEL_COMPLIANCE_REASONS_SHOWN:]
+            print(f"  premium dispatches with a stated reason "
+                  f"({len(stated)}, showing {len(shown)}):")
+            for r in shown:
+                label = r.get("task_id") or r.get("window") or "?"
+                print(f"    - {r.get('ts','')[:16]} {label} "
+                      f"[{r.get('model','?')}]: {r.get('reason').strip()}")
+        if silent:
+            print(f"  premium with NO stated reason: {silent} "
+                  f"(a config default, an automated dispatch, or pre-T-0909)")
 
 
 def cmd_model_status(args) -> None:
@@ -5461,7 +5668,10 @@ def cmd_cluster_launch(args) -> None:
         # measured by driving cmd_spawn with this exact Namespace. The launch
         # arm of cluster-launch could not have worked; carrying the project
         # defaults (None = "no override") is what makes it reachable.
-        model=None,
+        # T-0909: cluster-launch dispatches a dev like any other spawn, so it
+        # carries the same model decision rather than being a hole in the gate.
+        model=getattr(args, "model", None),
+        why=getattr(args, "why", None),
         provider=None,
         effort=None,
     )
@@ -6394,6 +6604,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Claude reasoning effort for this spawn (T-0871); absent "
                          "means the role default from system_settings.toml [effort]. "
                          "Clamped worker-side to the fleet EFFORT_CEILING")
+    sp.add_argument("--why", metavar="REASON",
+                    help="why THIS ticket needs a premium model (T-0909). Required "
+                         "with --model opus/fable on a dev spawn; recorded on the "
+                         "session md and in `bsq model compliance`")
     sp.add_argument("--prompt", help="custom initial prompt (overrides deterministic assembly)")
     sp.add_argument("--prompt-file", help="read initial prompt from a file")
     sp.add_argument("--fresh", action="store_true",
@@ -6429,6 +6643,11 @@ def build_parser() -> argparse.ArgumentParser:
     cl.add_argument("--spawn-dry-run", action="store_true", dest="spawn_dry_run",
                     help="confirm + reach spawn, but print the spawn plan instead of spawning")
     # spawn pass-throughs
+    cl.add_argument("--model",
+                    help="model for the launched session (T-0909: a dev launch "
+                         "must state one — 'sonnet' or 'opus' with --why)")
+    cl.add_argument("--why", metavar="REASON",
+                    help="why this cluster needs a premium model (T-0909)")
     cl.add_argument("--role", default="dev", choices=_SPAWNABLE_ROLES,
                     help="role contract for the launched session (default dev)")
     cl.add_argument("--window", help="tmux window name (default: seed feature slug)")
@@ -6556,6 +6775,17 @@ def build_parser() -> argparse.ArgumentParser:
     mdc = md_sub.add_parser("clear", help="clear this session's model override (revert to fleet/role default)")
     mdc.add_argument("--sid", help="target SID (default: this session)")
     mdc.set_defaults(func=cmd_model_clear)
+    mdc2 = md_sub.add_parser(
+        "compliance",
+        help="what the last N dispatches actually ran + the stated reasons (T-0909)")
+    mdc2.add_argument("--limit", type=int, default=50,
+                      help="how many recent dispatches to score (default 50)")
+    mdc2.add_argument("--role", default="dev",
+                      help="role to score; '' scores every role (default dev)")
+    mdc2.add_argument("--kinds", default="spawn",
+                      help="comma-separated dispatch kinds: spawn,resume (default spawn)")
+    _project_flag(mdc2)
+    mdc2.set_defaults(func=cmd_model_compliance)
     mdst = md_sub.add_parser("status", help="show this session's model override, if any")
     mdst.add_argument("--sid", help="target SID (default: this session)")
     mdst.set_defaults(func=cmd_model_status)

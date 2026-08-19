@@ -359,9 +359,15 @@ def test_cluster_launch_hands_spawn_the_seeds_board(world, monkeypatch, capsys):
     # guidance (T-0151) — 30s here, and none of it is what this test measures.
     monkeypatch.setattr(bsq, "_collect_guidance", lambda *a, **kw: ([], 0, None))
 
+    # `--model sonnet` because T-0909 made a dev dispatch state its model, and
+    # cluster-launch reaches `cmd_spawn` through the same gate. It is passed
+    # here rather than exempting the verb: the launch arm carries the flag
+    # through the Namespace it builds, so this test also holds THAT handoff
+    # together — the same "the Namespace was missing a field" defect this test
+    # was written for.
     args = bsq.build_parser().parse_args(
         ["cluster-launch", "T-0655@beta", "--yes", "--spawn-dry-run",
-         "--min-score", "0"])
+         "--min-score", "0", "--model", "sonnet"])
     args.func(args)
 
     out = capsys.readouterr().out
@@ -370,6 +376,9 @@ def test_cluster_launch_hands_spawn_the_seeds_board(world, monkeypatch, capsys):
     assert plan["task_id"] == "T-0655"
     # Every bundled id came off beta's board, from a cwd that is alpha's.
     assert set(plan["bind_after"]) == {"T-0998", "T-0999"}
+    # ...and the model decision reached the spawn params rather than being
+    # dropped on the way through cmd_cluster_launch's Namespace (T-0909).
+    assert plan["model"] == "sonnet"
 
 
 # ---------------------------------------------------------------------------

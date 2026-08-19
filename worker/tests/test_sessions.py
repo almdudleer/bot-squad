@@ -1763,6 +1763,8 @@ def test_spawn_with_initiative_targets_sibling_tmux_session(tmp_path, monkeypatc
     monkeypatch.setattr(S, "_get_current_user", lambda: "u")
     monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
     monkeypatch.setattr(S.time, "sleep", lambda x: None)
+    monkeypatch.setattr(S, "_wait_for_agent_composer_ready", lambda *_: True)
+    monkeypatch.setattr(S, "_deliver_prompt", lambda *a, **k: None)
 
     spawn(cfg, "test-project", "tl-init",
           initiative="multi-server-installation-process.md")
@@ -2251,7 +2253,7 @@ def test_spawn_raises_when_composer_never_ready(tmp_path, monkeypatch):
     monkeypatch.setattr(S, "_COMPOSER_READY_TIMEOUT_SEC", 0.6)
     monkeypatch.setattr(S, "_COMPOSER_READY_POLL_INTERVAL_SEC", 0.1)
 
-    with pytest.raises(ActionError, match="composer never showed"):
+    with pytest.raises(ActionError, match="composer was not ready"):
         spawn(cfg, "test-project", "w", initial_prompt="go")
 
     # No send-keys should have been issued — we must not type into a pane
@@ -2814,6 +2816,8 @@ def _spawn_and_capture_shell_cmd(tmp_path, monkeypatch, window: str, **spawn_kw)
     monkeypatch.setattr(S, "_get_current_user", lambda: "u")
     monkeypatch.setattr(S, "_get_user_home", lambda: str(tmp_path))
     monkeypatch.setattr(S.time, "sleep", lambda x: None)
+    monkeypatch.setattr(S, "_wait_for_agent_composer_ready", lambda *_: True)
+    monkeypatch.setattr(S, "_deliver_prompt", lambda *a, **k: None)
 
     spawn(cfg, "test-project", window, **spawn_kw)
     assert captured_shell_cmd, "expected a new-window call"
@@ -2824,6 +2828,83 @@ def test_spawn_explicit_model_lands_on_shell_cmd(tmp_path, monkeypatch):
     """spawn(model=X) bakes `claude --model X` into the bash -lc shell cmd."""
     cmd = _spawn_and_capture_shell_cmd(tmp_path, monkeypatch, "w", model="claude-opus-4-8")
     assert "--model claude-opus-4-8" in cmd
+
+
+def test_spawn_codex_pseudo_model_selects_codex_provider(tmp_path, monkeypatch):
+    cmd = _spawn_and_capture_shell_cmd(
+        tmp_path, monkeypatch, "w", model="codex", initial_prompt="do the task"
+    )
+    assert cmd.startswith("codex --dangerously-bypass-approvals-and-sandbox")
+    assert "do the task" not in cmd
+    assert "--model codex" not in cmd
+
+
+def test_fleet_codex_default_overrides_claude_role_default(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+    from bot_squad_worker import fleet_model
+    import bot_squad_worker.sessions as S
+
+    fleet_model.set_model("codex", S._caps_config_dir(cfg))
+    cmd = _spawn_and_capture_shell_cmd(
+        tmp_path, monkeypatch, "gu_a1b2c3-user-conversation"
+    )
+    assert cmd.startswith("codex --dangerously-bypass-approvals-and-sandbox")
+    assert "--model sonnet" not in cmd
+
+
+def test_fleet_codex_default_rejects_accidental_sonnet_override(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+    from bot_squad_worker import fleet_model
+    import bot_squad_worker.sessions as S
+    from bot_squad_worker.actions import ActionError
+
+    # T-0802: spawn() ensures the project's tmux session BEFORE it validates the
+    # model, so this test — which only cares about the rejection — was creating a
+    # REAL `tmux new-session -d -s test-project -n _init` on the host, once per
+    # suite run. Its neighbours all go through _spawn_and_capture_shell_cmd,
+    # which stubs this seam; this one calls spawn() directly and did not.
+    #
+    # FOUND BY THE fake_bin/tmux SHIM, not by the analysis that named the leak in
+    # test_tg_listener.py: the shim logs every tmux invocation, and a full-suite
+    # run showed this second `new-session -s test-project` alongside the known
+    # one. It matters beyond tidiness — it needs no leaked config to fire, so it
+    # would have kept re-creating the very session the ticket is about even after
+    # the conftest fixture closed the other path.
+    monkeypatch.setattr(S, "_run", lambda args, **kw: subprocess.CompletedProcess(
+        args, 0, "", ""))
+
+    fleet_model.set_model("codex", S._caps_config_dir(cfg))
+    with pytest.raises(ActionError, match="project default is Codex"):
+        spawn(cfg, "test-project", "w", model="sonnet")
+
+
+def test_explicit_claude_provider_can_override_codex_project_default(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg = _make_cfg(tmp_path, repo)
+    from bot_squad_worker import fleet_model
+    import bot_squad_worker.sessions as S
+
+    fleet_model.set_model("codex", S._caps_config_dir(cfg))
+    cmd = _spawn_and_capture_shell_cmd(
+        tmp_path, monkeypatch, "w", model="sonnet", provider="claude"
+    )
+    assert cmd.startswith("claude --dangerously-skip-permissions")
+    assert "--model sonnet" in cmd
+
+
+@pytest.mark.parametrize(
+    ("alias", "model"),
+    [("terra", "gpt-5.6-terra"), ("luna", "gpt-5.6-luna")],
+)
+def test_codex_model_alias_lands_on_codex_command(tmp_path, monkeypatch, alias, model):
+    cmd = _spawn_and_capture_shell_cmd(tmp_path, monkeypatch, "w", model=alias)
+    assert cmd.startswith("codex --dangerously-bypass-approvals-and-sandbox")
+    assert f"--model {model}" in cmd
 
 
 def test_spawn_without_model_still_names_the_catch_all_default(tmp_path, monkeypatch):

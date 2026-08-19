@@ -76,7 +76,8 @@ def test_no_thread_is_a_noop(cfg_slug, monkeypatch):
     cfg, slug = cfg_slug
     dispatched = _stub(monkeypatch)
     result = UC.check_project(cfg, slug)
-    assert result == {"ok": True, "redriven": []}
+    assert result == {"ok": True, "redriven": [], "probe_broken": [],
+                      "aged_out": []}
     assert dispatched == []
 
 
@@ -172,7 +173,7 @@ def test_idle_after_pressure_clears_redrives_exactly_once(cfg_slug, monkeypatch)
     dispatched = _stub(monkeypatch, activity="idle")
 
     result = UC.check_project(cfg, slug, now=now)
-    assert result["redriven"] == [{"gid": GID, "sid": SID, "pings": 1}]
+    assert result["redriven"] == [{"gid": GID, "sid": SID, "pings": 1, "thread": ""}]
     assert len(dispatched) == 1
     name, params = dispatched[0]
     assert name == "ensure_user_conversation"
@@ -215,7 +216,7 @@ def test_new_message_after_a_reply_resets_ping_state(cfg_slug, monkeypatch):
     assert UC.check_project(cfg, slug, now=now)["redriven"] == []
     # …and the ping that does come is ping 1 of a fresh cadence, not ping 4.
     result = UC.check_project(cfg, slug, now=now + 300)
-    assert result["redriven"] == [{"gid": GID, "sid": SID, "pings": 1}]
+    assert result["redriven"] == [{"gid": GID, "sid": SID, "pings": 1, "thread": ""}]
     assert len(dispatched) == 4
 
 
@@ -375,7 +376,7 @@ def test_system_record_after_the_user_message_does_not_hide_it(cfg_slug, monkeyp
 
     result = UC.check_project(cfg, slug, now=now)
 
-    assert result["redriven"] == [{"gid": GID, "sid": SID, "pings": 1}]
+    assert result["redriven"] == [{"gid": GID, "sid": SID, "pings": 1, "thread": ""}]
     # …and it re-drives with the USER's text, not the system notice's.
     assert dispatched[0][1]["message_ref"] == "please answer"
 
@@ -425,7 +426,7 @@ def test_torn_trailing_line_does_not_hide_the_hanging_message(cfg_slug, monkeypa
     dispatched = _stub(monkeypatch, activity="idle")
 
     assert UC.check_project(cfg, slug, now=now)["redriven"] == [
-        {"gid": GID, "sid": SID, "pings": 1}]
+        {"gid": GID, "sid": SID, "pings": 1, "thread": ""}]
 
 
 # ===========================================================================
@@ -597,3 +598,445 @@ def test_a_dead_operator_session_is_not_a_delivery(cfg_slug, monkeypatch):
     state = json.loads((Path(cfg.data_dir) / slug / "_worker" / "uc_redrive"
                         / "state.json").read_text())
     assert state[GID]["escalated_to"] == []
+
+
+# ===========================================================================
+# T-0917 — the probe's INPUT. Its cadence and trigger were both correct; the
+# log it read had stopped carrying answers. Each test below names the property
+# whose removal it must catch, because a guard nobody proved can fail is prose
+# (feedback: prove-the-guard-can-fail).
+# ===========================================================================
+
+def _write_topic(cfg, slug, gid, thread, records, *, mtime=None):
+    """One per-topic log: ``<slug>/<gid>/t<N>.jsonl`` beside ``<gid>.jsonl``."""
+    d = Path(cfg.data_dir) / "_mothership" / "conversations" / slug / gid
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{thread}.jsonl"
+    p.write_text("".join(json.dumps(r) + "\n" for r in records))
+    if mtime is not None:
+        import os
+        os.utime(p, (mtime, mtime))
+    return p
+
+
+def test_root_log_ask_is_answered_by_a_reply_in_a_topic_log(cfg_slug, monkeypatch):
+    """THE LIVE INCIDENT, reproduced to the minute (2026-08-18).
+
+    ``_fallback_undelivered`` files an undeliverable message into the ROOT log
+    THREADLESS; the attendant's reply is filed in the topic it was sent to. The
+    root log therefore cannot hold its own answer, and requiring one there
+    produced 23 pings and an operator escalation for a message answered 67
+    seconds after it arrived.
+
+    Property: a root-log ask is answered by a ``session:`` record in ANY log of
+    the same gid. Delete the ``newest_answer`` check in ``check_project`` and
+    this goes red.
+    """
+    cfg, slug = cfg_slug
+    now = time.time()
+    ask = now - 3600
+    _write_thread(cfg, slug, GID, [
+        {"timestamp": _iso(ask - 60), "author": "system:undelivered",
+         "text": "адресовано сессии S-x, она не активна"},
+        {"timestamp": _iso(ask), "author": "user", "text": "задача про aqice"},
+    ])
+    _write_topic(cfg, slug, GID, "t11", [
+        {"timestamp": _iso(ask - 12), "author": "user", "text": "что с презой?"},
+        {"timestamp": _iso(ask + 67), "author": f"session:{SID}",
+         "text": "Принял всё"},
+    ])
+    dispatched = _stub(monkeypatch)
+
+    result = UC.check_project(cfg, slug, now=now)
+
+    assert result["redriven"] == []
+    assert dispatched == []
+
+
+def test_a_hang_in_a_topic_log_is_seen_at_all(cfg_slug, monkeypatch):
+    """The per-topic logs were invisible to this module — it globbed only
+    ``*.jsonl`` at the top of the conversations dir, and since the forum-topic
+    era that is not where the conversation is. Property: the sweep descends one
+    level. Revert ``_conversation_files`` to a single ``*.jsonl`` glob and this
+    goes red."""
+    cfg, slug = cfg_slug
+    now = time.time()
+    _write_topic(cfg, slug, GID, "t11", [
+        {"timestamp": _iso(now - 600), "author": f"session:{SID}", "text": "hi"},
+        {"timestamp": _iso(now - 590), "author": "user", "text": "please answer"},
+    ])
+    dispatched = _stub(monkeypatch)
+
+    result = UC.check_project(cfg, slug, now=now)
+
+    assert result["redriven"] == [
+        {"gid": GID, "sid": SID, "pings": 1, "thread": "t11"}]
+    assert [n for n, _ in dispatched] == ["ensure_user_conversation"]
+
+
+def test_a_topic_log_is_judged_alone_not_by_its_siblings(cfg_slug, monkeypatch):
+    """The cross-log answer check is deliberately NOT symmetric. A per-topic log
+    carries both halves, so a ``session:`` record in some OTHER topic — a dev
+    session posting a status line into a per-task topic, which the live install
+    does — must not be read as an answer to a hang in this one.
+
+    Property: only ``thread == ""`` consults ``newest_answer``. Drop that
+    condition and this goes red while
+    ``test_root_log_ask_is_answered_by_a_reply_in_a_topic_log`` stays green —
+    which is why both exist.
+    """
+    cfg, slug = cfg_slug
+    now = time.time()
+    _write_topic(cfg, slug, GID, "t11", [
+        {"timestamp": _iso(now - 600), "author": f"session:{SID}", "text": "hi"},
+        {"timestamp": _iso(now - 590), "author": "user", "text": "please answer"},
+    ])
+    _write_topic(cfg, slug, GID, "t1181", [
+        {"timestamp": _iso(now - 60), "author": "session:S-u-chart-round3-p55",
+         "text": "деплой прошёл"},
+    ])
+    _stub(monkeypatch)
+
+    result = UC.check_project(cfg, slug, now=now)
+
+    assert [r["thread"] for r in result["redriven"]] == ["t11"]
+
+
+def test_root_and_topic_logs_keep_independent_ping_campaigns(cfg_slug, monkeypatch):
+    """Two logs of one gid hang independently, so their state cannot share a
+    key. Property: ``_conversation_files`` keys a topic ``<gid>/t<N>``. Key both
+    on the bare gid and one campaign silently overwrites the other."""
+    cfg, slug = cfg_slug
+    now = time.time()
+    _write_topic(cfg, slug, GID, "t11", [
+        {"timestamp": _iso(now - 3000), "author": f"session:{SID}", "text": "hi"},
+        {"timestamp": _iso(now - 2000), "author": "user", "text": "topic ask"},
+    ])
+    _write_topic(cfg, slug, GID, "t23", [
+        {"timestamp": _iso(now - 3000), "author": f"session:{SID}", "text": "hi"},
+        {"timestamp": _iso(now - 600), "author": "user", "text": "other ask"},
+    ])
+    _stub(monkeypatch)
+
+    UC.check_project(cfg, slug, now=now)
+
+    state = json.loads((Path(cfg.data_dir) / slug / "_worker" / "uc_redrive"
+                        / "state.json").read_text())
+    assert set(state) == {f"{GID}/t11", f"{GID}/t23"}
+    assert state[f"{GID}/t11"]["msg_ts"] != state[f"{GID}/t23"]["msg_ts"]
+
+
+# --- PROBE-BROKEN (ticket item 2) -----------------------------------------
+
+def _probe_broken_log(cfg, slug, now, *, gid=GID):
+    """A log whose answer half died a week ago while asks kept landing — the
+    shape watchrobot's root log had for seven days."""
+    day = 86400
+    _write_thread(cfg, slug, gid, [
+        {"timestamp": _iso(now - 7 * day), "author": f"session:{SID}", "text": "ok"},
+        {"timestamp": _iso(now - 3 * day), "author": "user", "text": "ask one"},
+        {"timestamp": _iso(now - 2 * day), "author": "user", "text": "ask two"},
+        {"timestamp": _iso(now - 600), "author": "user", "text": "ask three"},
+    ])
+
+
+def test_probe_broken_is_a_different_verdict_and_pings_nobody(cfg_slug, monkeypatch):
+    """Ticket item 2, verbatim: a predicate that cannot say "answered" must
+    shout PROBE-BROKEN rather than "hanging". Property: the ``probe_broken``
+    branch precedes the cadence and ``continue``s. Remove it and this log is
+    reported as an ordinary hang and the attendant is nudged."""
+    cfg, slug = cfg_slug
+    now = time.time()
+    _probe_broken_log(cfg, slug, now)
+    dispatched = _stub(monkeypatch)
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    monkeypatch.setattr(A, "_action_inject_input", lambda p: None)
+
+    result = UC.check_project(cfg, slug, now=now)
+
+    assert result["redriven"] == []
+    assert dispatched == []
+    assert [d["key"] for d in result["probe_broken"]] == [GID]
+    assert result["probe_broken"][0]["asks_since"] == 3
+
+
+def test_probe_broken_escalation_says_it_cannot_read_the_log(cfg_slug, monkeypatch):
+    """The two verdicts must not read alike: the previous one sent two people to
+    wake an attendant that had already replied. Property: a distinct message via
+    ``_notify_probe_broken``."""
+    from bot_squad_worker import intersession as I
+
+    cfg, slug = cfg_slug
+    now = time.time()
+    _probe_broken_log(cfg, slug, now)
+    _stub(monkeypatch)
+    _live_operator(cfg, slug)
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    nudged: list[dict] = []
+    monkeypatch.setattr(A, "_action_inject_input", lambda p: nudged.append(p))
+
+    UC.check_project(cfg, slug, now=now)
+
+    msg = I.inbox_read(cfg, slug, OPERATOR_SID)["messages"][0]
+    assert "PROBE-BROKEN" in msg
+    assert "NOT pinging" in msg
+    assert "UNANSWERED user message" not in msg
+    assert [n["sid"] for n in nudged] == [OPERATOR_SID]
+
+
+def test_probe_broken_escalation_retries_until_it_lands(cfg_slug, monkeypatch):
+    """Same contract as the hanging escalation (T-0790): an alert that reached
+    NOBODY is not recorded as done. Property: ``escalated_to`` empty ⇒ re-send
+    next tick."""
+    from bot_squad_worker import intersession as I
+
+    cfg, slug = cfg_slug
+    now = time.time()
+    _probe_broken_log(cfg, slug, now)
+    _stub(monkeypatch)
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    monkeypatch.setattr(A, "_action_inject_input", lambda p: None)
+
+    UC.check_project(cfg, slug, now=now)          # no operator alive yet
+    state = json.loads((Path(cfg.data_dir) / slug / "_worker" / "uc_redrive"
+                        / "state.json").read_text())
+    assert state[f"probe:{GID}"]["escalated_to"] == []
+
+    _live_operator(cfg, slug)
+    UC.check_project(cfg, slug, now=now + 60)
+
+    assert "PROBE-BROKEN" in I.inbox_read(cfg, slug, OPERATOR_SID)["messages"][0]
+
+
+def test_one_ask_after_a_stale_reply_is_a_hang_not_a_broken_probe(cfg_slug, monkeypatch):
+    """The inverted error is as bad as the original: calling an ordinary hanging
+    message "instrument dead" is how a real hang stops being pinged. Property:
+    :func:`probe_broken`'s span clause — one ask spans zero seconds, which can
+    never exceed the staleness window. (A separate minimum-ask-count constant
+    used to sit beside that clause; a mutation pass showed it could never fire
+    on its own, so it is gone and this test pins the clause that does.)"""
+    cfg, slug = cfg_slug
+    now = time.time()
+    _write_thread(cfg, slug, GID, [
+        {"timestamp": _iso(now - 7 * 86400), "author": f"session:{SID}", "text": "ok"},
+        {"timestamp": _iso(now - 600), "author": "user", "text": "the only ask"},
+    ])
+    dispatched = _stub(monkeypatch)
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    monkeypatch.setattr(A, "_action_inject_input", lambda p: None)
+
+    result = UC.check_project(cfg, slug, now=now)
+
+    assert result["probe_broken"] == []
+    assert result["redriven"] == [
+        {"gid": GID, "sid": SID, "pings": 1, "thread": ""}]
+    assert [n for n, _ in dispatched] == ["ensure_user_conversation"]
+
+
+def test_asks_must_span_the_window_before_the_log_is_called_broken(cfg_slug, monkeypatch):
+    """Two asks minutes apart after a long quiet spell is a busy morning, not a
+    dead log. Property: the ``asks_span_sec > stale`` clause."""
+    cfg, slug = cfg_slug
+    now = time.time()
+    _write_thread(cfg, slug, GID, [
+        {"timestamp": _iso(now - 9 * 86400), "author": f"session:{SID}", "text": "ok"},
+        {"timestamp": _iso(now - 900), "author": "user", "text": "ask one"},
+        {"timestamp": _iso(now - 600), "author": "user", "text": "ask two"},
+    ])
+    _stub(monkeypatch)
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    monkeypatch.setattr(A, "_action_inject_input", lambda p: None)
+
+    result = UC.check_project(cfg, slug, now=now)
+
+    assert result["probe_broken"] == []
+    assert [r["pings"] for r in result["redriven"]] == [1]
+
+
+def test_a_log_that_never_carried_a_reply_is_not_probe_broken(cfg_slug, monkeypatch):
+    """A per-task topic is a monologue by design and a new conversation has no
+    history — neither has a "stopped" to detect. Property: the
+    ``if not newest: return None`` guard."""
+    cfg, slug = cfg_slug
+    now = time.time()
+    recs = [{"timestamp": _iso(now - (5 - i) * 86400), "author": "user",
+             "text": f"ask {i}"} for i in range(4)]
+    _write_thread(cfg, slug, GID, recs)
+    _stub(monkeypatch)
+
+    assert UC.probe_broken(recs, now=now) is None
+    assert UC.check_project(cfg, slug, now=now)["probe_broken"] == []
+
+
+def test_probe_broken_clears_when_a_sibling_topic_answers(cfg_slug, monkeypatch):
+    """A diagnosis that never retracts is a second stuck alarm — and there are
+    THREE paths on which a log becomes readable again, each with its own
+    ``state.pop(pkey)``. This one: the answer arrives in a sibling topic log.
+    A mutation pass caught the other two being untested."""
+    cfg, slug = cfg_slug
+    now = time.time()
+    _probe_broken_log(cfg, slug, now)
+    _stub(monkeypatch)
+    _live_operator(cfg, slug)
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    monkeypatch.setattr(A, "_action_inject_input", lambda p: None)
+    UC.check_project(cfg, slug, now=now)
+    sp = Path(cfg.data_dir) / slug / "_worker" / "uc_redrive" / "state.json"
+    assert f"probe:{GID}" in json.loads(sp.read_text())
+
+    _write_topic(cfg, slug, GID, "t11", [
+        {"timestamp": _iso(now - 300), "author": f"session:{SID}", "text": "answered"},
+    ])
+    UC.check_project(cfg, slug, now=now + 60)
+
+    assert f"probe:{GID}" not in json.loads(sp.read_text())
+
+
+# --- the aged-out floor: the fix must not become the failure ---------------
+
+def test_an_old_untracked_hang_opens_no_ping_campaign(cfg_slug, monkeypatch):
+    """Widening the sweep uncovered eight dormant hangs on the live install, the
+    oldest from 2026-07-31. Pinging and escalating each would have been this
+    ticket's own failure mode delivered by its fix. Property:
+    :func:`max_first_ping_age_sec` applied while ``pings == 0``."""
+    cfg, slug = cfg_slug
+    now = time.time()
+    old = now - 12 * 86400
+    _write_topic(cfg, slug, GID, "t278", [
+        {"timestamp": _iso(old - 60), "author": f"session:{SID}", "text": "hi"},
+        {"timestamp": _iso(old), "author": "user", "text": "ancient ask"},
+    ])
+    dispatched = _stub(monkeypatch)
+
+    result = UC.check_project(cfg, slug, now=now)
+
+    assert result["redriven"] == []
+    assert dispatched == []
+    assert [a["key"] for a in result["aged_out"]] == [f"{GID}/t278"]
+
+
+def test_a_campaign_already_running_keeps_pinging_past_the_floor(cfg_slug, monkeypatch):
+    """The floor is about opening a campaign, never about bounding one — the
+    bound was the bug T-0794 removed. Property: the age test is gated on
+    ``pings == 0``, so one ping already sent exempts the campaign forever."""
+    cfg, slug = cfg_slug
+    now = time.time()
+    msg_at = now - 600
+    _write_thread(cfg, slug, GID, [
+        {"timestamp": _iso(msg_at), "author": "user", "text": "still hanging"},
+    ])
+    _stub(monkeypatch)
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    monkeypatch.setattr(A, "_action_inject_input", lambda p: None)
+
+    UC.check_project(cfg, slug, now=now)                       # ping 1, tracked
+    late = msg_at + 3 * 86400                                  # well past the floor
+    result = UC.check_project(cfg, slug, now=late)
+
+    assert result["aged_out"] == []
+    assert [r["pings"] for r in result["redriven"]] == [2]
+
+
+def test_a_dormant_log_is_not_read_every_tick(cfg_slug, monkeypatch):
+    """A log untouched for longer than the floor cannot hold a pingable message
+    (its mtime is never older than its newest record), so re-reading every
+    archived topic once a minute buys nothing. Property: the mtime skip in
+    :func:`_conversation_files`."""
+    cfg, slug = cfg_slug
+    now = time.time()
+    old = now - 30 * 86400
+    _write_topic(cfg, slug, GID, "t23", [
+        {"timestamp": _iso(old), "author": "user", "text": "archived ask"},
+    ], mtime=old)
+    _write_topic(cfg, slug, GID, "t11", [
+        {"timestamp": _iso(now - 600), "author": f"session:{SID}", "text": "hi"},
+    ])
+    _stub(monkeypatch)
+
+    keys = [c["key"] for c in UC._conversation_files(
+        Path(cfg.data_dir) / "_mothership" / "conversations" / slug,
+        now=now, max_age_sec=UC.max_first_ping_age_sec())]
+
+    assert keys == [f"{GID}/t11"]
+    assert UC.check_project(cfg, slug, now=now)["aged_out"] == []
+
+
+def test_probe_broken_clears_when_the_log_itself_is_answered(cfg_slug, monkeypatch):
+    """Second clearing path: the log's own newest record becomes a reply, so
+    ``_unanswered_in`` returns ``None``. Property: the ``state.pop(pkey)`` in
+    the ``rec is None`` branch."""
+    cfg, slug = cfg_slug
+    now = time.time()
+    _probe_broken_log(cfg, slug, now)
+    _stub(monkeypatch)
+    _live_operator(cfg, slug)
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    monkeypatch.setattr(A, "_action_inject_input", lambda p: None)
+    UC.check_project(cfg, slug, now=now)
+    sp = Path(cfg.data_dir) / slug / "_worker" / "uc_redrive" / "state.json"
+    assert f"probe:{GID}" in json.loads(sp.read_text())
+
+    p = Path(cfg.data_dir) / "_mothership" / "conversations" / slug / f"{GID}.jsonl"
+    p.write_text(p.read_text() + json.dumps(
+        {"timestamp": _iso(now - 60), "author": f"session:{SID}",
+         "text": "answered at last"}) + "\n")
+    UC.check_project(cfg, slug, now=now + 60)
+
+    assert f"probe:{GID}" not in json.loads(sp.read_text())
+
+
+def test_probe_broken_clears_while_the_message_still_hangs(cfg_slug, monkeypatch):
+    """Third clearing path, and the one that matters most: the log starts
+    recording replies again but the newest message is still an unanswered ask.
+    The verdict must fall back to an ordinary hang — pinged, not diagnosed.
+    Property: the mid-loop ``state.pop(pkey)`` on the not-broken path."""
+    cfg, slug = cfg_slug
+    now = time.time()
+    _probe_broken_log(cfg, slug, now)
+    dispatched = _stub(monkeypatch)
+    _live_operator(cfg, slug)
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    monkeypatch.setattr(A, "_action_inject_input", lambda p: None)
+    UC.check_project(cfg, slug, now=now)
+    sp = Path(cfg.data_dir) / slug / "_worker" / "uc_redrive" / "state.json"
+    assert f"probe:{GID}" in json.loads(sp.read_text())
+    dispatched.clear()
+
+    p = Path(cfg.data_dir) / "_mothership" / "conversations" / slug / f"{GID}.jsonl"
+    p.write_text(p.read_text() + "".join(json.dumps(r) + "\n" for r in [
+        {"timestamp": _iso(now - 900), "author": f"session:{SID}", "text": "back"},
+        {"timestamp": _iso(now - 800), "author": "user", "text": "a fresh ask"},
+    ]))
+    result = UC.check_project(cfg, slug, now=now + 60)
+
+    assert f"probe:{GID}" not in json.loads(sp.read_text())
+    assert result["probe_broken"] == []
+    assert [r["pings"] for r in result["redriven"]] == [1]
+    assert [n for n, _ in dispatched] == ["ensure_user_conversation"]
+
+
+def test_a_legacy_state_stub_does_not_smuggle_an_ancient_hang_past_the_floor(
+        cfg_slug, monkeypatch):
+    """Measured on the live install while walking this fix over a copy of it:
+    ``watchrobot/gu_5e3d…`` carries a state entry written under the pre-T-0794
+    schema (``retries``/``last_redrive_at``, no ``pings``) whose ``msg_ts``
+    still MATCHES the hanging record — so the reset branch never runs and a
+    24-day-old message would have been pinged as though tracked. Property: the
+    floor tests ``pings``, not whether a state entry happens to exist."""
+    cfg, slug = cfg_slug
+    now = time.time()
+    old = now - 24 * 86400
+    _write_thread(cfg, slug, GID, [
+        {"timestamp": _iso(old), "author": "user", "text": "ancient"},
+    ])
+    sp = Path(cfg.data_dir) / slug / "_worker" / "uc_redrive"
+    sp.mkdir(parents=True, exist_ok=True)
+    (sp / "state.json").write_text(json.dumps({GID: {
+        "msg_ts": _iso(old), "retries": 3, "last_redrive_at": old}}))
+    dispatched = _stub(monkeypatch)
+
+    result = UC.check_project(cfg, slug, now=now)
+
+    assert result["redriven"] == []
+    assert dispatched == []
+    assert [a["key"] for a in result["aged_out"]] == [GID]

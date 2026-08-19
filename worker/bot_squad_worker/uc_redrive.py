@@ -75,6 +75,52 @@ NOBODY as not-yet-escalated: it retries on each following ping slot until a live
 operator sid actually receives it, rather than spending its one alert on an
 empty fan-out.
 
+T-0917 — the probe was reading a log the attendant had stopped writing to
+=========================================================================
+For a week this module escalated the same message once every ~30 minutes and
+was dismissed as a false alarm twice in one hour, by two different people, each
+with their own wrong explanation. Neither the cadence nor the trigger was at
+fault. Its INPUT was.
+
+Measured on the live install 2026-08-19, watchrobot's thread with the
+stakeholder: the root ``gu_dc82….jsonl`` held 261 ``user`` records current to
+2026-08-18 and 223 ``session:`` records whose newest was 2026-08-12 — while
+``gu_dc82…/t11.jsonl``, which this module never opened, held 1023 records with
+both halves current. The forum-topic era (T-0660/T-0676) moved the conversation
+into per-topic logs; T-0606 (landed 2026-08-12 10:22Z) made the append honour
+the ``thread_id`` the attendant supplies, which closed the last path that still
+wrote a reply into the root log. The asks kept arriving there anyway, because
+``tg_listener._fallback_undelivered`` files an undeliverable message THREADLESS
+by design. So the root log became a place asks go in and answers never appear,
+and "newest user record with no ``session:`` after it" could only ever answer
+"hanging". The message it burned itself on had been answered 67 seconds later,
+in ``t11``.
+
+Three changes, and the third is the one that generalises:
+
+* **The sweep** covers every log of a conversation, root and per-topic
+  (:func:`_conversation_files`), each with its own ping campaign.
+* **The answer** to a ROOT log's ask may live in ANY log of that gid
+  (:func:`check_project`) — that log cannot record its own answer, so requiring
+  one there is requiring the impossible. Per-topic logs carry both halves and
+  are judged alone, so an unrelated session posting into another topic cannot
+  mask a real hang.
+* **A predicate that cannot say "answered" now says PROBE-BROKEN**
+  (:func:`probe_broken`), not "hanging". The cheap signal is the ticket's own:
+  the age of the newest ``session:`` record while asks keep landing. This is
+  the guard that would have caught the defect above on 2026-08-13 instead of
+  2026-08-19, and it is deliberately a different verdict with a different
+  message, because the previous verdict sent two people to wake an attendant
+  that had already replied.
+
+A fourth change exists only to keep the first from doing harm: a hanging
+message this module has never tracked and which is already older than
+:func:`max_first_ping_age_sec` opens no campaign at all
+(:data:`DEFAULT_MAX_FIRST_PING_AGE_SEC`). Widening the sweep uncovered eight
+dormant hangs on the live install, the oldest from 2026-07-31; pinging and
+escalating each of them would have been this ticket's own failure mode,
+delivered by its fix.
+
 Kill switch: ``BOT_SQUAD_UC_REDRIVE=0``.
 """
 from __future__ import annotations
@@ -112,6 +158,33 @@ DEFAULT_STEADY_PING_SEC = 1800
 #: escalation rides the entry into the steady state instead of being a third
 #: independent number to keep in sync.
 ESCALATE_AFTER_PINGS = 2
+
+#: T-0917 item 2 — the PROBE-BROKEN threshold. A conversation log whose newest
+#: ``session:`` record is older than this WHILE asks keep landing in it has an
+#: input this module can no longer read an answer from, and "he has not been
+#: answered" is then a statement about the LOG, not about him. One day: far past
+#: any plausible reply latency, far short of the three weeks the live instance
+#: ran undetected.
+DEFAULT_PROBE_STALE_SEC = 86400
+
+#: A hanging message this module has NEVER pinged and which is ALREADY older
+#: than this is history, not a reply turn that died: the docstring's whole scope
+#: is an attendant that went idle mid-answer, and a day-old ask needs a human
+#: decision rather than a nudge carrying context nobody holds any more. Without
+#: this floor the moment T-0917 widened the sweep to per-topic logs, eight
+#: dormant hangs (the oldest from 2026-07-31) would each have opened a fresh
+#: ping campaign and escalated — the alarm burn this ticket exists to stop,
+#: caused by its own fix.
+DEFAULT_MAX_FIRST_PING_AGE_SEC = 86400
+
+
+def probe_stale_sec() -> int:
+    return _env_sec("BOT_SQUAD_UC_REDRIVE_PROBE_STALE_SEC", DEFAULT_PROBE_STALE_SEC)
+
+
+def max_first_ping_age_sec() -> int:
+    return _env_sec("BOT_SQUAD_UC_REDRIVE_MAX_FIRST_PING_AGE_SEC",
+                    DEFAULT_MAX_FIRST_PING_AGE_SEC)
 
 
 def _env_sec(name: str, default: int) -> int:
@@ -179,6 +252,150 @@ def _conversations_dir(cfg: Any, slug: str) -> Path:
     return Path(cfg.data_dir) / "_mothership" / "conversations" / slug
 
 
+def _conversation_files(conv_dir: Path, *, now: float, max_age_sec: float,
+                        tracked: Any = ()) -> list[dict]:
+    """Every conversation log under ``conv_dir``, as
+    ``{"key", "gid", "thread", "path"}`` — the ROOT ``<gid>.jsonl`` files AND
+    the per-topic ``<gid>/t<N>.jsonl`` files beside them.
+
+    T-0917: the per-topic files were invisible here, and since the forum-topic
+    era (T-0660/T-0676, late July 2026) they are where the conversation
+    actually happens. Measured on the live install on 2026-08-19: watchrobot's
+    root ``gu_dc82….jsonl`` held its last ``session:`` record on 2026-08-12
+    while ``gu_dc82…/t11.jsonl`` held 1023 records with both halves current to
+    2026-08-18. Globbing only the root file meant the probe read a log the
+    attendant no longer writes to.
+
+    ``key`` is the STATE key: the bare gid for a root file, ``<gid>/t<N>`` for a
+    topic. It must stay distinct per log — two topics of one gid hang
+    independently and cannot share one ping campaign.
+
+    Files untouched for longer than ``max_age_sec`` are skipped: a log's mtime
+    is never older than its newest record, so a message FIRST SEEN in one is
+    past :func:`max_first_ping_age_sec` and would be aged out below anyway.
+    That is what keeps this sweep from re-reading every archived topic (~2 MB
+    on the live install) once a minute to reach the same conclusion.
+
+    ``tracked`` is the exemption, and it is not an optimisation detail: a
+    campaign ALREADY RUNNING must keep pinging for as long as the message hangs
+    (T-0794 removed the three-attempt bound precisely because a bound was the
+    bug), and a hanging message in a log nothing else appends to is exactly the
+    case whose mtime stops advancing. Skipping those would reinstate the bound
+    by the back door, silently, after a day.
+    """
+    keep = set(tracked or ())
+    out: list[dict] = []
+    for pattern in ("*.jsonl", "*/*.jsonl"):
+        for p in sorted(conv_dir.glob(pattern)):
+            if p.parent == conv_dir:
+                conv = {"key": p.stem, "gid": p.stem, "thread": "", "path": p}
+            else:
+                gid = p.parent.name
+                conv = {"key": f"{gid}/{p.stem}", "gid": gid,
+                        "thread": p.stem, "path": p}
+            if conv["key"] not in keep:
+                try:
+                    if now - p.stat().st_mtime > max_age_sec:
+                        continue
+                except OSError:
+                    continue
+            out.append(conv)
+    return out
+
+
+def _read_records(path: Path) -> list[dict]:
+    """Every well-formed record in one conversation log, in file order.
+
+    Tolerates a torn/garbage line (mirrors ``conversation_store``'s own read
+    tolerance) by skipping it — a half-written tail must not hide the records
+    behind it.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: list[dict] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
+def _newest_session_ts(records: list[dict]) -> str:
+    """The newest ``session:``-authored timestamp in ``records``, or ``""``."""
+    best = ""
+    for rec in records:
+        if str(rec.get("author") or "").startswith("session:"):
+            ts = str(rec.get("timestamp") or "")
+            if ts > best:
+                best = ts
+    return best
+
+
+def probe_broken(records: list[dict], *, now: float) -> dict | None:
+    """Whether this log can still tell us "answered" — T-0917 item 2.
+
+    Returns a diagnosis dict when the log's ANSWER half has gone dead, ``None``
+    when the log is readable. This is a DIFFERENT verdict from "he has not been
+    answered", and keeping them apart is the whole point: on 2026-08-18 the same
+    alert was raised, dismissed as a false alarm, and re-raised — twice, by two
+    people, each with their own wrong explanation — because a probe whose input
+    had died could only ever say "hanging". The message it fired on carried the
+    stakeholder's go-ahead on the largest open move in the project, and both
+    dismissals were wrong.
+
+    The signal is the cheap one the ticket names — the age of the newest
+    ``session:`` record while asks keep landing — with two guards that stop it
+    firing on a healthy log:
+
+    * a log that has NEVER carried a ``session:`` record is not broken. It is a
+      one-sided feed (a per-task topic is a monologue BY DESIGN) or a brand-new
+      conversation, and there is no "stopped" to detect without a "started".
+    * the asks after the last answer must SPAN more than the staleness window
+      themselves. A thread that was quiet for a week and got one message four
+      minutes ago is genuinely unanswered, not unreadable — and calling that
+      "instrument dead" would trade the false "hanging" for the same error
+      inverted, which is how a real hang stops being pinged. A span of more
+      than :func:`probe_stale_sec` means the log kept taking traffic for over a
+      day (necessarily two asks or more) and recorded not one reply to any of
+      it. This is the ONE clause that bounds the verdict; a separate
+      minimum-ask-count constant used to sit beside it and a mutation pass
+      showed it could never fire on its own.
+    """
+    newest = _newest_session_ts(records)
+    at = _parse_iso(newest)
+    if at is None:
+        # No answer was EVER recorded here (or the newest one is undatable). A
+        # per-task topic is a monologue by design and a new conversation has no
+        # history — neither has a "stopped" to detect without a "started".
+        return None
+    stale = probe_stale_sec()
+    if now - at <= stale:
+        return None
+    asks = sorted(
+        str(r.get("timestamp") or "") for r in records
+        if str(r.get("author") or "") == "user"
+        and str(r.get("timestamp") or "") > newest
+    )
+    first = _parse_iso(asks[0]) if asks else None
+    last = _parse_iso(asks[-1]) if asks else None
+    if first is None or last is None or (last - first) <= stale:
+        return None
+    return {
+        "last_session_ts": newest,
+        "session_age_sec": int(now - at),
+        "asks_since": len(asks),
+        "asks_span_sec": int(last - first),
+    }
+
+
 def _unanswered_user_record(path: Path) -> dict | None:
     """The newest ``author: "user"`` record that NO session reply follows, or
     ``None`` when the thread owes nothing.
@@ -201,20 +418,12 @@ def _unanswered_user_record(path: Path) -> dict | None:
     Tolerates a torn/garbage line (mirrors ``conversation_store``'s own read
     tolerance) by skipping it and looking further back.
     """
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return None
-    for line in reversed(lines):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(rec, dict):
-            continue
+    return _unanswered_in(_read_records(path))
+
+
+def _unanswered_in(records: list[dict]) -> dict | None:
+    """:func:`_unanswered_user_record`'s predicate over already-read records."""
+    for rec in reversed(records):
         author = str(rec.get("author") or "")
         if author == "user":
             return rec
@@ -252,10 +461,14 @@ def _save_state(cfg: Any, slug: str, state: dict) -> None:
 
 
 def _notify_operator_stuck(
-    cfg: Any, slug: str, gid: str, *, pings: int, hanging_sec: float,
+    cfg: Any, slug: str, key: str, *, pings: int, hanging_sec: float,
 ) -> list[str]:
     """Escalate one hanging message to a LIVE operator. Returns the sids it
     actually reached — ``[]`` when nobody did.
+
+    ``key`` names the conversation LOG (``<gid>`` or ``<gid>/t<N>``), not just
+    the gid: since T-0917 sweeps per-topic logs, an alert that named only the
+    gid would send the reader to a file the message is not in.
 
     The return value is the point (T-0794/T-0790). ``to="operator"`` resolves
     through :func:`dispatch.live_operator_sids`, so with no operator on duty it
@@ -269,20 +482,20 @@ def _notify_operator_stuck(
         from bot_squad_worker import intersession as _inter
         out = _inter.send(
             cfg, slug, to="operator",
-            text=(f"⚠️ uc_redrive: {gid} has an UNANSWERED user message — "
+            text=(f"⚠️ uc_redrive: {key} has an UNANSWERED user message — "
                   f"hanging {mins} min, {pings} re-wake ping(s) sent and the "
                   f"attendant still has not replied. Needs a human look."),
             from_sid="S-uc-redrive",
         )
     except Exception:  # noqa: BLE001 — best-effort notify must never break the tick
-        log.exception("uc_redrive: stuck-notify failed for %s/%s", slug, gid)
+        log.exception("uc_redrive: stuck-notify failed for %s/%s", slug, key)
         return []
     delivered = [str(s) for s in (out or {}).get("delivered_to") or []]
     if not delivered:
         log.warning(
             "uc_redrive: escalation for %s/%s reached NO live operator — the "
             "message has hung %d min over %d ping(s); will retry the escalation "
-            "on the next ping slot", slug, gid, mins, pings,
+            "on the next ping slot", slug, key, mins, pings,
         )
         return delivered
 
@@ -300,11 +513,75 @@ def _notify_operator_stuck(
     return delivered
 
 
-def check_project(cfg: Any, slug: str, *, now: float | None = None) -> dict:
-    """One unanswered-message sweep for a project. Returns a summary dict.
+def _notify_probe_broken(cfg: Any, slug: str, key: str, diag: dict) -> list[str]:
+    """Escalate a DEAD PROBE INPUT — not a hanging message. Returns the sids
+    reached, ``[]`` when nobody did (same contract as
+    :func:`_notify_operator_stuck`: an escalation nobody received is not
+    recorded as done).
 
-    Idempotent + side-effecting: fires at most one nudge per (slug, gid) per
-    ping slot (:func:`ping_due_after_sec`), for as long as the message hangs.
+    The wording carries the distinction to the reader, because the reader is
+    who acted on it wrongly last time. "Он не отвечен" sends someone to wake an
+    attendant; "я не могу прочитать ответ" sends them to the write path.
+    """
+    hours = int(diag.get("session_age_sec", 0) // 3600)
+    days = int(diag.get("asks_span_sec", 0) // 86400)
+    try:
+        from bot_squad_worker import intersession as _inter
+        out = _inter.send(
+            cfg, slug, to="operator",
+            text=(f"🚨 uc_redrive PROBE-BROKEN: {key} — I cannot tell whether "
+                  f"anyone has answered. The newest session: record in this "
+                  f"conversation log is {hours}h old, yet "
+                  f"{diag.get('asks_since')} user message(s) have landed in it "
+                  f"since, spanning {days}+ day(s). The log's ANSWER half is "
+                  f"dead, so 'unanswered' here is a statement about the LOG, "
+                  f"not about him. NOT pinging the attendant — this needs the "
+                  f"write path looked at, not a re-wake."),
+            from_sid="S-uc-redrive",
+        )
+    except Exception:  # noqa: BLE001 — best-effort notify must never break the tick
+        log.exception("uc_redrive: probe-broken notify failed for %s/%s", slug, key)
+        return []
+    delivered = [str(x) for x in (out or {}).get("delivered_to") or []]
+    if not delivered:
+        log.error(
+            "uc_redrive: PROBE-BROKEN for %s/%s reached NO live operator "
+            "(newest session: record %s, %d ask(s) since) — will retry",
+            slug, key, diag.get("last_session_ts"), diag.get("asks_since"))
+        return delivered
+    for sid in delivered:
+        try:
+            from bot_squad_worker.actions import _action_inject_input
+            _action_inject_input({"sid": sid, "text": "check mail"})
+        except Exception:  # noqa: BLE001
+            log.debug("uc_redrive: pane nudge skipped for %s (no live pane?)", sid)
+    return delivered
+
+
+def check_project(cfg: Any, slug: str, *, now: float | None = None) -> dict:
+    """One unanswered-message sweep for a project. Returns a summary dict:
+    ``{ok, redriven, probe_broken, aged_out}``.
+
+    Idempotent + side-effecting: fires at most one nudge per conversation log
+    per ping slot (:func:`ping_due_after_sec`), for as long as the message
+    hangs.
+
+    T-0917 changed WHAT IS SWEPT and WHAT COUNTS AS AN ANSWER:
+
+    * every log of a ``(slug, gid)`` conversation is swept, root and per-topic
+      alike (:func:`_conversation_files`), each with its own ping campaign;
+    * a ROOT log's ask is answered by a ``session:`` record in ANY log of the
+      same gid. This asymmetry is not a convenience — it is the defect. The
+      undelivered-message fallback (``tg_listener._fallback_undelivered``)
+      writes his ask into the root log DELIBERATELY THREADLESS, while the
+      attendant's answer is filed in whatever topic it was actually sent to.
+      Since T-0606 landed (2026-08-12) no reply reaches the root log at all, so
+      that log structurally CANNOT record its own answer, and every ask filed
+      there hangs forever. Measured on the live install: 23 pings and an
+      operator escalation for a message answered 67 seconds after it arrived.
+      A per-topic log carries both halves and is therefore judged on its own —
+      widening the cross-log check to those would let an unrelated session
+      posting into some other topic mask a real hang.
     """
     from bot_squad_worker import sessions as S
     from bot_squad_worker import detector as _detector
@@ -312,8 +589,26 @@ def check_project(cfg: Any, slug: str, *, now: float | None = None) -> dict:
 
     now = now if now is not None else time.time()
     conv_dir = _conversations_dir(cfg, slug)
+    out: dict[str, Any] = {"ok": True, "redriven": [], "probe_broken": [],
+                           "aged_out": []}
     if not conv_dir.exists():
-        return {"ok": True, "redriven": []}
+        return out
+
+    state = _load_state(cfg, slug)
+    state_changed = False
+
+    max_age = max_first_ping_age_sec()
+    logs = _conversation_files(conv_dir, now=now, max_age_sec=max_age,
+                               tracked=state)
+    records = {c["key"]: _read_records(c["path"]) for c in logs}
+
+    # The newest answer ANYWHERE in each gid's conversation — see the docstring
+    # for why only a ROOT log is allowed to consult it.
+    newest_answer: dict[str, str] = {}
+    for c in logs:
+        ts = _newest_session_ts(records[c["key"]])
+        if ts > newest_answer.get(c["gid"], ""):
+            newest_answer[c["gid"]] = ts
 
     pressure = _detector.session_pressure(cfg)
     pressured_sids = (set(pressure.get("rate_limited_sids", []))
@@ -325,19 +620,29 @@ def check_project(cfg: Any, slug: str, *, now: float | None = None) -> dict:
         log.exception("uc_redrive: list_sessions failed for %s", slug)
         rows = {}
 
-    state = _load_state(cfg, slug)
-    state_changed = False
-    redriven: list[dict] = []
+    for conv in logs:
+        key, gid, thread = conv["key"], conv["gid"], conv["thread"]
+        # ``probe:<key>`` holds the PROBE-BROKEN diagnosis for this log. It is
+        # a separate entry from the ping campaign because it is a statement
+        # about the LOG, which outlives any one message — and it is dropped on
+        # every path that concludes the log is readable, since a diagnosis that
+        # never retracts is just a second stuck alarm.
+        pkey = f"probe:{key}"
 
-    for jf in sorted(conv_dir.glob("*.jsonl")):
-        gid = jf.stem
-        rec = _unanswered_user_record(jf)
+        def _forget(*keys: str) -> bool:
+            """Drop these state entries; True when any existed. A helper rather
+            than ``pop(a) is not None or pop(b) is not None`` because ``or``
+            short-circuits — the second pop would silently not run whenever the
+            first found something, which is exactly the case where both need
+            dropping."""
+            return any([state.pop(k, None) is not None for k in keys])
+
+        recs = records[key]
+        rec = _unanswered_in(recs)
         if rec is None:
-            # Answered (or empty) thread — nothing to re-drive. Drop any
+            # Answered (or empty) log — nothing to re-drive. Drop any
             # stale ping state so a LATER stuck message starts fresh.
-            if gid in state:
-                del state[gid]
-                state_changed = True
+            state_changed = _forget(key, pkey) or state_changed
             continue
 
         msg_ts = str(rec.get("timestamp") or "")
@@ -345,10 +650,64 @@ def check_project(cfg: Any, slug: str, *, now: float | None = None) -> dict:
         if msg_at is None:
             continue  # undatable record — the cadence has nothing to count from
 
-        gid_state = state.get(gid) or {}
+        if not thread and newest_answer.get(gid, "") > msg_ts:
+            # Answered in one of this gid's topic logs. The root log could
+            # never have recorded that reply; see the docstring — and that is
+            # also why its own PROBE-BROKEN diagnosis is dropped here: a log
+            # whose answers are read from its siblings is being read fine.
+            state_changed = _forget(key, pkey) or state_changed
+            continue
+
+        diag = probe_broken(recs, now=now)
+        if diag is not None:
+            # A DIFFERENT diagnosis, and it must not be spoken as "he is
+            # unanswered" — no ping, no hanging-escalation (T-0917 item 2).
+            prev = state.get(pkey) or {}
+            if (prev.get("last_session_ts") != diag["last_session_ts"]
+                    or not prev.get("escalated_to")):
+                diag["escalated_to"] = _notify_probe_broken(cfg, slug, key, diag)
+                state[pkey] = {"last_session_ts": diag["last_session_ts"],
+                               "escalated_to": diag["escalated_to"],
+                               "at": now}
+                state_changed = True
+            log.error(
+                "uc_redrive: PROBE-BROKEN for %s/%s — newest session: record "
+                "%s (%dh old) with %d ask(s) since; NOT reporting this as an "
+                "unanswered message",
+                slug, key, diag["last_session_ts"],
+                diag["session_age_sec"] // 3600, diag["asks_since"])
+            out["probe_broken"].append({"key": key, **diag})
+            continue
+        state_changed = _forget(pkey) or state_changed  # the log reads again
+
+        gid_state = state.get(key) or {}
         if gid_state.get("msg_ts") != msg_ts:
             gid_state = {"msg_ts": msg_ts, "slot": 0, "pings": 0,
                          "last_ping_at": 0, "escalated_to": []}
+            state[key] = gid_state
+            state_changed = True
+        if not int(gid_state.get("pings") or 0) and now - msg_at > max_age:
+            # A message that is already history and on which NO campaign has
+            # ever been opened. The test is ``pings == 0``, not "first
+            # sighting", because a state entry can exist without a campaign
+            # behind it — the live install carries one written under the
+            # pre-T-0794 schema (``retries``/``last_redrive_at``, 24 days old),
+            # and keying off the entry's mere presence would have let exactly
+            # the message this floor exists for through. See
+            # :data:`DEFAULT_MAX_FIRST_PING_AGE_SEC`. Recorded rather than
+            # silently skipped, so it stays visible without being an alarm.
+            if not gid_state.get("aged_out"):
+                gid_state["aged_out"] = True
+                state[key] = gid_state
+                state_changed = True
+                log.warning(
+                    "uc_redrive: %s/%s has an unanswered message from %s "
+                    "(%dh old) that this probe never pinged — NOT opening a "
+                    "ping campaign on it", slug, key, msg_ts,
+                    int(now - msg_at) // 3600)
+            out["aged_out"].append({"key": key, "msg_ts": msg_ts})
+            continue
+
         # ``slot`` is the position in the schedule (what time says is due);
         # ``pings`` is how many nudges were actually SENT. They diverge whenever
         # slots pass unusable — a message that hung five days before its
@@ -380,29 +739,30 @@ def check_project(cfg: Any, slug: str, *, now: float | None = None) -> dict:
                 "message_ref": rec.get("text"),
             })
         except Exception:
-            log.exception("uc_redrive: redrive dispatch failed for %s/%s", slug, gid)
+            log.exception("uc_redrive: redrive dispatch failed for %s/%s", slug, key)
             continue
 
         gid_state["slot"] = due  # slots passed while it was busy are spent, not owed
         pings = int(gid_state.get("pings") or 0) + 1
         gid_state["pings"] = pings
         gid_state["last_ping_at"] = now
-        state[gid] = gid_state
+        state[key] = gid_state
         state_changed = True
-        redriven.append({"gid": gid, "sid": sid, "pings": pings})
+        out["redriven"].append({"gid": gid, "sid": sid, "pings": pings,
+                                "thread": thread})
         log.warning("uc_redrive: re-woke idle attendant %s for %s/%s (ping %d, "
-                    "unanswered %ds)", sid, slug, gid, pings, int(now - msg_at))
+                    "unanswered %ds)", sid, slug, key, pings, int(now - msg_at))
 
         # Escalate once the ramp is spent — and again on every later slot until
         # a live operator actually receives it (see _notify_operator_stuck).
         if pings >= ESCALATE_AFTER_PINGS and not gid_state.get("escalated_to"):
             gid_state["escalated_to"] = _notify_operator_stuck(
-                cfg, slug, gid, pings=pings, hanging_sec=now - msg_at,
+                cfg, slug, key, pings=pings, hanging_sec=now - msg_at,
             )
 
     if state_changed:
         _save_state(cfg, slug, state)
-    return {"ok": True, "redriven": redriven}
+    return out
 
 
 def uc_redrive_tick(cfg: Any) -> None:

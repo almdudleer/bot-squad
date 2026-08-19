@@ -2555,6 +2555,7 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
             window,
             _user_conversation_boot_prompt(cfg, slug, gid, message_ref, thread_id),
             model=params.get("model"),
+            dispatched_by="ensure_user_conversation",  # T-0909: attributable
         )
         return {"ok": True, "sid": result["sid"], "spawned": True}
     finally:

@@ -341,3 +341,87 @@ def test_the_graceful_path_still_labels_itself_autocompact(tmp_path, monkeypatch
     turn the default caller into an unattributed one."""
     _, recs = _relaunch_cmd(tmp_path, monkeypatch, {})
     assert recs[-1]["dispatched_by"] == "autocompact-relaunch"
+
+
+# ---------------------------------------------------------------------------
+# every producer names itself — checked by a machine, not by this docstring
+# ---------------------------------------------------------------------------
+
+def test_every_spawn_call_site_in_the_worker_names_its_producer():
+    """"Every automated producer is labelled" is a claim that rots the moment
+    someone adds the next one. So it is checked rather than asserted in prose
+    ([[feedback_prose_is_not_a_control]]).
+
+    An unlabelled dispatch is not a crash — it lands in the ledger as
+    `unattributed`, which reads like a rounding error next to the named
+    producers and is exactly how the autocompact relaunches stayed invisible
+    long enough to need a nine-day journal attribution to find.
+
+    The exception is `_action_spawn_session`, which is the shared entry point
+    every EXTERNAL caller (the CLI, the API) reaches through — it forwards
+    whatever label the caller supplied and must not invent one.
+    """
+    import re
+
+    pkg = Path(AC.__file__).parent
+    call_re = re.compile(r"(?:^|[^\w.])(?:S|sessions|_sessions)\.spawn\(", re.M)
+    unlabelled = []
+    seen = 0
+    for py in sorted(pkg.glob("*.py")):
+        src = py.read_text(encoding="utf-8")
+        for m in call_re.finditer(src):
+            # the call's own argument list, up to its balancing paren
+            i = src.index("(", m.end() - 1)
+            depth, j = 0, i
+            while j < len(src):
+                if src[j] == "(":
+                    depth += 1
+                elif src[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            call = src[i:j]
+            seen += 1
+            if "dispatched_by" in call:
+                continue
+            if py.name == "actions.py" and "params.get(" in call:
+                continue  # the shared entry point — forwards the caller's label
+            unlabelled.append(f"{py.name}:{src[:m.start()].count(chr(10)) + 1}")
+
+    # An empty scan would satisfy `not unlabelled` while proving nothing — a
+    # well-formed empty result from a broken instrument
+    # ([[feedback_positive_control_before_asserting_absence]]). The producers
+    # enumerated on this ticket are autocompact, recovery, routines,
+    # constant_teams, autopilot, operator_redrive and the two in actions.py.
+    assert seen >= 8, (
+        f"the call-site scan found only {seen} spawn sites — the detector is "
+        "broken, not the code")
+    assert not unlabelled, (
+        "these spawn call sites would land in the dispatch ledger as "
+        f"'unattributed': {unlabelled}")
+
+
+def test_the_producer_check_can_actually_fail(tmp_path):
+    """Positive control for the check above: it must reject a call site that
+    omits the label, or it is a green over nothing."""
+    import re
+
+    src = '''
+def go(cfg, slug):
+    S.spawn(cfg, slug, "dev", initial_prompt="x", owner="nobody")
+'''
+    call_re = re.compile(r"(?:^|[^\w.])(?:S|sessions|_sessions)\.spawn\(", re.M)
+    m = call_re.search(src)
+    assert m, "the detector must match a plain S.spawn( call at all"
+    i = src.index("(", m.end() - 1)
+    depth, j = 0, i
+    while j < len(src):
+        if src[j] == "(":
+            depth += 1
+        elif src[j] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    assert "dispatched_by" not in src[i:j]

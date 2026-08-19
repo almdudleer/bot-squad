@@ -100,11 +100,26 @@ Three changes, and the third is the one that generalises:
 
 * **The sweep** covers every log of a conversation, root and per-topic
   (:func:`_conversation_files`), each with its own ping campaign.
-* **The answer** to a ROOT log's ask may live in ANY log of that gid
-  (:func:`check_project`) — that log cannot record its own answer, so requiring
-  one there is requiring the impossible. Per-topic logs carry both halves and
-  are judged alone, so an unrelated session posting into another topic cannot
-  mask a real hang.
+* **The answer** to a ROOT log's ask may live in any log of that gid, but only
+  when THIS CONVERSATION'S ATTENDANT wrote it (:func:`is_attendant_answer`).
+  The root log cannot record its own answer, so requiring one there is
+  requiring the impossible; accepting any ``session:`` record instead was the
+  first draft of this fix and it was wrong, caught in review. Measured on the
+  live install: 27 distinct sids that are NOT the attendant post into
+  watchrobot's ``t11`` alone — operator sessions, plus dev sessions like
+  ``chart-round3`` and ``portfolio-signals`` — and any one of them landing
+  after his message would have closed a genuinely unanswered root ask. That is
+  the same false negative the per-topic asymmetry exists to prevent,
+  reintroduced through the other door. Per-topic logs still carry both halves
+  and are judged alone.
+
+  Two consequences, both deliberate. An OPERATOR reply in a topic no longer
+  ends a ROOT ask, so the module can over-report there — the safe direction for
+  an alarm whose failure mode is silence, and the operator is not the session
+  this module re-drives. And "the attendant" is decided by
+  :func:`sessions.user_conversation_window` / ``_window_from_sid``, the exact
+  pair ``live_user_conversation_sid`` uses, so this predicate and the gate that
+  picks a session to nudge cannot drift apart.
 * **A predicate that cannot say "answered" now says PROBE-BROKEN**
   (:func:`probe_broken`), not "hanging". The cheap signal is the ticket's own:
   the age of the newest ``session:`` record while asks keep landing. This is
@@ -333,6 +348,60 @@ def _newest_session_ts(records: list[dict]) -> str:
     best = ""
     for rec in records:
         if str(rec.get("author") or "").startswith("session:"):
+            ts = str(rec.get("timestamp") or "")
+            if ts > best:
+                best = ts
+    return best
+
+
+def attendant_window(gid: str) -> str:
+    """The tmux window every user-conversation attendant for ``gid`` carries,
+    or ``""`` when ``gid`` is not a name an attendant could ever have.
+
+    Derived from :func:`sessions.user_conversation_window` — the SAME producer
+    that names the window when an attendant is spawned, and the same value
+    :func:`sessions.live_user_conversation_sid` matches against to decide which
+    live session is THE attendant for this conversation. Reading it from the
+    producer rather than matching a hand-typed ``…-user-conversation-p…``
+    pattern is what stops this test and that gate drifting apart: rename the
+    scheme and both move together, or neither does.
+
+    ``gid`` here comes from a FILENAME on disk, so it is not guaranteed to be a
+    legal gid at all; the producer rejects those, and a rejection means "no
+    attendant lineage exists for this name" rather than an error to raise
+    inside a sweep.
+    """
+    from bot_squad_worker import sessions as S
+    try:
+        return S.user_conversation_window(gid)
+    except Exception:  # noqa: BLE001 — an illegal gid has no lineage, full stop
+        return ""
+
+
+def is_attendant_answer(author: str, attendant_win: str) -> bool:
+    """Whether ``author`` is a reply from THIS conversation's attendant lineage.
+
+    Uses :func:`sessions._window_from_sid`, the derivation
+    ``live_user_conversation_sid`` itself applies to a session md's immutable
+    SID. So "the attendant" means the same thing here as it does at the gate
+    that re-drives one — an alignment a regex over the author string could not
+    promise.
+    """
+    if not attendant_win or not str(author or "").startswith("session:"):
+        return False
+    from bot_squad_worker import sessions as S
+    return S._window_from_sid(str(author)[len("session:"):]) == attendant_win
+
+
+def _newest_attendant_ts(records: list[dict], attendant_win: str) -> str:
+    """Newest timestamp among ``records`` authored by this gid's ATTENDANT
+    lineage, or ``""``. Deliberately narrower than :func:`_newest_session_ts`:
+    that one asks "does this log record answers AT ALL" (the PROBE-BROKEN
+    input), this one asks "did the session we would re-drive actually reply".
+    """
+    best = ""
+    for rec in records:
+        if is_attendant_answer(rec.get("author") or "", attendant_win):
             ts = str(rec.get("timestamp") or "")
             if ts > best:
                 best = ts
@@ -570,8 +639,9 @@ def check_project(cfg: Any, slug: str, *, now: float | None = None) -> dict:
 
     * every log of a ``(slug, gid)`` conversation is swept, root and per-topic
       alike (:func:`_conversation_files`), each with its own ping campaign;
-    * a ROOT log's ask is answered by a ``session:`` record in ANY log of the
-      same gid. This asymmetry is not a convenience — it is the defect. The
+    * a ROOT log's ask is answered by an ATTENDANT record
+      (:func:`is_attendant_answer`) in any log of the same gid. This asymmetry
+      is not a convenience — it is the defect. The
       undelivered-message fallback (``tg_listener._fallback_undelivered``)
       writes his ask into the root log DELIBERATELY THREADLESS, while the
       attendant's answer is filed in whatever topic it was actually sent to.
@@ -581,7 +651,9 @@ def check_project(cfg: Any, slug: str, *, now: float | None = None) -> dict:
       operator escalation for a message answered 67 seconds after it arrived.
       A per-topic log carries both halves and is therefore judged on its own —
       widening the cross-log check to those would let an unrelated session
-      posting into some other topic mask a real hang.
+      posting into some other topic mask a real hang. The AUTHOR gate closes
+      the same hole in the cross-log direction; see the module docstring for
+      the 27 non-attendant sids measured in one topic.
     """
     from bot_squad_worker import sessions as S
     from bot_squad_worker import detector as _detector
@@ -602,11 +674,13 @@ def check_project(cfg: Any, slug: str, *, now: float | None = None) -> dict:
                                tracked=state)
     records = {c["key"]: _read_records(c["path"]) for c in logs}
 
-    # The newest answer ANYWHERE in each gid's conversation — see the docstring
-    # for why only a ROOT log is allowed to consult it.
+    # The newest ATTENDANT answer anywhere in each gid's conversation — see the
+    # docstring for why only a ROOT log is allowed to consult it, and why the
+    # author must be the attendant rather than any session at all.
+    attendant_wins = {c["gid"]: attendant_window(c["gid"]) for c in logs}
     newest_answer: dict[str, str] = {}
     for c in logs:
-        ts = _newest_session_ts(records[c["key"]])
+        ts = _newest_attendant_ts(records[c["key"]], attendant_wins[c["gid"]])
         if ts > newest_answer.get(c["gid"], ""):
             newest_answer[c["gid"]] = ts
 

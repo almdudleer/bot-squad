@@ -1040,3 +1040,161 @@ def test_a_legacy_state_stub_does_not_smuggle_an_ancient_hang_past_the_floor(
     assert result["redriven"] == []
     assert dispatched == []
     assert [a["key"] for a in result["aged_out"]] == [GID]
+
+
+# ===========================================================================
+# T-0917 hardening (operator review hold on 4fed246). The first draft let ANY
+# newer session: record in ANY sibling topic close a ROOT ask — the same false
+# negative the per-topic asymmetry prevents, reintroduced through the other
+# door. Measured on the live install before narrowing it: 27 distinct sids that
+# are NOT the attendant post into watchrobot's t11 alone.
+# ===========================================================================
+
+def test_a_root_ask_is_not_answered_by_an_unrelated_dev_session_in_a_sibling(
+        cfg_slug, monkeypatch):
+    """THE NEGATIVE CONTROL the review named. A dev session posting a status
+    line into a per-task topic must NOT close a genuinely unanswered root ask.
+
+    The sid is a real one, lifted from the live store: ``chart-round3-p55``
+    authors 10 records in ``watchrobot/gu_dc82…/t1181.jsonl``. Property:
+    :func:`is_attendant_answer` gates the cross-log map. Widen that map back to
+    every ``session:`` record and this goes red while
+    ``test_root_log_ask_is_answered_by_a_reply_in_a_topic_log`` stays green —
+    which is the pair that pins the rule."""
+    cfg, slug = cfg_slug
+    now = time.time()
+    ask = now - 3600
+    _write_thread(cfg, slug, GID, [
+        {"timestamp": _iso(ask), "author": "user", "text": "unanswered ask"},
+    ])
+    _write_topic(cfg, slug, GID, "t1181", [
+        {"timestamp": _iso(ask + 60), "author": "session:S-u-chart-round3-p55",
+         "text": "деплой прошёл"},
+    ])
+    dispatched = _stub(monkeypatch)
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    monkeypatch.setattr(A, "_action_inject_input", lambda p: None)
+
+    result = UC.check_project(cfg, slug, now=now)
+
+    assert [r["thread"] for r in result["redriven"]] == [""]
+    assert [n for n, _ in dispatched] == ["ensure_user_conversation"]
+
+
+def test_a_root_ask_is_not_answered_by_an_operator_post_in_a_sibling(
+        cfg_slug, monkeypatch):
+    """The same gate, on the class that is FAR more common and therefore the
+    one that would have silenced this alarm in practice: 27 distinct
+    ``S-almdudleer-operator-p*`` sids write into watchrobot's t11.
+
+    This over-reports — the operator answering him in a topic is a real answer
+    — and that is the deliberate direction. The operator is not the session
+    this module re-drives, and for an alarm whose failure mode is silence, a
+    spurious nudge to an idle attendant costs less than a hang nobody sees."""
+    cfg, slug = cfg_slug
+    now = time.time()
+    ask = now - 3600
+    _write_thread(cfg, slug, GID, [
+        {"timestamp": _iso(ask), "author": "user", "text": "unanswered ask"},
+    ])
+    _write_topic(cfg, slug, GID, "t11", [
+        {"timestamp": _iso(ask + 120), "author": f"session:{OPERATOR_SID}",
+         "text": "[🎧 operator] про режим забудьте"},
+    ])
+    dispatched = _stub(monkeypatch)
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    monkeypatch.setattr(A, "_action_inject_input", lambda p: None)
+
+    result = UC.check_project(cfg, slug, now=now)
+
+    assert [r["thread"] for r in result["redriven"]] == [""]
+    assert [n for n, _ in dispatched] == ["ensure_user_conversation"]
+
+
+def test_the_attendant_lineage_is_read_from_the_spawn_producer(cfg_slug):
+    """"The attendant" must mean the same thing here as at the gate that picks
+    a session to nudge, so it is derived from
+    :func:`sessions.user_conversation_window` — the producer that NAMES the
+    window at spawn — and matched with ``_window_from_sid``, the derivation
+    ``live_user_conversation_sid`` applies. A hand-typed
+    ``…-user-conversation-p…`` pattern would pass this file and silently stop
+    agreeing with that gate the day the scheme changes.
+
+    The sid here is COMPOSED from the producer rather than typed, so a rename
+    moves both sides together (T-0917 review)."""
+    from bot_squad_worker import sessions as SS
+
+    win = SS.user_conversation_window(GID)
+    composed = f"S-almdudleer-{win}-p151"          # a real live shape
+    assert UC.attendant_window(GID) == win
+    assert UC.is_attendant_answer(f"session:{composed}", win)
+
+    # …and every non-attendant class measured in the live store is rejected.
+    for other in ("S-almdudleer-operator-p373", "S-u-chart-round3-p55",
+                  "S-almdudleer-portfolio-signals-p64", "S-u-dev-p9",
+                  # ANOTHER gid's attendant writing into this log — measured:
+                  # gu_dc82…'s p70 authors a record in watchrobot/gu_5e3d….jsonl
+                  f"S-almdudleer-{SS.user_conversation_window('gu_OTHER')}-p9",
+                  # ⭐ the case that separates the producer derivation from a
+                  # substring match, and the one a mutation pass caught this
+                  # test missing: a session NAMED AFTER this gid that is not an
+                  # attendant. "the sid contains the gid" says yes; the window
+                  # it actually carries says no, and the window is what
+                  # live_user_conversation_sid matches on.
+                  f"S-almdudleer-{GID}-redrive-debug-p7",
+                  f"S-almdudleer-{GID}-user-conversation-review-p7"):
+        assert not UC.is_attendant_answer(f"session:{other}", win), other
+    # a non-session author is never an answer, whatever it says
+    assert not UC.is_attendant_answer("system:task-lifecycle", win)
+    assert not UC.is_attendant_answer("user", win)
+
+
+def test_an_unnameable_gid_has_no_lineage_and_never_raises(cfg_slug, monkeypatch):
+    """``gid`` comes from a FILENAME, so it need not be a legal gid at all. The
+    producer rejects those; a rejection must mean "no lineage" and leave the
+    sweep running, never raise inside it. Property: the ``except`` in
+    :func:`attendant_window`."""
+    cfg, slug = cfg_slug
+    now = time.time()
+    assert UC.attendant_window("-not a gid-") == ""
+    assert not UC.is_attendant_answer(f"session:{SID}", "")
+
+    conv = Path(cfg.data_dir) / "_mothership" / "conversations" / slug
+    conv.mkdir(parents=True, exist_ok=True)
+    (conv / "-not a gid-.jsonl").write_text(json.dumps(
+        {"timestamp": _iso(now - 600), "author": "user", "text": "hi"}) + "\n")
+    _stub(monkeypatch, live_sid=None)
+
+    result = UC.check_project(cfg, slug, now=now)   # must not raise
+
+    assert result["probe_broken"] == []
+
+
+def test_the_live_p151_answer_case_still_resolves(cfg_slug, monkeypatch):
+    """The incident itself, re-asserted AFTER narrowing the gate — the whole
+    point of the hardening is that it must not undo the fix. Composed from the
+    producer so it pins the real attendant shape, not a string I typed."""
+    from bot_squad_worker import sessions as SS
+
+    cfg, slug = cfg_slug
+    now = time.time()
+    ask = now - 3600
+    attendant = f"S-almdudleer-{SS.user_conversation_window(GID)}-p151"
+    _write_thread(cfg, slug, GID, [
+        {"timestamp": _iso(ask - 60), "author": "system:undelivered",
+         "text": "адресовано сессии S-x, она не активна"},
+        {"timestamp": _iso(ask), "author": "user", "text": "задача про aqice"},
+    ])
+    _write_topic(cfg, slug, GID, "t11", [
+        {"timestamp": _iso(ask + 67), "author": f"session:{attendant}",
+         "text": "Принял всё"},
+        # …and an operator line AFTER it, which must change nothing either way
+        {"timestamp": _iso(ask + 180), "author": f"session:{OPERATOR_SID}",
+         "text": "[🎧 operator] дополню"},
+    ])
+    dispatched = _stub(monkeypatch)
+
+    result = UC.check_project(cfg, slug, now=now)
+
+    assert result["redriven"] == []
+    assert dispatched == []

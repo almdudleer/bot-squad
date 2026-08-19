@@ -203,7 +203,7 @@ def compliance(
     """The number the operator is measured against: what the last N dispatches ran.
 
     Returns ``{n, economy, premium, unknown, economy_pct, premium_reasons,
-    by_source, roles, oldest_ts, newest_ts}``. ``n == 0`` is reported as such —
+    by_source, by_producer, roles, oldest_ts, newest_ts}``. ``n == 0`` is reported as such —
     an empty ledger must not render as 100% or 0% compliance, because both read
     as a measurement when there is none.
     """
@@ -218,6 +218,7 @@ def compliance(
     economy = premium = unknown = 0
     reasons: list[dict] = []
     by_source: dict[str, int] = {}
+    by_producer: dict[str, int] = {}
     for r in recs:
         cls = r.get("model_class") or model_class(r.get("model"))
         if cls in PREMIUM_CLASSES:
@@ -236,6 +237,14 @@ def compliance(
             unknown += 1
         src = r.get("source") or "-"
         by_source[src] = by_source.get(src, 0) + 1
+        # T-0909 follow-up: WHICH surface asked. `source` says whether a model
+        # was chosen or defaulted; this says who did the asking, which is the
+        # question "why is the default still winning" actually turns on — 87 of
+        # 123 role-default dev spawns turned out to be relaunches, not
+        # dispatches. An unlabelled producer reads as "unattributed", never as
+        # one of the named ones.
+        by_producer[r.get("dispatched_by") or "unattributed"] = (
+            by_producer.get(r.get("dispatched_by") or "unattributed", 0) + 1)
     n = len(recs)
     return {
         "n": n,
@@ -246,6 +255,7 @@ def compliance(
         "economy_pct": (round(100.0 * economy / n, 1) if n else None),
         "premium_reasons": reasons,
         "by_source": by_source,
+        "by_producer": by_producer,
         "roles": role,
         "oldest_ts": recs[0].get("ts", "") if recs else "",
         "newest_ts": recs[-1].get("ts", "") if recs else "",

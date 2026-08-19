@@ -2803,6 +2803,15 @@ def spawn(
             seed_meta["effort"] = _effort
         if _model_source:
             seed_meta["model_source"] = _model_source
+        # T-0909: the effort's PROVENANCE, alongside the model's. `effort` has
+        # been stamped unconditionally since T-0871, which makes the stamp
+        # ambiguous: "high" reads identically whether a dispatcher asked for it
+        # or the role default supplied it. A relaunch that carries the value
+        # forward needs to tell those apart — inheriting a role DEFAULT would
+        # freeze today's config onto every successor, the exact staleness
+        # T-0678 avoided for `model`. See autocompact._relaunch.
+        if _effort_source:
+            seed_meta["effort_source"] = _effort_source
         # T-0909: the stated reason for a premium model rides the md too, so a
         # session can be asked "why are you on Opus" without a ledger lookup.
         _reason_clean = (model_reason or "").strip()

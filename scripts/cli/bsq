@@ -3548,10 +3548,18 @@ def cmd_model_compliance(args) -> None:
         return
     by_source = res.get("by_source") or {}
     if by_source:
-        print("  by source: " + ", ".join(
+        print("  by source:   " + ", ".join(
             f"{k}={v}" for k, v in sorted(by_source.items(), key=lambda kv: -kv[1])))
+    # T-0909 follow-up: WHO dispatched. `source` says chosen-vs-defaulted; this
+    # says which surface asked, and it is the line that explains a stubborn
+    # default — the measurement behind it found 87 of 123 role-default dev
+    # spawns were autocompact RELAUNCHES rather than anybody's dispatch.
+    by_producer = res.get("by_producer") or {}
+    if by_producer:
+        print("  by producer: " + ", ".join(
+            f"{k}={v}" for k, v in sorted(by_producer.items(), key=lambda kv: -kv[1])))
     window = f"{res.get('oldest_ts', '')[:16]} .. {res.get('newest_ts', '')[:16]}"
-    print(f"  window:    {window}")
+    print(f"  window:      {window}")
     reasons = res.get("premium_reasons") or []
     if reasons:
         # Only dispatches that STATED a reason are listed, newest last, capped.

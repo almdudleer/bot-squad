@@ -32,10 +32,18 @@ def cfg_slug(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(ct, "_SPAWN_COOLDOWN_SEC", 0)
     spawns: list[dict] = []
 
-    def _fake_spawn(c, s, window, initial_prompt=None, initiative=None, owner=None):
+    # `**kw` deliberately: a stub that mirrors `sessions.spawn`'s parameter list
+    # by hand goes stale the moment a caller passes a new kwarg, and it fails as
+    # `assert 0 == 1` — a spawn that never happened — rather than as a signature
+    # error, which is a long way from the cause. (T-0909 added `dispatched_by`
+    # and broke four tests here exactly that way.) The recorded dict keeps the
+    # fields these tests assert on; everything else rides in `extra`.
+    def _fake_spawn(c, s, window, initial_prompt=None, initiative=None,
+                    owner=None, **kw):
         sid = f"S-spawned-{len(spawns)}"
         spawns.append({"window": window, "initiative": initiative,
-                       "prompt": initial_prompt, "owner": owner, "sid": sid})
+                       "prompt": initial_prompt, "owner": owner, "sid": sid,
+                       "extra": kw})
         return {"ok": True, "sid": sid}
 
     monkeypatch.setattr(S, "spawn", _fake_spawn)

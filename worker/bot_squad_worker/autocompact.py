@@ -585,6 +585,50 @@ def _alert_orphaned_handoff(cfg: Any, slug: str, sid: str, reason: str) -> None:
         log.exception("autocompact: orphaned-handoff alert failed for %s", sid)
 
 
+#: T-0909: what a relaunch carries forward from the incarnation it replaces.
+#:
+#: THE HOLE THIS CLOSES, measured on the live journal over 9 days: of 123
+#: role-default (`config:dev` -> opus) dev spawns, **87 (71%) were relaunches
+#: from this module**, not dispatches anybody made. A relaunch already carries
+#: task_id / initiative / parent_sid / owner so the reconcilers see continuity —
+#: but it dropped the MODEL, so a dispatch deliberately sent to Sonnet came back
+#: as Opus at the first cache-window recycle, roughly an hour later. The gate
+#: T-0909 put on `bsq spawn` would therefore have decayed to nothing on exactly
+#: the long-lived sessions that cost the most.
+#:
+#: This is not a new policy and it changes no default. It is the same
+#: carry-forward `operator_redrive._respawn_operator` has done since T-0678, for
+#: the same stated reason ("a full respawn mints a BRAND-NEW SID ... without
+#: this the override would silently revert to the fleet/role default"), applied
+#: to the path that produces 71% of the role-defaulted dev traffic.
+def _inherited_model_choice(meta: dict) -> tuple:
+    """``(model, effort, model_reason)`` to carry into a relaunch.
+
+    Each is inherited ONLY when the predecessor's md shows it was CHOSEN:
+
+    * ``model`` is stamped only for an explicit choice (T-0678), so its mere
+      presence is the signal — a role-defaulted predecessor carries nothing and
+      the successor re-reads the role default, exactly as today.
+    * ``effort`` is stamped UNCONDITIONALLY (T-0871), so presence proves
+      nothing; it rides on ``effort_source == "explicit"``. Inheriting a role
+      DEFAULT would freeze today's config onto every future incarnation — the
+      staleness T-0678 deliberately avoided — so an unstamped/defaulted effort
+      is left to re-resolve.
+    * ``model_reason`` follows the model: a carried-over premium choice keeps
+      the justification that bought it, instead of reappearing in the
+      compliance number as an unexplained Opus.
+    """
+    def _clean(v):
+        return v if (v and v != "~") else None
+
+    model = _clean(meta.get("model"))
+    effort = None
+    if str(meta.get("effort_source") or "").strip() == "explicit":
+        effort = _clean(meta.get("effort"))
+    reason = _clean(meta.get("model_reason")) if model else None
+    return model, effort, reason
+
+
 def _relaunch(cfg: Any, slug: str, rec: dict, make_prompt) -> None:
     """Relaunch a FRESH incarnation re-bound to the SAME assignment (binding
     continuity — task_id/initiative/parent_sid/owner carried from the
@@ -609,6 +653,7 @@ def _relaunch(cfg: Any, slug: str, rec: dict, make_prompt) -> None:
     assignment_id = task_id if task_id else (role or None)
     window = (_clean(meta.get("window")) or _clean(rec.get("window"))
               or f"recover-{assignment_id or role or 'session'}")
+    model, effort, model_reason = _inherited_model_choice(meta)
     sessions.spawn(
         cfg, slug, window, make_prompt(role, task_id, assignment_id),
         task_id=task_id,
@@ -616,6 +661,10 @@ def _relaunch(cfg: Any, slug: str, rec: dict, make_prompt) -> None:
         parent_sid=_clean(meta.get("parent_sid")),
         owner=_clean(meta.get("owner")),
         owner_user=_clean(meta.get("owner_user")),
+        model=model,
+        effort=effort,
+        model_reason=model_reason,
+        dispatched_by="autocompact-relaunch",
     )
 
 

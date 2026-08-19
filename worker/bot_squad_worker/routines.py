@@ -944,7 +944,13 @@ def _spawn_for_routine(cfg: Any, slug: str, routine: Routine,
     try:
         res = S.spawn(cfg, slug, "dev",
                       initial_prompt=spawn_brief(cfg, slug, routine, event, now=now),
-                      owner=f"routine:{routine.id}")
+                      owner=f"routine:{routine.id}",
+                      # T-0909: name the producer in the dispatch ledger. This
+                      # spawn has no dispatcher to justify a model, so it takes
+                      # the role default — which is fine, but it must be
+                      # ATTRIBUTABLE rather than showing up as a blank next to
+                      # the choices an agent actually made.
+                      dispatched_by=f"routine:{routine.id}")
         sid = res.get("sid")
         if not sid:
             # spawn returned without a SID — not an exception, but no session

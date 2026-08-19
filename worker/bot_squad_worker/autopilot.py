@@ -537,7 +537,9 @@ def start(
         from bot_squad_worker import intersession as _is
         from bot_squad_worker import sessions as S
         brief = compose_brief(state)  # uses expires/key which are already set
-        res = S.spawn(cfg, slug, spawn_window, initial_prompt=brief, owner=created_by or None)
+        res = S.spawn(cfg, slug, spawn_window, initial_prompt=brief,
+                      owner=created_by or None,
+                      dispatched_by="autopilot")  # T-0909: attributable
         target_sid = res.get("sid", "")
         if not target_sid:
             raise ActionError("autopilot.start: spawn did not return a SID")

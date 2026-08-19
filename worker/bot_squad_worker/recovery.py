@@ -339,9 +339,20 @@ def _do_respawn(cfg: Any, row: dict) -> None:
                   f"progress note. Do not restart finished work.")
         log.warning("recovery: respawning crashed %s for %s (no artifact yet)",
                     sid, task_id)
+        # T-0909: a crash respawn replaces an incarnation that had a model
+        # decision; carry it the same way autocompact's relaunch does, or the
+        # crash silently re-prices the ticket at the role default.
+        from bot_squad_worker import autocompact as _ac
+        _dead_meta = {}
+        if sid:
+            _dead_meta = _sessions._read_session_metadata(
+                _sessions._session_file(cfg.data_dir, slug, sid)) or {}
+        _rmodel, _reffort, _rreason = _ac._inherited_model_choice(_dead_meta)
         _sessions.spawn(
             cfg, slug, row.get("window") or f"recover-{task_id}",
             prompt, task_id=task_id, initiative=row.get("initiative"),
+            model=_rmodel, effort=_reffort, model_reason=_rreason,
+            dispatched_by="recovery-respawn",
         )
     if sid:
         # T-0470: a crashed session was re-driven → record the recycle on the

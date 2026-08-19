@@ -564,6 +564,12 @@ async def spawn_session(
         params["model"] = body.model
     if body.provider:
         params["provider"] = body.provider
+    # T-0909: name the producer in the dispatch ledger. A UI spawn does not go
+    # through `bsq spawn`, so the CLI's model gate never sees it — that is a
+    # deliberate limit (a human clicking Spawn is not an agent skipping a
+    # checklist), but the dispatch must still be ATTRIBUTABLE rather than
+    # arriving as a blank next to the choices agents actually made.
+    params["dispatched_by"] = "api:spawn_session"
 
     try:
         return await client.call_action("spawn_session", params)

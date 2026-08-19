@@ -297,7 +297,8 @@ def _spawn_member(cfg: Any, slug: str, *, window: str, init_filename: str, brief
     from bot_squad_worker.actions import ActionError
     try:
         res = S.spawn(cfg, slug, window, initial_prompt=brief,
-                      initiative=init_filename, owner="constant-team")
+                      initiative=init_filename, owner="constant-team",
+                      dispatched_by="constant-team")  # T-0909: attributable
         return res.get("sid")
     except ActionError as e:
         # T-0345: the parallel-session cap is normal backpressure, not a fault —

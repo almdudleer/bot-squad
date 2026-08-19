@@ -436,6 +436,7 @@ def _respawn_operator(cfg: Any, slug: str) -> Optional[str]:
             initial_prompt=_dispatch.operator_standing_task(brief),
             owner="operator-redrive",
             model=model,
+            dispatched_by="operator-redrive",  # T-0909: attributable
         )
         return res.get("sid")
     except ActionError as e:

@@ -108,6 +108,31 @@ def test_scan_lines_boundary_without_post_tokens_measures_none():
     assert scan["last_window"] == 120_000
 
 
+def test_resolved_window_prefers_post_compact_when_no_usage_since():
+    """T-0908: a boundary with no assistant turn after it — the idle-session
+    case that fired compact-and-stay 266 times in 6 days — must read the
+    POST-compact number, not the frozen pre-compact one."""
+    scan = T.scan_lines([_assistant((95_498, 0, 0), 20), _boundary(11_015)])
+    assert T._resolved_window(scan) == 11_015
+
+
+def test_resolved_window_uses_last_window_once_a_turn_ran_after_compact():
+    scan = T.scan_lines([
+        _assistant((95_498, 0, 0), 20), _boundary(11_015),
+        _assistant((38_000, 0, 0), 7),
+    ])
+    assert T._resolved_window(scan) == 38_000
+
+
+def test_resolved_window_uses_last_window_when_no_boundary():
+    scan = T.scan_lines([_assistant((2, 420000, 1000), 200)])
+    assert T._resolved_window(scan) == 421_002
+
+
+def test_resolved_window_is_none_when_chunk_carries_neither():
+    assert T._resolved_window(T.scan_lines([])) is None
+
+
 def test_context_and_memory_levels(monkeypatch):
     # T-0857 (stakeholder 2026-08-11): default ceiling 300k (was 700k, T-0210),
     # warn at the same 0.8 warn:urgent ratio → 240k. No env override set.
@@ -384,6 +409,34 @@ def test_sample_incremental_accrues_output_and_carries_context(tmp_path, fake_se
                        / "S-almdudleer-dev-p5.json").read_text())
     assert rec2["context"]["tokens"] == 95202
     assert rec2["output_tokens_cum"] == 1000
+
+
+def test_sample_after_idle_compact_reads_post_window_not_stale_pre_compact(
+    tmp_path, fake_session,
+):
+    """T-0908 live bug: a /compact on an idle session writes a compact_boundary
+    and NO assistant turn runs after it, so before this fix context.tokens
+    stayed frozen at the pre-compact number forever — the exact reading that
+    kept idle_timeout's compact-and-stay gate open (266 re-sends/6 days)."""
+    cfg = _make_cfg(tmp_path)
+    f = _write_transcript(fake_session["home"], fake_session["uuid"],
+                          [_assistant((95_498, 0, 0), 20)])
+    T.sample(cfg, "proj")  # establishes the stale-if-unfixed baseline
+    rec_path = (cfg.data_dir / "proj" / "_worker" / "telemetry"
+               / "S-almdudleer-dev-p5.json")
+    assert json.loads(rec_path.read_text())["context"]["tokens"] == 95_498
+
+    # session idles, gets compacted, and NOTHING runs afterward
+    with f.open("a") as fh:
+        fh.write(_boundary(11_015) + "\n")
+    T.sample(cfg, "proj")
+    rec = json.loads(rec_path.read_text())
+    assert rec["context"]["tokens"] == 11_015
+
+    # further idle ticks (no new lines) must not regress to the stale number
+    T.sample(cfg, "proj")
+    rec2 = json.loads(rec_path.read_text())
+    assert rec2["context"]["tokens"] == 11_015
 
 
 def test_sample_carries_compact_phase_across_ticks(tmp_path, fake_session):

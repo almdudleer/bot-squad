@@ -288,6 +288,23 @@ def scan_lines(lines: Iterable[str]) -> dict:
     }
 
 
+def _resolved_window(scan: dict) -> int | None:
+    """T-0908: the context-tokens reading a chunk's scan actually supports.
+
+    ``last_window`` is only trustworthy as the CURRENT window when no
+    ``compact_boundary`` in this chunk is still waiting for its first
+    post-compact ``usage`` line — a boundary with no assistant turn after it
+    (an idle session that just got compacted) leaves ``last_window`` frozen at
+    the PRE-compact number. In that one case ``compact_post_window`` (T-0722's
+    instrument, unused until now) IS the current window; otherwise fall back
+    to ``last_window`` as before — including the ordinary case of no boundary
+    at all, or a boundary already followed by a real turn.
+    """
+    if scan["compact_post_window"] is not None and not scan["usage_after_compact"]:
+        return scan["compact_post_window"]
+    return scan["last_window"]
+
+
 def _read_chunk(path: Path, offset: int) -> tuple[str, int]:
     """Read complete (newline-terminated) lines from ``offset`` → EOF.
 
@@ -705,8 +722,9 @@ def _sample_one(cfg: Any, slug: str, row: dict, home: str, now: float) -> dict |
             start = max(0, size - _TAIL_BYTES)
             text, _ = _read_chunk(transcript, start)
             scan = scan_lines(text.splitlines())
-            if scan["last_window"] is not None:
-                context_tokens = scan["last_window"]
+            resolved = _resolved_window(scan)
+            if resolved is not None:
+                context_tokens = resolved
                 model = scan["model"] or model
             # T-0332: do NOT re-detect a 429 from the fresh tail-read — a stale
             # marker already in the tail (common after a compact spawns a new
@@ -718,8 +736,9 @@ def _sample_one(cfg: Any, slug: str, row: dict, home: str, now: float) -> dict |
             text, offset = _read_chunk(transcript, offset)
             if text:
                 scan = scan_lines(text.splitlines())
-                if scan["last_window"] is not None:
-                    context_tokens = scan["last_window"]
+                resolved = _resolved_window(scan)
+                if resolved is not None:
+                    context_tokens = resolved
                     model = scan["model"] or model
                 output_cum += scan["output_sum"]
                 saw_429 = scan["saw_429"]

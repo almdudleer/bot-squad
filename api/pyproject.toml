@@ -14,6 +14,10 @@ dependencies = [
     # shared secret_crypto.py (mirrored to worker/bot_squad_worker/) that
     # routes_settings calls to encrypt the TG bot token on write.
     "cryptography>=42",
+    # T-0912: comment-preserving TOML round-trip for system_settings.toml.
+    # stdlib tomllib is read-only by design; tomlkit edits in place, keeping
+    # every comment and blank line the file's owner wrote.
+    "tomlkit>=0.12",
 ]
 
 [project.optional-dependencies]

@@ -970,3 +970,55 @@ def test_put_quotes_other_non_bare_keys_too(tmp_bot_squad: Path, monkeypatch) ->
         "a.b": "dotted", "has space": "spaced", "*": "star", "plain-key_1": "bare",
     }
     assert "\nplain-key_1 = " in text, "a bare-legal key must NOT be needlessly quoted"
+
+
+# ---------------------------------------------------------------------------
+# T-0912: tomllib does not return comments, and the pre-fix writer rebuilt the
+# whole file from a tomllib-parsed dict — so ANY successful PUT destroyed
+# every comment in system_settings.toml (measured on a copy of the live
+# config: 24 comment lines -> 1). Pin that a save keeps them, in both an
+# unmanaged section and a managed one.
+# ---------------------------------------------------------------------------
+
+def test_put_preserves_comments_in_an_unmanaged_section(tmp_bot_squad: Path, monkeypatch) -> None:
+    _set_env(monkeypatch, tmp_bot_squad)
+    cfg = tmp_bot_squad / "config" / "system_settings.toml"
+    cfg.write_text(
+        "[models]\n"
+        "# T-0866: keyed to ROLE. Do not paraphrase this comment.\n"
+        'dev = "opus"\n'
+        '"*" = "sonnet"\n'
+    )
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.put("/api/system-settings", json={"session": {"ttl": "3d"}})
+        assert r.status_code == 200, r.text
+    text = cfg.read_text()
+    assert "# T-0866: keyed to ROLE. Do not paraphrase this comment." in text
+    raw = tomllib.loads(text)
+    assert raw["models"] == {"dev": "opus", "*": "sonnet"}
+    assert raw["session"]["ttl"] == "3d"
+
+
+def test_put_preserves_a_comment_attached_to_a_managed_key(tmp_bot_squad: Path, monkeypatch) -> None:
+    """A comment sitting inside a MANAGED section (e.g. hand-added to [caps])
+    must also survive — the writer syncs the existing table in place rather
+    than rebuilding it from scratch."""
+    _set_env(monkeypatch, tmp_bot_squad)
+    cfg = tmp_bot_squad / "config" / "system_settings.toml"
+    cfg.write_text(
+        "[caps]\n"
+        "# operator asked to cap this after the 2026-08 runaway spawn incident\n"
+        "max_parallel_sessions = 5\n"
+        "max_total_tokens = 0\n"
+        "idle_suspend_sec = 0\n"
+    )
+    with TestClient(build_app()) as client:
+        _login(client)
+        r = client.put("/api/system-settings",
+                       json={"caps": {"max_parallel_sessions": 9}})
+        assert r.status_code == 200, r.text
+    text = cfg.read_text()
+    assert "# operator asked to cap this after the 2026-08 runaway spawn incident" in text
+    raw = tomllib.loads(text)
+    assert raw["caps"]["max_parallel_sessions"] == 9

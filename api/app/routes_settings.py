@@ -7,6 +7,7 @@ import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
+import tomlkit
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app import secret_crypto
@@ -76,17 +77,14 @@ def _toml_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-# Sections this endpoint hand-emits WHOLE; everything else in the file is
-# preserved verbatim on write (T-0368).
+# tg/session/admin/caps are fully managed: _write_system_settings syncs each
+# section to exactly the keys below via _sync_table. Every other section in
+# the file — including [operator] below — is left untouched (T-0368/T-0912).
 #
-# T-0894: [operator] is deliberately NOT here. It is a *partially* managed
-# section — this endpoint owns exactly the keys in _OPERATOR_MANAGED_KEYS and
-# must leave any other key in it untouched (there will be more operator knobs).
-# Listing it here would make _write_system_settings skip it in the preserve
-# loop and hand-emit only the managed key, i.e. silently DROP the rest — the
-# exact T-0368 regression shape. Instead the managed key is merged INTO the
-# preserved section body; see _apply_operator_section.
-_MANAGED_SECTIONS = ("tg", "session", "admin", "caps")
+# T-0894: [operator] is *partially* managed — this endpoint owns exactly the
+# keys in _OPERATOR_MANAGED_KEYS and must leave any other key in it untouched
+# (there will be more operator knobs). So its managed key is merged INTO the
+# section's existing content first; see _merge_operator_section.
 
 # T-0894: the [operator] keys this endpoint reads/writes. Everything else under
 # [operator] is unmanaged and preserved.
@@ -112,50 +110,6 @@ def _read_quota(config_dir: Path) -> dict:
         return {}
     q = raw.get("quota")
     return dict(q) if isinstance(q, dict) else {}
-
-
-# T-0910: a TOML *bare* key may only contain A-Za-z0-9_- . Anything else has to
-# be quoted, and the preserve loop below used to emit every key bare.
-_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-
-
-def _toml_key(k: object) -> str:
-    """Render a key for a preserved (unmanaged) section, quoting it when it is
-    not bare-legal (T-0910).
-
-    This was a silent config-corrupter: since T-0866 the live config carries a
-    catch-all key ``"*"`` in BOTH ``[models]`` and ``[effort]``, so ANY
-    successful save — a caps change, a TTL, a chat id — re-emitted it as
-    ``* = "sonnet"`` and the whole file stopped parsing for every reader. The
-    PUT still returned ``ok: true`` because nothing re-parses what it wrote,
-    and ``operator_redrive`` swallows the decode error and reports "no target",
-    so the failure looked like an unset setting rather than a broken file.
-    """
-    s = str(k)
-    if _BARE_KEY_RE.match(s):
-        return s
-    return f'"{_toml_escape(s)}"'
-
-
-def _toml_value(v: object) -> str:
-    """Render a TOML value for a preserved (unmanaged) section."""
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, int):
-        return str(v)
-    if isinstance(v, float):
-        return repr(v)
-    # T-0910: containers used to fall through to the str() branch below and come
-    # back as a Python repr inside a quoted string ('["a", "b"]' as TEXT) — it
-    # parses, so nothing complained, and the reader silently got a str where it
-    # had written a list. Emit real TOML instead: an array, and an inline table
-    # for a sub-table (semantically identical to the [parent.child] form).
-    if isinstance(v, (list, tuple)):
-        return "[" + ", ".join(_toml_value(item) for item in v) + "]"
-    if isinstance(v, dict):
-        inner = ", ".join(f"{_toml_key(k)} = {_toml_value(val)}" for k, val in v.items())
-        return "{" + inner + "}"
-    return f'"{_toml_escape(str(v))}"'
 
 
 def _read_system_settings(config_dir: Path) -> dict:
@@ -234,17 +188,14 @@ def _target_pct(v: object) -> float | None:
         return None
 
 
-def _apply_operator_section(existing: dict, operator_settings: dict) -> dict:
-    """Return ``existing`` with [operator]'s MANAGED keys set from
+def _merge_operator_section(existing: dict, operator_settings: dict) -> dict:
+    """Return [operator]'s content with its MANAGED keys set from
     ``operator_settings``, preserving every unmanaged key already in it (T-0894).
 
     A managed key set to None is *removed*, not written as a literal — TOML has
-    no null, and the worker's reader spells "no target" as an absent key. When
-    that empties the section entirely it is dropped, so clearing the target
-    leaves the file exactly as it was before anyone set one.
+    no null, and the worker's reader spells "no target" as an absent key.
     """
-    body = existing.get("operator")
-    merged = dict(body) if isinstance(body, dict) else {}
+    merged = dict(existing)
     for key in _OPERATOR_MANAGED_KEYS:
         if key not in operator_settings:
             continue
@@ -253,59 +204,83 @@ def _apply_operator_section(existing: dict, operator_settings: dict) -> dict:
             merged.pop(key, None)
         else:
             merged[key] = value
-    if merged:
-        return {**existing, "operator": merged}
-    return {k: v for k, v in existing.items() if k != "operator"}
+    return merged
+
+
+def _sync_table(doc, name: str, body: dict) -> None:
+    """Set ``doc[name]`` to contain exactly ``body``'s keys/values (T-0912).
+
+    Reuses the existing tomlkit table object when the section is already
+    present, instead of rebuilding it from a plain dict — that's what makes a
+    managed-section save preserve any comment attached to the section or to
+    one of its keys. Keys no longer in ``body`` are dropped; the rest are set
+    in place, so an unchanged key's own trivia (comment/whitespace) survives.
+    """
+    if not isinstance(doc.get(name), tomlkit.items.Table):
+        doc[name] = tomlkit.table()
+    table = doc[name]
+    for key in [k for k in table.keys() if k not in body]:
+        del table[key]
+    for key, value in body.items():
+        table[key] = value
 
 
 def _write_system_settings(config_dir: Path, settings: dict, quota_override: dict | None = None) -> None:
-    out: list[str] = []
-    out.append("# bot-squad system settings. Managed by /api/system-settings.")
-    out.append("")
-    out.append("[tg]")
-    out.append(f"quiet_hours_start_utc = {int(settings['tg']['quiet_hours_start_utc'])}")
-    out.append(f"quiet_hours_end_utc = {int(settings['tg']['quiet_hours_end_utc'])}")
-    out.append(f'default_chat_id = "{_toml_escape(str(settings["tg"]["default_chat_id"]))}"')
-    out.append(f'proxy_url = "{_toml_escape(str(settings["tg"]["proxy_url"]))}"')
-    out.append("")
-    out.append("[session]")
-    out.append(f'ttl = "{_toml_escape(settings["session"]["ttl"])}"')
-    out.append("")
-    out.append("[admin]")
-    out.append(f'coordinator_user = "{_toml_escape(settings["admin"]["coordinator_user"])}"')
-    out.append("")
-    out.append("[caps]")
-    out.append(f"max_parallel_sessions = {int(settings['caps']['max_parallel_sessions'])}")
-    out.append(f"max_total_tokens = {int(settings['caps']['max_total_tokens'])}")
-    out.append(f"idle_suspend_sec = {int(settings['caps']['idle_suspend_sec'])}")
-    out.append("")
+    """Write system_settings.toml without destroying comments (T-0912).
+
+    tomllib (stdlib) is read-only by design and drops every comment on parse,
+    which is what the old dict-rebuild writer below it inherited: it hand-
+    emitted the managed sections and re-emitted every other section from a
+    tomllib-parsed dict, so ANY successful save wiped every comment in the
+    whole file. tomlkit parses+edits in place instead, so unmanaged sections
+    are never even touched, and a managed section keeps its own comments
+    because _sync_table edits the existing table rather than replacing it.
+    """
     path = config_dir / "system_settings.toml"
-    # T-0368: PRESERVE any top-level section this endpoint doesn't manage (e.g.
-    # [max], the T-0247 MAX-DM recipient) — this writer hand-emits only the
-    # managed sections, so without this a settings save silently DROPPED [max]
-    # and reverted operator->stakeholder DMs to TG-only on the next worker reload.
     try:
-        existing = tomllib.loads(path.read_text()) if path.exists() else {}
-    except (OSError, ValueError):
-        existing = {}
+        raw = path.read_text() if path.exists() else ""
+    except OSError:
+        raw = ""
+    try:
+        doc = tomlkit.parse(raw) if raw else tomlkit.document()
+    except tomlkit.exceptions.TOMLKitError:
+        doc = tomlkit.document()
+    if not raw:
+        doc.add(tomlkit.comment("bot-squad system settings. Managed by /api/system-settings."))
+        doc.add(tomlkit.nl())
+
+    _sync_table(doc, "tg", {
+        "quiet_hours_start_utc": int(settings["tg"]["quiet_hours_start_utc"]),
+        "quiet_hours_end_utc": int(settings["tg"]["quiet_hours_end_utc"]),
+        "default_chat_id": str(settings["tg"]["default_chat_id"]),
+        "proxy_url": str(settings["tg"]["proxy_url"]),
+    })
+    _sync_table(doc, "session", {"ttl": str(settings["session"]["ttl"])})
+    _sync_table(doc, "admin", {"coordinator_user": str(settings["admin"]["coordinator_user"])})
+    _sync_table(doc, "caps", {
+        "max_parallel_sessions": int(settings["caps"]["max_parallel_sessions"]),
+        "max_total_tokens": int(settings["caps"]["max_total_tokens"]),
+        "idle_suspend_sec": int(settings["caps"]["idle_suspend_sec"]),
+    })
+
     # T-0418: put_settings may stamp/override the [quota] anchor (token-cap
-    # free) while every OTHER unmanaged section is still preserved verbatim.
+    # free) while every OTHER unmanaged section is left untouched.
     if quota_override is not None:
-        existing = {**existing, "quota": quota_override}
+        _sync_table(doc, "quota", quota_override)
+
     # T-0894: [operator] is partially managed — merge this endpoint's key into
-    # whatever else that section already holds, then let the preserve loop below
-    # emit the section as a whole. That way the managed key round-trips AND an
-    # unmanaged sibling key survives the write.
-    existing = _apply_operator_section(existing, settings.get("operator") or {})
-    for name, body in existing.items():
-        if name in _MANAGED_SECTIONS or not isinstance(body, dict):
-            continue
-        out.append(f"[{name}]")
-        for key, value in body.items():
-            out.append(f"{_toml_key(key)} = {_toml_value(value)}")
-        out.append("")
+    # whatever else that section already holds; drop the section entirely if
+    # that empties it (clearing the target leaves the file as it was before
+    # anyone set one).
+    existing_operator = dict(doc["operator"]) if isinstance(doc.get("operator"), dict) else {}
+    merged_operator = _merge_operator_section(existing_operator, settings.get("operator") or {})
+    if merged_operator:
+        _sync_table(doc, "operator", merged_operator)
+    elif "operator" in doc:
+        del doc["operator"]
+
     tmp = path.with_suffix(".toml.tmp")
-    tmp.write_text("\n".join(out))
+    tmp.write_text(tomlkit.dumps(doc))
     os.rename(tmp, path)
 
 

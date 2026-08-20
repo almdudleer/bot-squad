@@ -3695,6 +3695,103 @@ def _action_routine_mute(params: dict[str, Any]) -> dict[str, Any]:
         raise ActionError(f"routine_mute: {e}") from e
 
 
+_COMPACT_REQUIRED = {"sid"}
+_COMPACT_ALLOWED = _COMPACT_REQUIRED
+
+
+def _action_compact(params: dict[str, Any]) -> dict[str, Any]:
+    """``bsq compact`` (T-0924): stop sending a bare ``/compact`` into a session
+    the system's own autocompact would ARM+FINALIZE (write forward-state, clear
+    the pane, relaunch fresh) anyway — that native summarization was pure waste,
+    thrown away the moment the pane got cleared right after.
+
+    This now makes the SAME decision :func:`autocompact.maybe_compact`'s ARM
+    half does: a task-bound session gets the write-your-forward-state-into-##
+    Context handoff, a task-less role with an artifact gets the artifact
+    handoff — and either way the session's telemetry record is armed
+    (``compact: {phase: "writing", ...}``) so the next tick's FINALIZE clears
+    + relaunches it once the pane goes idle, same as an automatic ARM. Only a
+    session with no resolvable destination (or one whose telemetry record
+    doesn't exist yet — never sampled, so there is no finalize tick to arm)
+    falls back to the legacy bare ``/compact``.
+
+    Required params: sid
+    Returns: {ok, kind, sid, ...}
+    """
+    extra = set(params) - _COMPACT_ALLOWED
+    if extra:
+        raise ActionError(f"compact got unexpected params: {sorted(extra)}")
+    missing = _COMPACT_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"compact missing required params: {sorted(missing)}")
+
+    sid = params["sid"]
+    cfg = _get_config()
+
+    from bot_squad_worker.park import _slug_for_sid
+    slug = _slug_for_sid(cfg, sid)
+    if not slug:
+        raise ActionError(f"compact: no project found for sid {sid!r}")
+
+    from bot_squad_worker import sessions as _sessions
+    from bot_squad_worker import telemetry as _telemetry
+    from bot_squad_worker import autocompact as _autocompact
+
+    md_path = _sessions._session_file(cfg.data_dir, slug, sid)
+    meta = _sessions._read_session_metadata(md_path) or {}
+    task_id = meta.get("task_id")
+    role = meta.get("role") or _sessions._derive_role(
+        meta.get("window"), task_id, meta.get("initiative"))
+
+    rec_path = _telemetry._record_path(cfg, slug, sid)
+    rec = _telemetry._read_json(rec_path)
+    if rec is None:
+        # Never telemetry-sampled: no record for a later tick to FINALIZE
+        # against, so arming a handoff here would just wedge. Legacy fallback.
+        _action_inject_input({"sid": sid, "text": "/compact"})
+        return {"ok": True, "kind": "none", "sid": sid,
+                "reason": "no telemetry record yet"}
+
+    target_rec = {"sid": sid, "role": role, "task_id": task_id}
+    target = _autocompact._resolve_compact_target(cfg, slug, target_rec)
+    now = time.time()
+
+    if target["kind"] == "context":
+        tid, task_md = target["task_id"], target["task_md"]
+        _autocompact._inject_context_handoff(sid, tid, relaunch=True)
+        rec["compact"] = {
+            "phase": "writing",
+            "kind": "context",
+            "armed_at": now,
+            "task_id": tid,
+            "task_md": task_md,
+            "arm_digest": _autocompact.context_digest(task_md),
+            "role": target["role"],
+            "assignment_id": tid,
+        }
+        _telemetry._write_json(rec_path, rec)
+        return {"ok": True, "kind": "context", "sid": sid, "task_id": tid}
+
+    if target["kind"] == "artifact":
+        artifact_path, target_role = target["artifact_path"], target["role"]
+        _autocompact._inject_handoff(sid, artifact_path, target_role)
+        rec["compact"] = {
+            "phase": "writing",
+            "kind": "artifact",
+            "armed_at": now,
+            "arm_mtime": _autocompact._artifact_mtime(artifact_path),
+            "artifact_path": artifact_path,
+            "role": target_role,
+            "assignment_id": target["assignment_id"],
+        }
+        _telemetry._write_json(rec_path, rec)
+        return {"ok": True, "kind": "artifact", "sid": sid,
+                "artifact_path": artifact_path}
+
+    _action_inject_input({"sid": sid, "text": "/compact"})
+    return {"ok": True, "kind": "none", "sid": sid}
+
+
 _COMPACT_WRITE_STATE_REQUIRED = {"slug", "sid", "content"}
 _COMPACT_WRITE_STATE_ALLOWED = _COMPACT_WRITE_STATE_REQUIRED
 
@@ -5636,6 +5733,9 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     # T-0759: read-only liveness of the outbound log (ok/idle/decayed/blind).
     "outbound_liveness": _action_outbound_liveness,
     "inject_input": _action_inject_input,
+    # T-0924: `bsq compact` — arm the system's own handoff instead of a bare
+    # /compact whenever the session has a resolvable destination.
+    "compact": _action_compact,
     # T-0770: the BLOCK sibling — a multi-line payload as ONE composer
     # submission (inject_input submits one line at a time, which splits an
     # envelope into N turns).
@@ -5815,6 +5915,9 @@ ACTION_MODES: dict[str, str] = {
     # telemetry_get — a per-user fan-out would answer the same question N times.
     "outbound_liveness": "coordinator_only",
     "inject_input": "tmux_only",
+    # T-0924: same per-user tmux view as inject_input (resolves a LOCAL pane
+    # to send the handoff/compact prompt into) → tmux_only.
+    "compact": "tmux_only",
     # T-0770: same per-user tmux view as inject_input (pane lookup + paste into
     # a LOCAL pane) → tmux_only for the same reason.
     "inject_prompt": "tmux_only",

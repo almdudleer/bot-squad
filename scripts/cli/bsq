@@ -2905,9 +2905,24 @@ def cmd_autopilot_status(args) -> None:
 
 
 def cmd_compact(args) -> None:
+    """T-0924: arm the system's own handoff (write forward-state, then get
+    cleared+relaunched fresh by the next telemetry tick) instead of a bare
+    Claude ``/compact`` whose summarization would just be thrown away the
+    moment the handoff kills the pane anyway. Falls back to the legacy
+    ``/compact`` only when no destination (task Context / role artifact)
+    resolves, or the session has no telemetry record yet to arm."""
     sid = require_sid(args.sid)
-    res = post("inject_input", {"sid": sid, "text": "/compact"})
-    print(f"/compact sent to {sid} (pane {res.get('pane_id')})")
+    res = post("compact", {"sid": sid})
+    kind = res.get("kind")
+    if kind == "context":
+        print(f"handoff armed for {sid} → {res.get('task_id')} ## Context "
+              f"(will clear+relaunch once written and idle)")
+    elif kind == "artifact":
+        print(f"handoff armed for {sid} → {res.get('artifact_path')} "
+              f"(will clear+relaunch once written and idle)")
+    else:
+        reason = f" ({res['reason']})" if res.get("reason") else ""
+        print(f"/compact sent to {sid}{reason}")
 
 
 def cmd_compact_save(args) -> None:

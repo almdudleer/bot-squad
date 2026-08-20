@@ -793,3 +793,122 @@ def test_the_soft_deadline_still_covers_every_completed_handoff_measured():
     # and the hard cap has to clear the worst measured busy stretch (p355:
     # 1194s from ARM to the pane first going composer-ready)
     assert A.DEFAULT_HANDOFF_HARD_TIMEOUT_SEC >= 1194
+
+
+# --- `bsq compact` (T-0924): arm the SAME handoff instead of a bare /compact -
+
+def _write_rec(data_dir, slug, sid, rec):
+    from bot_squad_worker import telemetry as T
+    import types
+    cfg = types.SimpleNamespace(data_dir=data_dir)
+    path = T._record_path(cfg, slug, sid)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    T._write_json(path, rec)
+    return path
+
+
+def test_action_compact_arms_context_handoff_for_a_task_bound_session(
+        tmp_path, monkeypatch):
+    import bot_squad_worker.actions as ACT
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    _cfg, data_dir = _make_cfg(tmp_path, monkeypatch, sid=sid, window="demo",
+                               task_id="T-0042")
+    _write_rec(data_dir, "bot-squad", sid, {"sid": sid, "compact": {}})
+
+    calls = []
+    monkeypatch.setattr(
+        "bot_squad_worker.autocompact._inject_context_handoff",
+        lambda sid_, task_id, *, relaunch=True: calls.append(
+            (sid_, task_id, relaunch)))
+
+    res = ACT.dispatch("compact", {"sid": sid})
+
+    assert res["kind"] == "context"
+    assert res["task_id"] == "T-0042"
+    assert calls == [(sid, "T-0042", True)]
+
+    from bot_squad_worker import telemetry as T
+    import types
+    saved = T._read_json(
+        T._record_path(types.SimpleNamespace(data_dir=data_dir), "bot-squad", sid))
+    assert saved["compact"]["phase"] == "writing"
+    assert saved["compact"]["kind"] == "context"
+    assert saved["compact"]["task_id"] == "T-0042"
+
+
+def test_action_compact_arms_artifact_handoff_for_a_taskless_session(
+        tmp_path, monkeypatch):
+    import bot_squad_worker.actions as ACT
+    sid = "S-almdudleer-bot-squad-operator-p1"
+    _cfg, data_dir = _make_cfg(tmp_path, monkeypatch, sid=sid, window="operator",
+                               task_id=None)
+    _write_rec(data_dir, "bot-squad", sid, {"sid": sid, "compact": {}})
+
+    calls = []
+    monkeypatch.setattr(
+        "bot_squad_worker.autocompact._inject_handoff",
+        lambda sid_, art_path, role=None, *, relaunch=True: calls.append(
+            (sid_, art_path, role)))
+
+    res = ACT.dispatch("compact", {"sid": sid})
+
+    assert res["kind"] == "artifact"
+    assert calls and calls[0][0] == sid
+    assert "operator-state.md" in calls[0][1]
+
+    from bot_squad_worker import telemetry as T
+    import types
+    saved = T._read_json(
+        T._record_path(types.SimpleNamespace(data_dir=data_dir), "bot-squad", sid))
+    assert saved["compact"]["phase"] == "writing"
+    assert saved["compact"]["kind"] == "artifact"
+
+
+def test_action_compact_falls_back_to_bare_compact_with_no_telemetry_record(
+        tmp_path, monkeypatch):
+    """No telemetry record → no later tick to FINALIZE against — arming here
+    would just wedge, so this is still the legacy bare /compact, unchanged."""
+    import bot_squad_worker.actions as ACT
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    _make_cfg(tmp_path, monkeypatch, sid=sid, window="demo", task_id="T-0042")
+
+    calls = []
+    monkeypatch.setattr(ACT, "_action_inject_input",
+                        lambda params: calls.append(params) or {"ok": True})
+
+    res = ACT.dispatch("compact", {"sid": sid})
+
+    assert res["kind"] == "none"
+    assert res["reason"] == "no telemetry record yet"
+    assert calls == [{"sid": sid, "text": "/compact"}]
+
+
+def test_action_compact_missing_sid_raises(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as ACT
+    with pytest.raises(ACT.ActionError, match="missing required"):
+        ACT.dispatch("compact", {})
+
+
+def test_action_compact_rejects_extra_params(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as ACT
+    with pytest.raises(ACT.ActionError, match="unexpected"):
+        ACT.dispatch("compact", {"sid": "S-x-p1", "bogus": 1})
+
+
+def test_action_compact_unknown_sid_raises(tmp_path, monkeypatch):
+    """No project has a session md for this sid at all: `_slug_for_sid`
+    resolves to nothing. Same failure `inject_input` itself gives for a dead
+    sid ("no live pane") — a wrong sid should error loudly, not silently
+    fall back to blasting a bare /compact at nothing."""
+    import bot_squad_worker.actions as ACT
+    _make_cfg(tmp_path, monkeypatch, sid="S-known-p1", window="demo",
+             task_id=None)
+    with pytest.raises(ACT.ActionError, match="no project found"):
+        ACT.dispatch("compact", {"sid": "S-unknown-p9"})
+
+
+def test_action_compact_registered_with_a_mode():
+    from bot_squad_worker.actions import ACTION_MODES, ACTION_REGISTRY
+    assert "compact" in ACTION_REGISTRY
+    assert "compact" in ACTION_MODES
+    assert ACTION_MODES["compact"] == "tmux_only"

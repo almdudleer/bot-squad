@@ -71,6 +71,8 @@ def test_registry_lists_only_allowed_actions():
         # T-0478 (M2/F2.4): user-conversation intake-session ensure/spawn.
         "ensure_user_conversation",
         "scheduler_state", "inject_input",
+        # T-0924: `bsq compact` — arms the handoff instead of a bare /compact.
+        "compact",
         # T-0770: the BLOCK sibling of inject_input — one composer submission.
         "inject_prompt",
         # T-0759: read-only liveness of the outbound log (ok/idle/decayed/blind).

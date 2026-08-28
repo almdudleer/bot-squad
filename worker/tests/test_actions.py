@@ -121,6 +121,9 @@ def test_registry_lists_only_allowed_actions():
         "topology_decision",
         # T-0184: per-session drift-check off-ramp (bsq drift on/off).
         "set_drift_paused",
+        # T-0926 follow-up: per-session pin against every automatic action
+        # (bsq pin on/off).
+        "set_pinned",
         # T-0655: operator's own drive=on/off continuity toggle (bsq drive on/off).
         "set_drive",
         # T-0678: durable per-session `claude --model` override (bsq model set/status).

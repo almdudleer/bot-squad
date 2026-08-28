@@ -4877,6 +4877,33 @@ def _action_set_drift_paused(params: dict[str, Any]) -> dict[str, Any]:
     return _sessions.set_drift_paused(cfg, params["slug"], params["sid"], params["paused"])
 
 
+_SET_PINNED_REQUIRED = {"slug", "sid", "pinned"}
+_SET_PINNED_ALLOWED = _SET_PINNED_REQUIRED
+
+
+def _action_set_pinned(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0926 follow-up: pin/unpin a single session against every automatic
+    action (terminate AND compact-and-stay alike).
+
+    Required params: slug, sid, pinned (bool). Returns {ok, sid, pinned}.
+    Backs ``bsq pin on`` / ``bsq pin off``. ``tmux_only`` so a session can pin
+    itself via the user-worker without coordinator privileges, mirroring
+    set_drift_paused/set_drive.
+    """
+    extra = set(params) - _SET_PINNED_ALLOWED
+    if extra:
+        raise ActionError(f"set_pinned got unexpected params: {sorted(extra)}")
+    missing = _SET_PINNED_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"set_pinned missing required params: {sorted(missing)}")
+    if not isinstance(params["pinned"], bool):
+        raise ActionError("set_pinned: 'pinned' must be a boolean")
+
+    cfg = _get_config()
+    from bot_squad_worker import sessions as _sessions
+    return _sessions.set_pinned(cfg, params["slug"], params["sid"], params["pinned"])
+
+
 _SET_DRIVE_REQUIRED = {"slug", "sid", "on"}
 _SET_DRIVE_ALLOWED = _SET_DRIVE_REQUIRED
 
@@ -5701,6 +5728,9 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "topology_decision": _action_topology_decision,
     # T-0184: per-session drift-check off-ramp (bsq drift on/off).
     "set_drift_paused": _action_set_drift_paused,
+    # T-0926 follow-up: per-session pin against every automatic action
+    # (bsq pin on/off).
+    "set_pinned": _action_set_pinned,
     # T-0655: operator's own drive=on/off continuity toggle (bsq drive on/off).
     "set_drive": _action_set_drive,
     # T-0678: per-session `claude --model` override (bsq model set/status).
@@ -5892,6 +5922,10 @@ ACTION_MODES: dict[str, str] = {
     # it writes only its own SessionMd frontmatter (filesystem-local), so
     # tmux_only (no coordinator privilege required).
     "set_drift_paused": "tmux_only",
+    # T-0926 follow-up: a session pins/unpins ITSELF against every automatic
+    # action — writes only its own SessionMd frontmatter (filesystem-local),
+    # tmux_only like set_drift_paused.
+    "set_pinned": "tmux_only",
     # T-0655: the operator toggles its OWN drive continuity flag — writes
     # only its own SessionMd frontmatter (filesystem-local), tmux_only like
     # set_drift_paused.

@@ -473,6 +473,12 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
     # T-0563: never recycle a non-allowlisted project.
     if not recycle_gate.project_allowed(cfg, slug, now):
         return False
+    # T-0926 follow-up: an explicit human pin beats every other signal here —
+    # not just terminate, but compact-and-stay too. Checked before is_attached
+    # so a pinned session takes no action even through a real (not just
+    # flickered) attachment gap.
+    if recycle_gate.session_pinned(meta):
+        return False
     # T-0564: never touch a pane a human is currently attached to — applies
     # to every session, exempt or not.
     if recycle_gate.is_attached(pane, sid=sid, now=now):

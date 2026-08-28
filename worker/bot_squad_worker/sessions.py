@@ -1014,12 +1014,25 @@ def _ensure_project_tmux_session(slug: str, cwd: str, initiative: str | None = N
         return
     # Create detached; -n _init parks a placeholder window we never use for
     # claude. claude windows are added via tmux new-window -t <target>:.
+    # It must keep EXISTING (gc_orphan_tmux_sessions reads its name as the
+    # ownership proof that lets a de-registered project's stray session be
+    # told apart from a human's own unrelated tmux session — sessions.py
+    # around _BOT_SQUAD_INIT_WINDOW), but nothing needs it VISIBLE while the
+    # session is staffed with real windows: T-0927 (stakeholder, 2026-08-28,
+    # "tmux _init window is irritating"). Blank its own status-bar label
+    # (window-specific option, so it beats whatever the human's own
+    # ~/.tmux.conf sets globally) so it stops showing up as a stray empty tab
+    # without touching the keep-alive/ownership mechanism at all.
     _run([
         "tmux", "new-session", "-d",
         "-s", target,
         "-c", cwd,
         "-n", "_init",
     ])
+    _run(["tmux", "set-window-option", "-t", f"{target}:_init",
+          "window-status-format", ""])
+    _run(["tmux", "set-window-option", "-t", f"{target}:_init",
+          "window-status-current-format", ""])
 
 
 # ---------------------------------------------------------------------------

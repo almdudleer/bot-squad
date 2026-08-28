@@ -90,7 +90,21 @@ def is_paused(cfg: Any, slug: str) -> bool:
 
 def pause(cfg: Any, slug: str, *, by: str = "user", reason: str = "") -> dict:
     """Set the user-pause flag — re-drive stops until :func:`resume`. Returns the
-    metadata written. Idempotent (re-pausing just rewrites the marker)."""
+    metadata written. Idempotent (re-pausing just rewrites the marker).
+
+    T-0929 (stakeholder, 2026-08-28): "I regularly find the sessions working
+    when earlier on I've explicitly asked them to stop the auto-drive." Root
+    cause — this flag only ever gated FUTURE re-drive respawns (see this
+    module's own docstring: "a within-time-box live operator is left alone
+    for the universal lifecycle (idle_timeout / autopilot) to end"); it never
+    touched a currently-running :mod:`autopilot` (T-0153), which is a wholly
+    separate mechanism with its own stop condition and zero awareness of this
+    flag. A user telling the system to stop while an autopilot brief is
+    active would see this flag flip and the driven session keep working
+    regardless. Pause is the stakeholder's one asked-for "stop everything
+    automatic" lever, so it now also ends every currently-running autopilot
+    for this project (best-effort: a broken autopilot-state read must not
+    block the pause itself from taking effect)."""
     d = _state_dir(cfg, slug)
     d.mkdir(parents=True, exist_ok=True)
     meta = {"paused_by": by, "reason": reason, "paused_at": time.time()}
@@ -99,6 +113,18 @@ def pause(cfg: Any, slug: str, *, by: str = "user", reason: str = "") -> dict:
     tmp.write_text(json.dumps(meta, indent=2))
     os.replace(tmp, p)
     log.info("operator_redrive: %s paused by %s — %s", slug, by, reason or "(no reason)")
+
+    try:
+        from bot_squad_worker import autopilot as _autopilot
+        for state in _autopilot.list_states(cfg, slug):
+            if state.enabled and state.status == "running":
+                _autopilot.stop(
+                    cfg, slug, key=state.key,
+                    reason="", stopped_by=f"operator_redrive pause ({by})",
+                )
+    except Exception:  # noqa: BLE001
+        log.exception("operator_redrive: %s pause — failed to also stop running autopilots", slug)
+
     return meta
 
 

@@ -105,7 +105,15 @@ log = logging.getLogger(__name__)
 # median max context 732k against the 700k ceiling). Expect the same ~30k at
 # 300k. Anything far above that is a GATE not firing, not the ceiling being
 # ignored — see recycle_gate's skip logging (T-0864).
-DEFAULT_CONTEXT_CEILING = 300_000
+# T-0926 follow-up (stakeholder, 2026-08-28, verbatim: "и поставь значит 600к
+# токенов лимит везде сначала"): raised back from T-0857's 300k, ordered live
+# mid-incident after watchrobot's operator was hitting the ceiling every
+# ~1-1.5h during a stretch of heavy direct engagement (vs. its normal
+# ~3-5h background pace) and losing momentum to repeated full relaunches. This
+# is a DELIBERATE reversal of T-0857's cost-driven 300k, not a forgotten
+# constant — the long-context-premium cost tradeoff documented above still
+# applies at 600k (fewer relaunches, but more turns pay the >200k premium).
+DEFAULT_CONTEXT_CEILING = 600_000
 CONTEXT_WARN_RATIO = 0.8
 # T-0834: the warn line is on LOADED memory — MEMORY.md, the only file that
 # enters every session — NOT on the whole store. The old 40k line was a

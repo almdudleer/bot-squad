@@ -134,13 +134,14 @@ def test_resolved_window_is_none_when_chunk_carries_neither():
 
 
 def test_context_and_memory_levels(monkeypatch):
-    # T-0857 (stakeholder 2026-08-11): default ceiling 300k (was 700k, T-0210),
-    # warn at the same 0.8 warn:urgent ratio → 240k. No env override set.
+    # T-0926 follow-up (stakeholder 2026-08-28): default ceiling 600k (was
+    # 300k, T-0857; was 700k before that, T-0210), warn at the same 0.8
+    # warn:urgent ratio -> 480k. No env override set.
     monkeypatch.delenv("BOT_SQUAD_CONTEXT_CEILING", raising=False)
-    assert T.context_level(239_999) == "none"
-    assert T.context_level(240_000) == "warn"
-    assert T.context_level(299_999) == "warn"
-    assert T.context_level(300_000) == "urgent"
+    assert T.context_level(479_999) == "none"
+    assert T.context_level(480_000) == "warn"
+    assert T.context_level(599_999) == "warn"
+    assert T.context_level(600_000) == "urgent"
     # T-0834: the memory level is taken on LOADED tokens (MEMORY.md), not the
     # whole store.
     monkeypatch.delenv("BOT_SQUAD_MEMORY_LOADED_WARN_TOKENS", raising=False)
@@ -160,15 +161,16 @@ def test_memory_loaded_warn_env_override(monkeypatch):
     assert T.memory_loaded_warn() == T.MEMORY_LOADED_WARN_TOKENS
 
 
-def test_context_ceiling_default_is_300k(monkeypatch):
-    """T-0857: lowered 700k → 300k on the stakeholder's decision. The warn line
-    is DERIVED from the ceiling (0.8), so it moves with it — the failure mode
-    this pins is a ceiling change leaving an absolute warn behind at 560k, which
-    at a 300k ceiling would sit above 'urgent' and never fire."""
+def test_context_ceiling_default_is_600k(monkeypatch):
+    """T-0926 follow-up: raised 300k → 600k on the stakeholder's live decision
+    (was lowered 700k → 300k by T-0857). The warn line is DERIVED from the
+    ceiling (0.8), so it moves with it — the failure mode this pins is a
+    ceiling change leaving an absolute warn behind at, say, 240k, which at a
+    600k ceiling would sit well below 'warn' and fire far too early."""
     monkeypatch.delenv("BOT_SQUAD_CONTEXT_CEILING", raising=False)
-    assert T.context_ceiling() == 300_000
-    assert T.context_warn() == 240_000      # 0.8 ratio preserved
-    assert T.context_urgent() == 300_000
+    assert T.context_ceiling() == 600_000
+    assert T.context_warn() == 480_000      # 0.8 ratio preserved
+    assert T.context_urgent() == 600_000
     assert T.context_warn() < T.context_urgent()
 
 
@@ -185,7 +187,7 @@ def test_context_ceiling_env_override_scales_warn(monkeypatch):
 
 def test_context_ceiling_bad_env_falls_back_to_default(monkeypatch):
     monkeypatch.setenv("BOT_SQUAD_CONTEXT_CEILING", "not-a-number")
-    assert T.context_ceiling() == 300_000
+    assert T.context_ceiling() == 600_000
 
 
 def test_crossed_only_on_strictly_worse_level():

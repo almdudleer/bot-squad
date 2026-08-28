@@ -94,6 +94,25 @@ _SKIP_LOG_WINDOW_SEC = 30.0
 _SKIP_LOG_MAX_KEYS = 512
 _last_skip_log: dict[str, float] = {}
 
+# T-0926 (stakeholder, 2026-08-28): is_attached() is a single stateless tmux
+# poll — "which window is each client's #{window_id} RIGHT NOW". Reproduced
+# live twice within the hour it was filed: idle_timeout's compact-and-stay
+# sent a bare /compact into the stakeholder's own user-conversation pane
+# (13:24:41), and autocompact armed a full handoff on the watchrobot operator
+# pane (13:57:46) — both while he was actively working the pane, and both
+# with "a human client is viewing" skip lines logged on the ticks immediately
+# before and after but NOT on the firing tick itself. One negative sample from
+# tmux (a momentary resize/redraw/client-switch blip, or however his actual
+# viewing method reports to tmux) was enough to fire. Grace: remember the last
+# tick each target read attached, and keep treating it as attached for
+# _ATTACH_GRACE_SEC after that even if the current sample reads negative — a
+# real detach stays negative past the grace window, a blip doesn't survive
+# long enough to matter. In-memory only (per worker process, not persisted):
+# a worker restart re-learns attachment on the very next tick, which is fine
+# since the grace exists to bridge a single missed sample, not an outage.
+_ATTACH_GRACE_SEC = 180.0
+_last_attached_true_at: dict[str, float] = {}
+
 
 def should_log_skip(key: str, now: float | None = None) -> bool:
     """True at most once per ``key`` per :data:`_SKIP_LOG_WINDOW_SEC`, stamping
@@ -266,14 +285,24 @@ def is_attached(tmux_target: str | None, *, sid: str | None = None,
 
     Logs one debounced INFO line naming the session and the window a client is
     holding, so a stuck session is a log lookup (T-0864 DoD 3).
+
+    T-0926 grace: a "not viewing right now" reading (the ``target_window not
+    in viewing`` case below) is held against the last tick this same target
+    read attached for :data:`_ATTACH_GRACE_SEC` — see that constant's comment.
+    Every OTHER False path (no target, target gone, no server) returns
+    immediately with no grace: those mean there is nothing to be attached TO,
+    not "attached a moment ago."
     """
     if not tmux_target:
         return False
+    ts = time.time() if now is None else float(now)
+    key = f"attached:{sid or tmux_target}"
     tgt = _tmux(["display-message", "-p", "-t", str(tmux_target),
                  "-F", "#{window_id}"])
     if tgt is None:
         log.warning("recycle: tmux display-message failed for %s — treating as "
                     "attached (fail-closed)", tmux_target)
+        _last_attached_true_at[key] = ts
         return True
     if tgt.returncode != 0:
         return False
@@ -284,13 +313,18 @@ def is_attached(tmux_target: str | None, *, sid: str | None = None,
     if clients is None:
         log.warning("recycle: tmux list-clients failed for %s — treating as "
                     "attached (fail-closed)", tmux_target)
+        _last_attached_true_at[key] = ts
         return True
     if clients.returncode != 0:
         return False  # no server → no client possible
     viewing = {ln.strip() for ln in clients.stdout.splitlines() if ln.strip()}
     if target_window not in viewing:
+        last_true = _last_attached_true_at.get(key)
+        if last_true is not None and (ts - last_true) < _ATTACH_GRACE_SEC:
+            return True  # T-0926: one flickered sample, not a real detach
         return False
-    if should_log_skip(f"attached:{sid or tmux_target}", now):
+    _last_attached_true_at[key] = ts
+    if should_log_skip(key, now):
         log.info("recycle: skipping %s — a human client is viewing its tmux "
                  "window %s (target %s)", sid or "<unknown sid>",
                  target_window, tmux_target)

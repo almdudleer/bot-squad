@@ -261,6 +261,25 @@ def test_exempt_session_ceiling_compacts_in_place_no_suspend(tmp_path, stay_harn
     assert "idle_recycle_phase" not in meta
 
 
+def test_pinned_session_ceiling_never_compacts(tmp_path, stay_harness, monkeypatch):
+    """T-0926 follow-up: a ``pinned: true`` session gets no ceiling action at
+    all — unlike the plain exempt case above (still compacts in place), pin
+    is a stronger "do not touch" override."""
+    sid = "S-almdudleer-operator-p9"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None,
+                          extra_md={"pinned": True})
+    suspended = []
+    monkeypatch.setattr(S, "suspend", lambda *a, **k: suspended.append(a))
+
+    rec = {"sid": sid, "activity": "idle", "role": "user-conversation"}
+    assert A.maybe_compact(cfg, "bot-squad", rec, "urgent", now=1000.0) is False
+    assert stay_harness["sent"] == []
+    assert suspended == []
+
+    meta = S._read_session_metadata(S._session_file(data, "bot-squad", sid))
+    assert "compact_stay_phase" not in meta
+
+
 def test_exempt_session_ceiling_skips_below_urgent(tmp_path, stay_harness):
     sid = "S-almdudleer-operator-p9"
     cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None)

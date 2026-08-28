@@ -3473,6 +3473,45 @@ def cmd_drift_status(args) -> None:
 
 
 # --------------------------------------------------------------------------
+# T-0926 follow-up: pin a session against EVERY automatic action (terminate
+# AND compact-and-stay alike) — distinct from drift (a nag off-ramp only) and
+# from recycle_exempt (still permits compact-and-stay by design). For a
+# session the human is actively typing into directly: the T-0926 attach-grace
+# fix only survives one flickered tmux sample, not a real stretch of no
+# keystrokes/no detected client during a long turn or a look-away. Mirrors
+# the drift CLI shape.
+# --------------------------------------------------------------------------
+
+def _set_pinned(args, pinned: bool) -> None:
+    slug = resolve_slug()
+    sid = require_sid(getattr(args, "sid", None))
+    res = post("set_pinned", {"slug": slug, "sid": sid, "pinned": pinned})
+    state = "ON (pinned)" if res.get("pinned") else "OFF (unpinned)"
+    print(f"pin for {res.get('sid', sid)}: {state}")
+
+
+def cmd_pin_on(args) -> None:
+    _set_pinned(args, True)
+
+
+def cmd_pin_off(args) -> None:
+    _set_pinned(args, False)
+
+
+def cmd_pin_status(args) -> None:
+    slug = resolve_slug()
+    sid = require_sid(getattr(args, "sid", None))
+    md = sessions_dir(slug) / f"{sid}.md"
+    pinned = False
+    if md.exists():
+        fm = read_frontmatter(md)
+        pinned = str(fm.get("pinned", "")).strip().lower() in {"true", "1", "yes", "on"}
+    else:
+        print(f"bsq: no SessionMd at {md} (status may be stale)", file=sys.stderr)
+    print(f"pin for {sid}: {'ON (pinned)' if pinned else 'OFF (unpinned)'}")
+
+
+# --------------------------------------------------------------------------
 # T-0655: operator's own drive=on/off continuity toggle.
 #
 # Distinct from `bsq pace pause` (a project-wide dispatch gate — stop
@@ -6796,6 +6835,19 @@ def build_parser() -> argparse.ArgumentParser:
     drs = dr_sub.add_parser("status", help="show whether drift checks are paused for this session")
     drs.add_argument("--sid", help="target SID (default: this session)")
     drs.set_defaults(func=cmd_drift_status)
+
+    # pin (T-0926 follow-up: block EVERY automatic action for this session)
+    pn = sub.add_parser("pin", help="block terminate AND compact-and-stay for THIS session (T-0926)")
+    pn_sub = pn.add_subparsers(dest="sub", required=True)
+    pno = pn_sub.add_parser("on", help="pin this session — no automatic action touches it")
+    pno.add_argument("--sid", help="target SID (default: this session)")
+    pno.set_defaults(func=cmd_pin_on)
+    pnoff = pn_sub.add_parser("off", help="unpin this session — automatic actions resume")
+    pnoff.add_argument("--sid", help="target SID (default: this session)")
+    pnoff.set_defaults(func=cmd_pin_off)
+    pns = pn_sub.add_parser("status", help="show whether this session is pinned")
+    pns.add_argument("--sid", help="target SID (default: this session)")
+    pns.set_defaults(func=cmd_pin_status)
 
     # drive (T-0655: operator-only drive=on/off continuity toggle)
     dv = sub.add_parser("drive", help="operator-only: your own drive=on/off continuity toggle (T-0655)")

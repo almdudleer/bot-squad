@@ -787,6 +787,20 @@ def test_recycle_exempt_marker_blocks_terminate_but_allows_compact_stay(tmp_path
     assert seams["calls"]["compact"] == [sid] and seams["calls"]["terminate"] == []
 
 
+def test_pinned_marker_blocks_compact_stay_too(tmp_path, seams):
+    """T-0926 follow-up: unlike ``recycle_exempt`` (blocks terminate only,
+    still permits compact-and-stay by design), an explicit ``pinned: true``
+    stamp blocks compact-and-stay as well — no automatic action at all."""
+    sid = "S-almdudleer-user-session-p8"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None,
+                          extra_md={"pinned": True})
+    row = _row(sid, window="user-session", task_id=None,
+               cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
+
+
 # --- A3. T-0617: compact-and-stay — arm, finalize, anti-loop ----------------
 
 def test_compact_stay_finalize_never_terminates_and_stamps_last_at(tmp_path, seams):

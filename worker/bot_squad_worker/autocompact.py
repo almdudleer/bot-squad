@@ -963,6 +963,10 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
             md_path = None
     if not recycle_gate.project_allowed(cfg, slug, now):
         return False
+    # T-0926 follow-up: an explicit human pin beats every other signal here —
+    # including the compact-and-stay ceiling path a few lines down.
+    if recycle_gate.session_pinned(meta):
+        return False
     pane = _pane_for(sid) if sid else None
     if recycle_gate.is_attached(pane, sid=sid, now=now):
         return False

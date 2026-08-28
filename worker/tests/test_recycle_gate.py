@@ -16,6 +16,18 @@ def _cfg(**kw):
     return types.SimpleNamespace(**kw)
 
 
+@pytest.fixture(autouse=True)
+def _reset_attach_grace():
+    """T-0926: is_attached() now remembers the last tick a target read
+    attached (grace window against a single flickered tmux sample) in a
+    module-level dict keyed by target/sid — reset it before every test so one
+    test's "attached" call can't leak a grace window into another test reusing
+    the same pane id (e.g. "%1")."""
+    G._last_attached_true_at.clear()
+    yield
+    G._last_attached_true_at.clear()
+
+
 # --- T-0563: per-project allowlist -------------------------------------------
 
 def test_default_allowlist_is_bot_squad_and_watchrobot(monkeypatch):
@@ -318,6 +330,36 @@ def test_is_attached_false_when_target_gone(monkeypatch):
     fake = _one_project_two_sessions()
     monkeypatch.setattr(subprocess, "run", fake.run)
     assert G.is_attached("%99") is False
+
+
+# --- T-0926: grace against a single flickered "not viewing" sample ----------
+
+def test_is_attached_grace_survives_one_flickered_negative_sample(monkeypatch):
+    """Attached at t=1000, one bad tmux sample reads "not viewing" at t=1030
+    (well inside the grace window) — still treated as attached."""
+    fake = _one_project_two_sessions(client_window="@1")
+    monkeypatch.setattr(subprocess, "run", fake.run)
+    assert G.is_attached("%1", now=1000.0) is True
+    fake.clients = []  # the flicker: this sample sees no client at all
+    assert G.is_attached("%1", now=1030.0) is True
+
+
+def test_is_attached_grace_expires_after_the_window(monkeypatch):
+    """Same flicker, but the negative reading persists past
+    _ATTACH_GRACE_SEC — a real detach, not a blip, must still read False."""
+    fake = _one_project_two_sessions(client_window="@1")
+    monkeypatch.setattr(subprocess, "run", fake.run)
+    assert G.is_attached("%1", now=1000.0) is True
+    fake.clients = []
+    assert G.is_attached("%1", now=1000.0 + G._ATTACH_GRACE_SEC + 1) is False
+
+
+def test_is_attached_grace_is_per_target_not_global(monkeypatch):
+    """Grace on pane A must not bleed into a pane that was never attached."""
+    fake = _one_project_two_sessions(client_window="@1")
+    monkeypatch.setattr(subprocess, "run", fake.run)
+    assert G.is_attached("%1", now=1000.0) is True
+    assert G.is_attached("%2", now=1030.0) is False
 
 
 def test_is_attached_false_on_nonzero_exit(monkeypatch):

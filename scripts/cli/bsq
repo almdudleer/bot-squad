@@ -4107,7 +4107,16 @@ def cmd_pace_drive(args) -> None:
 
 def cmd_pace_pause(args) -> None:
     """T-0482: GLOBAL operator pause — stop the re-drive from starting new work.
-    Writes the SAME flag operator_redrive.is_paused honors (single pause SSOT)."""
+    Writes the SAME flag operator_redrive.is_paused honors (single pause SSOT).
+
+    T-0929 (stakeholder, 2026-08-28): pause is the one "stop everything
+    automatic" lever, so it must also end any currently-running autopilot
+    (T-0153) — a separate mechanism with its own stop condition that this
+    flag alone never touched (`operator_redrive.pause` gained the same fix
+    server-side; `bsq operator pause` already went through that path, but
+    this verb writes the flag file directly per pace's own no-new-worker-
+    action design, so it needs the same step here — best-effort, a worker
+    hiccup must not block the pause itself)."""
     slug = resolve_slug()
     flag = _pace_redrive_flag(slug)
     flag.parent.mkdir(parents=True, exist_ok=True)
@@ -4116,8 +4125,22 @@ def cmd_pace_pause(args) -> None:
     tmp = flag.with_suffix(".flag.tmp")
     tmp.write_text(json.dumps(meta, indent=2))
     os.replace(tmp, flag)
+    stopped = []
+    try:
+        status = post("autopilot_status", {"slug": slug})
+        for ap in status.get("autopilots", []):
+            if ap.get("enabled") and ap.get("status") == "running":
+                post("autopilot_stop", {
+                    "slug": slug, "key": ap["key"],
+                    "stopped_by": meta["paused_by"],
+                })
+                stopped.append(ap["key"])
+    except Exception as exc:  # noqa: BLE001
+        print(f"pace[{slug}]: warning — could not check/stop running autopilots: {exc}")
     print(f"pace[{slug}]: PAUSED — operator re-drive stops starting new work "
           f"(resume with `bsq pace resume`)")
+    if stopped:
+        print(f"pace[{slug}]: also stopped running autopilot(s): {', '.join(stopped)}")
 
 
 def cmd_pace_resume(args) -> None:

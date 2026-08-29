@@ -2862,6 +2862,34 @@ def _handle_reply(
         _clear_stall(cfg, chat_id, sid, thread_id=thread_id)
         return {"ok": True, "action": "inject", "sid": sid, "result": result}
     except A.ActionError as e:
+        # T-0930 (stakeholder, 2026-08-29): ``inject_prompt``/``inject_input``
+        # raise the IDENTICAL ActionError whether the pane is truly gone or
+        # merely busy — a paste that can't land in a mid-generation composer
+        # fails exactly like "no live pane for sid" does. Every caller here
+        # used to read that as "the session recycled" and start asking who
+        # holds its seat now — for a session that's genuinely just mid-turn,
+        # ``_route_to_successor`` then (correctly) finds the target itself
+        # alive and reports back a contradiction: "session not active... but
+        # its successor lookup says it's alive" (measured live: operator
+        # p513, journal 2026-08-29T12:33:15Z, reason=target_live — the exact
+        # incarnation that had been running continuously for ~21h at that
+        # point). So check pane liveness DIRECTLY before assuming a recycle:
+        # a live pane gets the message QUEUED (``send_input`` never raises —
+        # it enqueues durably and a later scheduler tick delivers it once the
+        # composer frees up) instead of misreported as dead. Only a truly
+        # gone pane (or nothing to queue — the pre-existing empty-text case)
+        # falls through to the successor/fallback flow below, unchanged.
+        if payload.strip() and A._send_input_pane_lookup(sid) is not None:
+            queued = A.dispatch("send_input", {"sid": sid, "text": payload,
+                                               "author": "tg-reply"})
+            _clear_stall(cfg, chat_id, sid, thread_id=thread_id)
+            _notify(
+                cfg, chat_id,
+                f"⏳ Сессия {sid} сейчас занята (в процессе хода) — сообщение "
+                f"поставлено в очередь, доставится как только освободится.",
+                thread_id=thread_id,
+            )
+            return {"ok": True, "action": "queued", "sid": sid, "result": queued}
         # T-0896: the SID is dead, but the seat may not be. Ask who holds it
         # BEFORE handing the message to an attendant — the successor is the one
         # party that can act on it, and until now it was the one party never

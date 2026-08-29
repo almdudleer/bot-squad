@@ -133,6 +133,82 @@ def test_live_target_gets_it_and_nothing_is_copied_to_a_successor(tmp_path, spy,
 
 
 # ---------------------------------------------------------------------------
+# T-0930: a BUSY-but-alive pane must be queued, not treated as a recycle
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def busy_dispatch(monkeypatch, spy):
+    """``inject_prompt``/``inject_input`` raise for a pane that is alive but
+    mid-generation (the paste never lands) — the SAME ActionError shape a
+    truly-gone pane raises. ``send_input`` (the queued lane) always succeeds,
+    matching its real never-raises contract."""
+    def _fake(verb, params):
+        state = (verb, params.get("sid"), params.get("text", ""))
+        spy["dispatch"].append(state)
+        if verb == "send_input":
+            return {"ok": True, "queued": 1, "delivered": 0,
+                    "deferred": True, "reason": "composer_busy"}
+        raise A.ActionError(
+            f"{verb}: _deliver_prompt: paste never appeared in the composer "
+            f"for pane %1"
+        )
+
+    monkeypatch.setattr(A, "dispatch", _fake)
+    monkeypatch.setattr(A, "_send_input_pane_lookup", lambda sid: "%1")
+
+
+def test_busy_live_pane_is_queued_not_rerouted_to_a_successor(tmp_path, spy,
+                                                              busy_dispatch):
+    """T-0930 — the live incident: operator p513 had been running
+    continuously for ~21h (no recycle at all) when a reply landed while it
+    was mid-turn; the paste-never-landed ActionError was misread as a
+    recycle, ``_route_to_successor`` correctly found the target itself
+    alive (``target_live``), and the stakeholder got a contradictory
+    "not active... but it IS active" notice. A live pane must be queued
+    instead — never routed to a successor, never told "not active"."""
+    cfg = _cfg(tmp_path, {LIVE: "active", HEIR: "active"})
+
+    out = TL._handle_reply(cfg, CHAT, LIVE, TEXT, gid=GID, block_text="конверт")
+
+    assert out["action"] == "queued" and out["ok"] is True
+    assert ("send_input", LIVE, "конверт") in spy["dispatch"]
+    assert _dispatched_sids(spy, "inject_successor") == []
+    assert spy["posts"] == []
+    assert any("занята" in n for n in spy["notices"])
+    assert not any("не активна" in n for n in spy["notices"])
+
+
+def test_busy_live_pane_still_clears_the_stall(tmp_path, spy, busy_dispatch,
+                                              monkeypatch):
+    """T-0155's reasoning (he answered, so the stall is over) applies the
+    moment he replies, independent of whether delivery is instant or
+    deferred — a queued-but-not-yet-delivered message must not leave a
+    stall escalation armed."""
+    cleared = []
+    monkeypatch.setattr(TL, "_clear_stall",
+                        lambda cfg, chat_id, sid, **k: cleared.append(sid))
+    cfg = _cfg(tmp_path, {LIVE: "active"})
+
+    TL._handle_reply(cfg, CHAT, LIVE, TEXT, gid=GID, block_text="конверт")
+
+    assert cleared == [LIVE]
+
+
+def test_empty_text_to_a_busy_pane_still_falls_through_unchanged(tmp_path, spy,
+                                                                 busy_dispatch):
+    """The pre-existing empty-text refusal (``block_text=""``, ``text=""``)
+    must not be swallowed by the new busy-pane branch — there is nothing to
+    queue, so this stays the T-0746 fallback exactly as before."""
+    cfg = _cfg(tmp_path, {LIVE: "active"})
+
+    out = TL._handle_reply(cfg, CHAT, LIVE, "", gid=GID, block_text="")
+
+    assert out["action"] == "inject_failed"
+    assert out["reason"] == "нечего передавать (пустой текст)"
+    assert _dispatched_sids(spy, "send_input") == []
+
+
+# ---------------------------------------------------------------------------
 # The REROUTE arms — one per inbound type measured on the old route
 # ---------------------------------------------------------------------------
 

@@ -187,7 +187,7 @@ def test_non_compact_fire_clears_inflight_phase_keeps_durable(hook_env, source):
 def seams(monkeypatch):
     """Same seam set as test_idle_timeout: no real tmux/telemetry/suspend."""
     calls = {"compact": [], "terminate": [], "handoff": []}
-    state = {"pane": "%7", "buf": "❯ ready\n", "idle_age": 7200.0,
+    state = {"pane": "%7", "buf": "❯ \n", "idle_age": 7200.0,
              "tokens": 60000}
     monkeypatch.setattr(A, "_pane_for", lambda sid, **kw: state["pane"])
     monkeypatch.setattr(A, "_capture_pane", lambda pane, **kw: state["buf"])

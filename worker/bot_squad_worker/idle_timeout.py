@@ -568,7 +568,7 @@ def _start_recycle(cfg: Any, slug: str, sid: str, row: dict, meta: dict, md_path
     T-0655: ``role`` is threaded through to :func:`_terminate_and_remember` so
     a drive=off operator (the only way an operator reaches this function at
     all — see :func:`maybe_recycle`) self-terminates without resume bait."""
-    if not pane or not autocompact.composer_ready(
+    if not pane or not autocompact.composer_free(
             autocompact._capture_pane(pane), sid=sid, now=now):
         return False
 
@@ -765,7 +765,7 @@ def _maybe_compact_and_stay(cfg: Any, slug: str, sid: str, row: dict, meta: dict
         log.info("idle_timeout: compact-and-stay auto-postpone %s — waiting "
                  "on a tracked long job", sid)
         return False
-    if not pane or not autocompact.composer_ready(
+    if not pane or not autocompact.composer_free(
             autocompact._capture_pane(pane), sid=sid, now=now):
         return False
 
@@ -894,7 +894,7 @@ def _maybe_keepalive_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
         log.info("idle_timeout: keepalive auto-postpone %s — waiting on a "
                  "tracked long job", sid)
         return False
-    if not pane or not autocompact.composer_ready(
+    if not pane or not autocompact.composer_free(
             autocompact._capture_pane(pane), sid=sid, now=now):
         return False
 

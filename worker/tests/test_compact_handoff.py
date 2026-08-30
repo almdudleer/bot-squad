@@ -267,7 +267,7 @@ def harness(monkeypatch):
     """
     calls = {"handoff": [], "ctx_handoff": [], "compact": [], "suspend": [],
              "spawn": [], "spawn_ticket": []}
-    state = {"pane": "%9", "buf": "❯ ready\n", "artifact_mtime": 100.0,
+    state = {"pane": "%9", "buf": "❯ \n", "artifact_mtime": 100.0,
              "ctx_digest": "digest-at-arm",
              "target": {"kind": "context", "task_id": "T-0042",
                         "task_md": "/backlog/T-0042-demo.md", "role": "dev",
@@ -275,8 +275,8 @@ def harness(monkeypatch):
     monkeypatch.setattr(A, "_pane_for", lambda sid: state["pane"])
     monkeypatch.setattr(A, "_capture_pane", lambda pane: state["buf"])
     monkeypatch.setattr(A, "_send_compact", lambda sid: calls["compact"].append(sid))
-    monkeypatch.setattr(A, "_inject_handoff", lambda sid, art_path, role=None, *, relaunch=True: calls["handoff"].append((sid, art_path, role, relaunch)))
-    monkeypatch.setattr(A, "_inject_context_handoff", lambda sid, task_id, *, relaunch=True: calls["ctx_handoff"].append((sid, task_id, relaunch)))
+    monkeypatch.setattr(A, "_inject_handoff", lambda sid, art_path, role=None, *, relaunch=True, **kw: calls["handoff"].append((sid, art_path, role, relaunch)))
+    monkeypatch.setattr(A, "_inject_context_handoff", lambda sid, task_id, *, relaunch=True, **kw: calls["ctx_handoff"].append((sid, task_id, relaunch)))
     monkeypatch.setattr(A, "_suspend_session", lambda cfg, slug, sid: calls["suspend"].append(sid))
     # `**kw` deliberately (T-0909) — see test_recovery.py for why a hand-mirrored
     # stub signature is the wrong thing to pin.
@@ -764,7 +764,7 @@ def test_a_late_write_still_finalizes_instead_of_being_locked_out(harness):
     assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=late) is False
 
     harness["state"]["ctx_digest"] = "digest-after-write"   # it wrote, late
-    harness["state"]["buf"] = "❯ ready\n"
+    harness["state"]["buf"] = "❯ \n"
     assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=late + 60) is True
     assert harness["calls"]["compact"] == []
     assert harness["calls"]["spawn_ticket"] == [(rec["sid"], "/backlog/T-0042-demo.md")]
@@ -818,7 +818,7 @@ def test_action_compact_arms_context_handoff_for_a_task_bound_session(
     calls = []
     monkeypatch.setattr(
         "bot_squad_worker.autocompact._inject_context_handoff",
-        lambda sid_, task_id, *, relaunch=True: calls.append(
+        lambda sid_, task_id, *, relaunch=True, **kw: calls.append(
             (sid_, task_id, relaunch)))
 
     res = ACT.dispatch("compact", {"sid": sid})
@@ -847,7 +847,7 @@ def test_action_compact_arms_artifact_handoff_for_a_taskless_session(
     calls = []
     monkeypatch.setattr(
         "bot_squad_worker.autocompact._inject_handoff",
-        lambda sid_, art_path, role=None, *, relaunch=True: calls.append(
+        lambda sid_, art_path, role=None, *, relaunch=True, **kw: calls.append(
             (sid_, art_path, role)))
 
     res = ACT.dispatch("compact", {"sid": sid})
@@ -912,3 +912,147 @@ def test_action_compact_registered_with_a_mode():
     assert "compact" in ACTION_REGISTRY
     assert "compact" in ACTION_MODES
     assert ACTION_MODES["compact"] == "tmux_only"
+
+
+# ---------------------------------------------------------------------------
+# T-0930: checkpoint + compact-in-place (the ceiling default) ----------------
+# ---------------------------------------------------------------------------
+#
+# The stakeholder's 2026-08-30 ruling: «handoff + compact без exit было бы
+# правильным поведением, если есть шанс что эта сессия будет продолжаться».
+# The ceiling trigger's job is to SHRINK a session that continues — not to
+# mint a fresh incarnation. ARM stamps `stay: true` (the promise made to the
+# session in its prompt) and FINALIZE honours it: /compact in place, no
+# suspend, no relaunch. The clear+relaunch survives in exactly two shapes —
+# an armed record WITHOUT the stamp (a promise made by the previous build)
+# and the busy-past-hard-cap escape hatch.
+
+def test_arm_stamps_stay_and_finalize_compacts_in_place_ticket(harness):
+    rec = _rec()
+    assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=1000.0) is True
+    assert rec["compact"]["stay"] is True
+
+    harness["state"]["ctx_digest"] = "digest-after-write"  # the session wrote
+    assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=1030.0) is True
+    # compacted in place: /compact sent, session NEVER suspended or relaunched
+    assert harness["calls"]["compact"] == [rec["sid"]]
+    assert harness["calls"]["suspend"] == []
+    assert harness["calls"]["spawn_ticket"] == [] and harness["calls"]["spawn"] == []
+    assert rec.get("compact", {}).get("phase") is None
+    # the compact cooldown is stamped so the next tick can't instantly re-arm
+    assert rec["alert_fired_at"]["compact"] == 1030.0
+
+
+def test_arm_stamps_stay_and_finalize_compacts_in_place_artifact(harness):
+    harness["taskless"]()
+    rec = _rec(role="operator", task_id=None)
+    assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=1000.0) is True
+    assert rec["compact"]["stay"] is True
+
+    harness["state"]["artifact_mtime"] = 150.0  # the session wrote
+    assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=1030.0) is True
+    assert harness["calls"]["compact"] == [rec["sid"]]
+    assert harness["calls"]["suspend"] == []
+    assert harness["calls"]["spawn"] == [] and harness["calls"]["spawn_ticket"] == []
+
+
+def test_stay_env_kill_switch_restores_relaunch(harness, monkeypatch):
+    monkeypatch.setenv("BOT_SQUAD_CEILING_COMPACT_STAY", "0")
+    rec = _rec()
+    assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=1000.0) is True
+    assert rec["compact"]["stay"] is False
+    harness["state"]["ctx_digest"] = "digest-after-write"
+    assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=1030.0) is True
+    assert harness["calls"]["suspend"] == [rec["sid"]]
+    assert harness["calls"]["compact"] == []
+
+
+def test_pre_stay_armed_record_still_relaunches(harness):
+    """An in-flight handoff armed by the PREVIOUS build carries no `stay` key
+    — the session was PROMISED a relaunch, so finalize must deliver one, not
+    silently convert it to a compact the session was never told about."""
+    rec = _rec(compact={"phase": "writing", "kind": "context", "armed_at": 1000.0,
+                        "task_id": "T-0042", "task_md": "/backlog/T-0042-demo.md",
+                        "arm_digest": "digest-at-arm"})
+    harness["state"]["ctx_digest"] = "digest-after-write"
+    assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=1030.0) is True
+    assert harness["calls"]["suspend"] == [rec["sid"]]
+    assert harness["calls"]["compact"] == []
+
+
+def test_stay_finalize_defers_while_the_human_is_typing(harness):
+    """The T-0930 typing gate on the in-place compact itself: forward-state on
+    disk, pane idle, but his draft is sitting in the composer — retry next
+    tick, never /compact over it."""
+    rec = _rec()
+    assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=1000.0) is True
+    harness["state"]["ctx_digest"] = "digest-after-write"
+    harness["state"]["buf"] = "❯ вот что я думаю про\n"
+    assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=1030.0) is False
+    assert harness["calls"]["compact"] == []
+    assert rec["compact"]["phase"] == "writing"  # still armed, retried later
+
+
+def test_stay_falls_back_to_relaunch_past_the_hard_cap(harness):
+    """A stay-armed handoff whose pane NEVER frees cannot compact in place —
+    past handoff_hard_timeout_sec it takes the one move that cannot wedge:
+    the old clear+relaunch, booting from the checkpoint it already wrote."""
+    rec = _rec(activity="busy",
+               compact={"phase": "writing", "kind": "context", "armed_at": 1000.0,
+                        "task_id": "T-0042", "task_md": "/backlog/T-0042-demo.md",
+                        "arm_digest": "digest-at-arm", "stay": True})
+    harness["state"]["ctx_digest"] = "digest-after-write"
+    late = 1000.0 + A.handoff_hard_timeout_sec() + 1
+    assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=late) is True
+    assert harness["calls"]["suspend"] == [rec["sid"]]
+    assert harness["calls"]["spawn_ticket"] == [(rec["sid"], "/backlog/T-0042-demo.md")]
+    assert harness["calls"]["compact"] == []
+
+
+def test_arm_gate_defers_while_the_human_is_typing(harness):
+    """ARM itself must not fire the handoff prompt over a half-typed draft."""
+    rec = _rec()
+    harness["state"]["buf"] = "❯ давай сначала обсудим\n"
+    assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=1000.0) is False
+    assert harness["calls"]["ctx_handoff"] == []
+
+
+def test_stay_prompts_tell_the_truth_about_continuing():
+    """The stay prompt variants must promise continuation, not death — a
+    session told it is dying writes a will, not a checkpoint (the same
+    truthfulness rule the relaunch/end split already pins)."""
+    p = A.handoff_prompt("/art/operator-state.md", "operator", stay=True)
+    assert "COMPACTED IN PLACE" in p and "SAME session" in p
+    assert "FRESH incarnation" not in p and "ENDED" not in p
+    q = A.context_handoff_prompt("T-0042", relaunch=True, stay=True)
+    assert "COMPACTED IN PLACE" in q and "no relaunch" in q
+    assert "incarnation is ending" not in q
+    # and the non-stay variants are untouched
+    assert "FRESH incarnation" in A.handoff_prompt("/a.md", relaunch=True)
+    assert "ENDED" in A.handoff_prompt("/a.md", relaunch=False)
+
+
+def test_composer_free_is_the_typing_aware_gate():
+    assert A.composer_free("❯ \n") is True
+    assert A.composer_free("❯\n") is True
+    assert A.composer_free("❯ его недописанный текст\n") is False
+    assert A.composer_free("… esc to interrupt\n❯ \n") is False  # mid-generation
+    assert A.composer_free("") is False
+
+
+def test_finalize_never_relaunches_an_attached_pane(harness, monkeypatch):
+    """T-0930: «я не смогу ее найти когда вернусь» — a pre-stay armed record
+    (or the past-hard-cap stay fallback) must hold the clear+relaunch open
+    for as long as a human client is attached, however late it is."""
+    monkeypatch.setattr(A.recycle_gate, "is_attached",
+                        lambda target, **kw: True)
+    monkeypatch.setenv("BOT_SQUAD_RECYCLE_PROJECTS", "bot-squad")
+    rec = _rec(compact={"phase": "writing", "kind": "context", "armed_at": 1000.0,
+                        "task_id": "T-0042", "task_md": "/backlog/T-0042-demo.md",
+                        "arm_digest": "digest-at-arm"})
+    harness["state"]["ctx_digest"] = "digest-after-write"
+    late = 1000.0 + A.handoff_hard_timeout_sec() + 1
+    assert A.maybe_compact(None, "bot-squad", rec, "urgent", now=late) is False
+    assert harness["calls"]["suspend"] == []
+    assert harness["calls"]["spawn_ticket"] == []
+    assert rec["compact"]["phase"] == "writing"  # held open, not dropped

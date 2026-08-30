@@ -3755,10 +3755,14 @@ def _action_compact(params: dict[str, Any]) -> dict[str, Any]:
     target_rec = {"sid": sid, "role": role, "task_id": task_id}
     target = _autocompact._resolve_compact_target(cfg, slug, target_rec)
     now = time.time()
+    # T-0930: the manual `bsq compact` rides the same compact-in-place default
+    # as the automatic ceiling trigger — the stakeholder's 2026-08-29 «то, что
+    # я выше написал, распространяется и на наш компакт тоже».
+    stay = _autocompact.ceiling_stay_enabled()
 
     if target["kind"] == "context":
         tid, task_md = target["task_id"], target["task_md"]
-        _autocompact._inject_context_handoff(sid, tid, relaunch=True)
+        _autocompact._inject_context_handoff(sid, tid, relaunch=True, stay=stay)
         rec["compact"] = {
             "phase": "writing",
             "kind": "context",
@@ -3768,13 +3772,14 @@ def _action_compact(params: dict[str, Any]) -> dict[str, Any]:
             "arm_digest": _autocompact.context_digest(task_md),
             "role": target["role"],
             "assignment_id": tid,
+            "stay": stay,
         }
         _telemetry._write_json(rec_path, rec)
         return {"ok": True, "kind": "context", "sid": sid, "task_id": tid}
 
     if target["kind"] == "artifact":
         artifact_path, target_role = target["artifact_path"], target["role"]
-        _autocompact._inject_handoff(sid, artifact_path, target_role)
+        _autocompact._inject_handoff(sid, artifact_path, target_role, stay=stay)
         rec["compact"] = {
             "phase": "writing",
             "kind": "artifact",
@@ -3783,6 +3788,7 @@ def _action_compact(params: dict[str, Any]) -> dict[str, Any]:
             "artifact_path": artifact_path,
             "role": target_role,
             "assignment_id": target["assignment_id"],
+            "stay": stay,
         }
         _telemetry._write_json(rec_path, rec)
         return {"ok": True, "kind": "artifact", "sid": sid,

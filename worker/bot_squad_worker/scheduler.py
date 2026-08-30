@@ -31,6 +31,7 @@ from bot_squad_worker.jobs import (
     graceful_exit_tick,
     heartbeat,
     idle_timeout_tick,
+    wait_resume_tick,
     input_flush_tick,
     oauth_refresh,
     outbound_drain_tick,
@@ -230,6 +231,24 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="graceful_exit",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # wait_resume_tick: T-0930 — auto-resume a suspended WAITING session
+    # (blocked_on_user, T-0931) the moment its condition clears. Third
+    # sibling of idle_timeout/graceful_exit's 60s jobs: idle_timeout RECYCLES
+    # (record+exit when unfinished), graceful_exit EXITS (when done),
+    # wait_resume RESUMES (the one place the worker autonomously resurrects a
+    # session). No-op under BOT_SQUAD_WAIT_RESUME=0. max_instances=1 +
+    # coalesce; idempotent (a session no longer carrying wait_reason is
+    # simply skipped next pass).
+    sched.add_job(
+        wait_resume_tick,
+        "interval",
+        seconds=60,
+        args=[cfg],
+        id="wait_resume",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

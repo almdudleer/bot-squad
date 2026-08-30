@@ -50,6 +50,26 @@ def test_window_default_and_override(monkeypatch):
     assert IT.idle_timeout_sec() == 3300
 
 
+# --- T-0930: the operator nudge cadence is DECOUPLED from idle_timeout_sec --
+
+def test_operator_nudge_default_and_override(monkeypatch):
+    monkeypatch.delenv("BOT_SQUAD_OPERATOR_NUDGE_SEC", raising=False)
+    assert IT.operator_nudge_sec() == IT.DEFAULT_OPERATOR_NUDGE_SEC == 2400
+    monkeypatch.setenv("BOT_SQUAD_OPERATOR_NUDGE_SEC", "60")
+    assert IT.operator_nudge_sec() == 60
+    # garbage / non-positive falls back to the default (never collapse to 0)
+    monkeypatch.setenv("BOT_SQUAD_OPERATOR_NUDGE_SEC", "-5")
+    assert IT.operator_nudge_sec() == 2400
+    monkeypatch.setenv("BOT_SQUAD_OPERATOR_NUDGE_SEC", "nope")
+    assert IT.operator_nudge_sec() == 2400
+
+
+def test_operator_nudge_default_is_shorter_than_the_recycle_window():
+    # The whole point of decoupling: 40min < 55min, so a drive=on operator
+    # gets nudged well before its cache window would otherwise expire.
+    assert IT.DEFAULT_OPERATOR_NUDGE_SEC < IT.DEFAULT_IDLE_TIMEOUT_SEC
+
+
 # --- T-0856: the window must fire INSIDE the prompt-cache TTL ---------------
 
 def test_window_fires_before_the_cache_ttl(monkeypatch, tmp_config_dir):
@@ -146,7 +166,7 @@ def test_postpone_active():
 # --- cfg + session-md harness (mirrors test_compact_handoff) ----------------
 
 def _make_cfg(tmp_path: Path, *, sid: str, window: str, task_id: str | None,
-              extra_md: dict | None = None):
+              extra_md: dict | None = None, task_status: str = "closed"):
     cfg_dir = tmp_path / "config"
     cfg_dir.mkdir()
     repo = tmp_path / "repo"
@@ -180,7 +200,7 @@ def _make_cfg(tmp_path: Path, *, sid: str, window: str, task_id: str | None,
         backlog = data_dir / "bot-squad" / "backlog"
         backlog.mkdir(parents=True, exist_ok=True)
         (backlog / f"{task_id}-demo.md").write_text(
-            f"---\nid: {task_id}\ntitle: Demo\nstatus: open\n---\n\n"
+            f"---\nid: {task_id}\ntitle: Demo\nstatus: {task_status}\n---\n\n"
             "## Stakeholder notes\n\nDo the thing.\n\n"
             "## Context\n\nstate as of arm time\n")
     if extra_md:
@@ -1258,6 +1278,19 @@ def test_drive_on_operator_default_when_field_absent(tmp_path, keepalive_seams):
     assert keepalive_seams["calls"]["terminate"] == []
 
 
+def test_drive_on_operator_nudged_at_40min_before_the_55min_recycle_window(
+        tmp_path, keepalive_seams):
+    """T-0930: the nudge must fire on its OWN 40min cadence, not wait for the
+    55min recycle window — the entire point of decoupling it."""
+    sid = "S-almdudleer-bot-squad-operator-p1"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None)
+    keepalive_seams["state"]["idle_age"] = 2500.0  # > 2400 (40min), < 3300 (55min)
+    row = _operator_row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert len(keepalive_seams["calls"]["keepalive"]) == 1
+
+
 def test_drive_on_operator_not_due_when_jsonl_fresh(tmp_path, keepalive_seams):
     sid = "S-almdudleer-bot-squad-operator-p1"
     cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None)
@@ -1351,6 +1384,185 @@ def test_keepalive_nudge_text_with_target_steers_to_maintenance(monkeypatch):
     assert "20%" in text
     assert "maintenance" in text.lower()
     assert "NOT" in text  # "NOT by itself a reason to set drive=off"
+
+
+# --- T-0930: dev drive-unmet nudge (5min, independent of the operator's) ---
+
+@pytest.fixture
+def dev_nudge_seams(seams, monkeypatch):
+    """Extend `seams` with a spy on the dev nudge send."""
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(IT, "_send_dev_nudge",
+                        lambda sid, text: calls.append((sid, text)))
+    seams["calls"]["dev_nudge"] = calls
+    return seams
+
+
+def test_dev_with_open_task_gets_nudged_not_recycled(tmp_path, dev_nudge_seams):
+    """The stakeholder's core dev ask: an idle dev whose task is not yet
+    totest/closed is nudged ('продолжай'), never terminated/compacted."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="open")
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert len(dev_nudge_seams["calls"]["dev_nudge"]) == 1
+    assert dev_nudge_seams["calls"]["dev_nudge"][0][0] == sid
+    assert dev_nudge_seams["calls"]["terminate"] == []
+    assert dev_nudge_seams["calls"]["ctx_handoff"] == []
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert "dev_nudge_last_at" in meta
+    assert meta["status"] == "active"  # never suspended
+
+
+def test_dev_with_in_progress_task_gets_nudged_too(tmp_path, dev_nudge_seams):
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="in_progress")
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert len(dev_nudge_seams["calls"]["dev_nudge"]) == 1
+
+
+def test_dev_with_totest_task_falls_through_to_normal_recycle(tmp_path, dev_nudge_seams):
+    """DONE — not drive-unmet, so it must NOT be nudged (falls through to the
+    same terminate-and-remember mechanism the pre-T-0930 tests exercise)."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="totest")
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert dev_nudge_seams["calls"]["dev_nudge"] == []
+    assert _fired(dev_nudge_seams)  # the normal terminate/ctx-handoff path fired instead
+
+
+def test_dev_with_blocked_on_user_task_falls_through_not_nudged(tmp_path, dev_nudge_seams):
+    """WAITING — the literal failure T-0931's blocked_on_user exists to stop:
+    a blocked dev must NOT be nudged 'продолжай'. (It still falls through to
+    the generic terminate path here — T-0930's dedicated WAITING durable
+    wait-state is separate, not-yet-built follow-on work; the DoD for THIS
+    piece is only that it is never nudged.)"""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="blocked_on_user")
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(), user_home="/home/x")
+    assert dev_nudge_seams["calls"]["dev_nudge"] == []
+
+
+def test_dev_with_no_task_id_never_nudged(tmp_path, dev_nudge_seams):
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id=None)
+    row = _row(sid, cwd_repo=data.parent / "repo", task_id=None)
+    IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(), user_home="/home/x")
+    assert dev_nudge_seams["calls"]["dev_nudge"] == []
+
+
+def test_dev_nudged_at_5min_before_the_55min_recycle_window(tmp_path, dev_nudge_seams):
+    """T-0930: the whole point of decoupling — 5min, not 55min."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="open")
+    dev_nudge_seams["state"]["idle_age"] = 310.0  # > 300 (5min), << 3300 (55min)
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert len(dev_nudge_seams["calls"]["dev_nudge"]) == 1
+
+
+def test_dev_nudge_not_due_when_jsonl_fresh(tmp_path, dev_nudge_seams):
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="open")
+    dev_nudge_seams["state"]["idle_age"] = 10.0
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert dev_nudge_seams["calls"]["dev_nudge"] == []
+
+
+def test_dev_nudge_anti_loop_blocks_within_same_cadence_window(tmp_path, dev_nudge_seams):
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    just_sent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="open",
+                          extra_md={"dev_nudge_last_at": just_sent})
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert dev_nudge_seams["calls"]["dev_nudge"] == []
+
+
+def test_dev_nudge_rearms_after_cadence_window_elapses(tmp_path, dev_nudge_seams):
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    long_ago = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                             time.gmtime(time.time() - IT.dev_nudge_sec() - 10))
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="open",
+                          extra_md={"dev_nudge_last_at": long_ago})
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert len(dev_nudge_seams["calls"]["dev_nudge"]) == 1
+
+
+def test_dev_nudge_tracked_job_skips_nudge(tmp_path, dev_nudge_seams):
+    """'если он не ждет build' — the SAME tracked-job auto-postpone the
+    terminate path already uses."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="open")
+    _enqueue_deploy(data, sid, phase="processing")
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert dev_nudge_seams["calls"]["dev_nudge"] == []
+
+
+def test_dev_nudge_postpone_active_skips_nudge(tmp_path, dev_nudge_seams):
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 1800))
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="open",
+                          extra_md={"idle_postpone_until": future})
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert dev_nudge_seams["calls"]["dev_nudge"] == []
+
+
+def test_dev_nudge_waits_for_composer_ready(tmp_path, dev_nudge_seams):
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="open")
+    dev_nudge_seams["state"]["buf"] = "working… esc to interrupt\n"  # mid-turn
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert dev_nudge_seams["calls"]["dev_nudge"] == []
+
+
+def test_dev_drive_unmet_helper(tmp_path, seams):
+    cfg, data = _make_cfg(tmp_path, sid="S-almdudleer-bot-squad-demo-p5",
+                          window="demo", task_id="T-0042", task_status="open")
+    assert IT.dev_drive_unmet(cfg, "bot-squad", "T-0042") is True
+    assert IT.dev_drive_unmet(cfg, "bot-squad", None) is False
+    assert IT.dev_drive_unmet(cfg, "bot-squad", "") is False
+    assert IT.dev_drive_unmet(cfg, "bot-squad", "T-9999-missing") is False
+
+
+def test_dev_drive_unmet_false_for_done_and_waiting(tmp_path):
+    for status, expected in (("totest", False), ("closed", False),
+                             ("blocked_on_user", False), ("open", True),
+                             ("in_progress", True), ("paused", True)):
+        tp = tmp_path / status
+        tp.mkdir()
+        cfg, data = _make_cfg(tp, sid="S-almdudleer-bot-squad-demo-p5",
+                              window="demo", task_id="T-0042", task_status=status)
+        assert IT.dev_drive_unmet(cfg, "bot-squad", "T-0042") is expected, status
 
 
 # --- T-0655: drive=off is the ONLY thing that permits an operator to recycle -

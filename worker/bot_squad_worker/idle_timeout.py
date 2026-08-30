@@ -155,7 +155,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from bot_squad_worker import autocompact, lifecycle_events, recycle_gate, sessions
+from bot_squad_worker import autocompact, lifecycle_events, recovery, recycle_gate, sessions
 
 log = logging.getLogger(__name__)
 
@@ -283,6 +283,60 @@ def idle_timeout_sec() -> int:
         except (TypeError, ValueError):
             pass
     return DEFAULT_IDLE_TIMEOUT_SEC
+
+
+# T-0930: the stakeholder's own cadence split — "дев, если остановился ...
+# спустя 5 минут ... nudge (если он не ждет build) ... Оператор -- спустя уже
+# 40 минут, т.к. оператор может ждать девов и долго." The keep-alive nudge
+# used to fire on the SAME 3300s window as the terminate-and-remember trigger
+# (a session too close to the cache TTL to be worth nudging sooner anyway,
+# back when nudging was the ONLY alternative to recycling); now that a
+# drive-unmet nudge is its own concept independent of the cache clock, it gets
+# its own, shorter, independently-tunable cadence. 2400s = 40 min.
+DEFAULT_OPERATOR_NUDGE_SEC = 2400
+
+
+def operator_nudge_sec() -> int:
+    """The drive=on-operator keep-alive nudge cadence (40 min by default) —
+    DECOUPLED from :func:`idle_timeout_sec`'s cache-window recycle trigger
+    (T-0930). Overridable via ``BOT_SQUAD_OPERATOR_NUDGE_SEC``; non-positive/
+    garbage falls back to the default, same failure posture as
+    :func:`idle_timeout_sec`. No cache-TTL cross-check here — unlike the
+    recycle window, an operator nudge re-firing after the TTL is not a
+    cache-miss hazard, just a later "continue"."""
+    raw = os.environ.get("BOT_SQUAD_OPERATOR_NUDGE_SEC")
+    if raw:
+        try:
+            v = int(raw)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_OPERATOR_NUDGE_SEC
+
+
+# T-0930: "дев, если остановился, а его задача не выполнена по статусу, то уже
+# спустя 5 минут он должен получать nudge (если он не ждет build или что-то
+# еще может его разбудить)". Much shorter than the operator's 40min — a dev
+# "может ждать девов и долго" is the OPERATOR's excuse for patience, not the
+# dev's.
+DEFAULT_DEV_NUDGE_SEC = 300
+
+
+def dev_nudge_sec() -> int:
+    """The drive=unmet dev nudge cadence (5 min by default), independent of
+    both :func:`idle_timeout_sec` and :func:`operator_nudge_sec` (T-0930).
+    Overridable via ``BOT_SQUAD_DEV_NUDGE_SEC``; same non-positive/garbage
+    fallback posture as its siblings."""
+    raw = os.environ.get("BOT_SQUAD_DEV_NUDGE_SEC")
+    if raw:
+        try:
+            v = int(raw)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_DEV_NUDGE_SEC
 
 
 def _now_iso() -> str:
@@ -504,6 +558,18 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
     # converges rather than leaving the session armed forever.
     if meta.get("idle_recycle_phase") in ("finalizing", "compacting"):
         return _finalize_compact(cfg, slug, sid, meta, md_path, now, pane, role=role)
+
+    # T-0930: a dev whose bound task is neither done nor blocked_on_user is a
+    # DRIVE-CONDITION-UNMET session — same posture as the drive=on operator
+    # above (no exit while the condition holds), but on its own 5min cadence.
+    # A dev in DONE state is normally already gone via graceful_exit's faster
+    # tick by the time this runs; a dev in blocked_on_user (WAITING) is
+    # deliberately excluded here — that is what lets it fall through to the
+    # terminate-and-remember path below instead of being nudged forever.
+    if role == "dev":
+        task_id = row.get("task_id") or meta.get("task_id")
+        if dev_drive_unmet(cfg, slug, task_id):
+            return _maybe_dev_nudge(cfg, slug, sid, row, meta, md_path, now, pane, user_home)
 
     # Otherwise decide whether to START a recycle this tick.
     idle_age = _idle_age(row, meta, user_home, now)
@@ -878,16 +944,19 @@ def _send_keepalive_nudge(sid: str, text: str) -> None:
 def _maybe_keepalive_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
                            md_path, now: float, pane: str | None,
                            user_home: str) -> bool:
-    """T-0655: the drive=on-operator counterpart to :func:`_maybe_compact_and_stay`
-    — same idle-window trigger, postpone/tracked-job gates, and composer-ready
-    gate, but instead of ``/compact`` it injects a plain-text keep-alive nudge
-    and NEVER terminates. ``operator_keepalive_last_at`` bounds it to at most
-    once per cache window (:func:`keepalive_due`)."""
+    """T-0655/T-0930: the drive=on-operator counterpart to
+    :func:`_maybe_compact_and_stay` — shares the postpone/tracked-job gates
+    and composer-ready gate, but fires on its OWN :func:`operator_nudge_sec`
+    cadence (40 min default), decoupled from :func:`idle_timeout_sec`'s
+    cache-window recycle trigger, and instead of ``/compact`` it injects a
+    plain-text keep-alive nudge and NEVER terminates.
+    ``operator_keepalive_last_at`` bounds it to at most once per nudge cadence
+    (:func:`keepalive_due`)."""
     idle_age = _idle_age(row, meta, user_home, now)
-    if not idle_due(idle_age, idle_timeout_sec()):
+    if not idle_due(idle_age, operator_nudge_sec()):
         return False
-    if not keepalive_due(meta.get("operator_keepalive_last_at"), now, idle_timeout_sec()):
-        return False  # already nudged once this cache window
+    if not keepalive_due(meta.get("operator_keepalive_last_at"), now, operator_nudge_sec()):
+        return False  # already nudged once this cadence window
     if postpone_active(meta.get("idle_postpone_until"), now):
         return False
     if tracking_long_job(cfg, slug, sid):
@@ -910,6 +979,83 @@ def _maybe_keepalive_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
                           now=now, reason="idle_window_keepalive")
     log.info("idle_timeout: sent keep-alive nudge to drive=on operator %s — "
              "session stays, no recycle", sid)
+    return True
+
+
+# --- T-0930: dev drive-unmet nudge (5min, decoupled from the 55min window) --
+
+def dev_drive_unmet(cfg: Any, slug: str, task_id: str | None) -> bool:
+    """True when a dev's bound task is neither DONE nor WAITING — the
+    "стоит, а задача не выполнена" condition the 5min nudge exists for.
+
+    No task bound at all (``task_id`` empty/None) is NOT drive-unmet here —
+    there is nothing for a "продолжай" nudge to point at, and a task-less dev
+    is not a shape this system expects to persist (falls through to the
+    normal recycle path instead). Reads :func:`recovery.read_task_status` —
+    the same reader :mod:`graceful_exit` already uses — and
+    ``recovery.DONE_STATUSES``/``recovery.WAITING_STATUSES`` rather than a
+    third local copy of either set.
+    """
+    if not task_id:
+        return False
+    status = recovery.read_task_status(cfg, slug, task_id)
+    if not status:
+        return False
+    return status not in recovery.DONE_STATUSES and status not in recovery.WAITING_STATUSES
+
+
+def _dev_nudge_text() -> str:
+    return ("continue — продолжай. Your bound task is not yet in totest/"
+            "closed and your ~1h cache window is idling toward expiry; the "
+            "system is nudging you instead of recycling you while the task "
+            "remains open. If you are genuinely blocked on the stakeholder, "
+            "set the task to blocked_on_user instead of sitting idle "
+            "(`bsq ticket update <id> blocked_on_user`) — that stops this "
+            "nudge and lets the system handle the wait properly.")
+
+
+def _send_dev_nudge(sid: str, text: str) -> None:
+    from bot_squad_worker.actions import _action_inject_input
+    _action_inject_input({"sid": sid, "text": text})
+
+
+def _maybe_dev_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
+                     md_path, now: float, pane: str | None,
+                     user_home: str) -> bool:
+    """T-0930: the dev counterpart to :func:`_maybe_keepalive_nudge` — same
+    shape (postpone/tracked-job/composer-ready gates, once-per-cadence
+    anti-loop guard) but on its own :func:`dev_nudge_sec` cadence (5 min
+    default) and never terminates. ``dev_nudge_last_at`` bounds it to at most
+    once per cadence window, mirroring :func:`keepalive_due`."""
+    idle_age = _idle_age(row, meta, user_home, now)
+    if not idle_due(idle_age, dev_nudge_sec()):
+        return False
+    if not keepalive_due(meta.get("dev_nudge_last_at"), now, dev_nudge_sec()):
+        return False  # already nudged once this cadence window
+    if postpone_active(meta.get("idle_postpone_until"), now):
+        return False
+    if tracking_long_job(cfg, slug, sid):
+        # "если он не ждет build или что-то еще может его разбудить" — the
+        # SAME tracked-job auto-postpone the terminate path already uses.
+        log.info("idle_timeout: dev nudge auto-postpone %s — waiting on a "
+                 "tracked long job", sid)
+        return False
+    if not pane or not autocompact.composer_free(
+            autocompact._capture_pane(pane), sid=sid, now=now):
+        return False
+
+    try:
+        _send_dev_nudge(sid, _dev_nudge_text())
+    except Exception:
+        log.exception("idle_timeout: dev nudge send failed for %s "
+                      "(will retry)", sid)
+        return False
+    meta["dev_nudge_last_at"] = _now_iso()
+    sessions._write_session_metadata(md_path, meta, atomic=True)
+    lifecycle_events.emit(cfg, slug, sid, lifecycle_events.SESSION_TIMEOUT,
+                          now=now, reason="idle_window_dev_nudge")
+    log.info("idle_timeout: sent drive-unmet nudge to dev %s — session "
+             "stays, no recycle", sid)
     return True
 
 

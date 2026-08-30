@@ -157,11 +157,12 @@ and the `bsq task digest` paste. Not to peer sends between sessions.
    not merely that the request is code-shaped:
 
    - **Too many concurrent USER requests to record/clarify/implement without
-     dropping one** — that is when a second dedicated user-conversation-style
-     attendant would earn its keep (currently theoretical: one live attendant
-     is bound per (project, user) by design, so in practice this means
-     working the queue in order, not silently dropping the older ask — flag
-     it to the stakeholder rather than inventing a second session ad hoc).
+     dropping one** — this is the L0→L1 rung of gradual budding (T-0932):
+     **`bsq bud dev`** hands the task you are holding to a dev bud (full
+     ticket handover) and narrows YOU back to pure conversation, so the
+     queue gets recorded and driven in parallel instead of behind your
+     build. A second attendant is still not the answer (one live attendant
+     per (project, user) by design) — budding the WORK off is.
    - **Too many concurrent pieces of DEV work that need to keep running while
      you keep attending the user thread, or that need real orchestration
      across several dev sessions** — that is what `bsq route` (T-0855) still
@@ -189,6 +190,54 @@ and the `bsq task digest` paste. Not to peer sends between sessions.
    Don't re-derive it from how busy you feel. But getting there in the first
    place, for an ordinary single request, is itself the wrong default: check
    the "do it yourself" gate above BEFORE running `bsq route` at all.
+
+## Gradual budding — you differentiate under load (T-0932, stakeholder 2026-08-30)
+
+> «когда у нас одна сессия на всё, потом она может отпочковать дева а сама
+> дифференцироваться чисто в юзер-сессию, если сильно много параллельных
+> запросов от юзера, и может отпочковать оператора если сильно много отдельных
+> девов и их оркестрации»
+
+The topology is not a fixed org chart. It is a ladder YOU climb under load and
+slide back down when the load drops, and you are the session at the bottom of
+it — the one that owns the conversation and differentiates:
+
+| rung | shape | you |
+|---|---|---|
+| **L0 solo** | you talk to the user AND hold the task | the default; see the "do the work yourself" gate above |
+| **L1 work split** | a dev bud holds the task | you are pure conversation again |
+| **L2 orchestration split** | an operator runs the devs | you stay user-facing and talk to the OPERATOR, not the devs |
+
+**`bsq bud`** (no subcommand) reads the ladder: which rung, which pressure is
+building, and the exact verb for the move it suggests. Then:
+
+- **`bsq bud dev [<T-id>]`** — L0→L1. Sheds your binding and spawns a dev on
+  that task (the same full handover `bsq spawn` performs), so you narrow back
+  to the conversation. Run it when the user is queueing requests behind the
+  thing you are building. The shed comes first because a spawn refuses a task
+  a live session still owns — and until the shed, that session is you; if the
+  spawn then fails the task is re-bound to you automatically.
+- **`bsq bud operator`** — L1→L2. Spawns the operator that will steer the devs
+  («выделение оператора»). Same spawn the 60s re-drive performs, under the same
+  one-operator-per-project guard, so doing it by hand can never produce two.
+- **`bsq bud absorb [<T-id>]`** — deflation, L1→L0. Nothing running and one
+  lone piece of queued work: take it yourself rather than pay for a second
+  process.
+
+Three things this does NOT do, on purpose:
+
+1. **It never fires on its own.** The worker computes the verdict and SUGGESTS
+   it into your pane (at most once per cooldown, never while a human is
+   watching or typing) — parallelism is decided by the sessions themselves
+   (T-0929). Ignoring a suggestion is a legitimate answer.
+2. **It does not grow a second set of thresholds.** The operator rung's trigger
+   IS `bsq route`'s verdict (`dispatch.decide_topology`), so you and the
+   scheduler can never disagree about which rung the project is on.
+3. **It never suggests killing anything.** Buds die by themselves — a dev bud
+   when its task goes terminal, an operator when its backlog empties (T-0465).
+   You never exit: shedding the task on `bud dev` is exactly what keeps that
+   true, because a session still holding a task inherits that task's
+   done-signal. The ladder de-escalates by attrition, not by a peer's decision.
 
 ## Why the operator hop is now conditional (T-0855, stakeholder 2026-08-11)
 

@@ -3060,6 +3060,187 @@ def cmd_route(args) -> None:
     print(f"  → {res.get('reason')}")
 
 
+# --------------------------------------------------------------------------
+# T-0932: GRADUAL BUDDING — the write side of the same scaling ladder `route`
+# reads. «когда у нас одна сессия на всё, потом она может отпочковать дева а
+# сама дифференцироваться чисто в юзер-сессию ... и может отпочковать оператора
+# если сильно много отдельных девов и их оркестрации.»
+#
+# `bsq bud` (no subcommand) is the READ — which rung the project is on and
+# whether this session should move. The subcommands are the deliberate moves;
+# nothing here ever fires on its own (T-0929: parallelism is decided by the
+# sessions themselves), the worker only ever SUGGESTS.
+# --------------------------------------------------------------------------
+
+def _bud_decision(slug: str, sid: str | None = None) -> dict:
+    params = {"slug": slug}
+    if sid:
+        params["sid"] = sid
+    return post("budding_decision", params)
+
+
+def cmd_bud_status(args) -> None:
+    slug = resolve_slug()
+    res = _bud_decision(slug, my_sid())
+    if getattr(args, "json", False):
+        print(json.dumps(res, indent=2, sort_keys=True))
+        return
+    obs = res.get("observation") or {}
+    c = obs.get("counts") or {}
+    t = obs.get("thresholds") or {}
+    print(f"budding ladder for {slug}:")
+    print(f"  level             : {res.get('level')}")
+    print(f"  bud devs          : {c.get('bud_devs')}"
+          + (f"   {', '.join(obs.get('bud_dev_sids') or [])}"
+             if obs.get("bud_dev_sids") else ""))
+    print(f"  live operator     : {(obs.get('operator_sids') or ['(none)'])[0]}")
+    print(f"  root session(s)   : {', '.join(obs.get('root_sids') or []) or '(none)'}")
+    print(f"  queued requests   : {c.get('queued_requests')}  "
+          f"(bud a dev at >= {t.get('request_pressure')} while you hold a task)"
+          + (f"   {', '.join(obs.get('queued_requests') or [])}"
+             if obs.get("queued_requests") else ""))
+    print(f"  you hold          : {', '.join(obs.get('held_task_ids') or []) or '(nothing)'}")
+    print(f"  verdict           : {res.get('verdict')}")
+    print(f"  → {res.get('reason')}")
+    if res.get("command"):
+        print(f"\n  run: {res['command']}")
+
+
+def _bud_morph(slug: str, sid: str, role: str, task_id: str | None = None) -> dict:
+    """morph_session with this pane's identity seeded (an unregistered,
+    hand-launched session has no md until the worker upserts one)."""
+    params = {"slug": slug, "sid": sid, "role": role}
+    if task_id:
+        params["task_id"] = task_id
+    win, cwd = _my_pane_fields()
+    if win:
+        params["window"] = win
+    if cwd:
+        params["cwd"] = cwd
+    return post("morph_session", params)
+
+
+def cmd_bud_dev(args) -> None:
+    """L0 -> L1: hand the task you are holding to a DEV bud, then narrow back
+    to the conversation.
+
+    ORDER MATTERS, and not in the direction that reads safest. The shed runs
+    FIRST, because `sessions.spawn` claims the task under `.task-claim.lock`
+    and REFUSES a task a live session already owns — and while you still hold
+    it, that live session is YOU: spawn-then-shed cannot bud at all, it dies on
+    `already bound to live session <you>`.
+
+    So this is a compensating transaction, not a two-step: shed, spawn, and on
+    ANY spawn failure re-bind the task to yourself before the error propagates,
+    so a failed bud never leaves work with no owner.
+    """
+    slug = resolve_slug()
+    sid = require_sid(getattr(args, "sid", None))
+
+    task = args.task
+    if not task:
+        res = _bud_decision(slug, sid)
+        held = ((res.get("observation") or {}).get("held_task_ids") or [])
+        if len(held) != 1:
+            die(f"bud dev: name the task to hand over — this session holds "
+                f"{', '.join(held) or 'nothing'}")
+        task = held[0]
+
+    # The role to restore if the spawn fails. Derived, not assumed: a session
+    # that morphed to `teamlead` and took a ticket must not come back as `dev`.
+    prev_role = "dev"
+    try:
+        for row in post("list_sessions", {"slug": slug}).get("sessions", []):
+            if row.get("sid") == sid and row.get("role"):
+                prev_role = row["role"]
+                break
+    except WorkerError:
+        pass
+
+    print(f"budding off a dev for {task} …")
+    _bud_morph(slug, sid, "user-conversation")
+
+    spawn_args = argparse.Namespace(
+        ticket=task, slug=slug, bundle=None, window=args.window,
+        initiative=None, owner="budding", role="dev",
+        prompt=None, prompt_file=None, fresh=args.fresh, resume_sid=None,
+        dry_run=False,
+        # `cmd_spawn` reads these unguarded — same contract as cluster-launch.
+        model=getattr(args, "model", None), why=getattr(args, "why", None),
+        provider=None, effort=None,
+    )
+    try:
+        cmd_spawn(spawn_args)
+    except BaseException:
+        # Roll the shed back. `die()` raises SystemExit, so this catches the
+        # ordinary failure path too — a bare `except Exception` would let the
+        # commonest failure strand the task with no owner.
+        try:
+            _bud_morph(slug, sid, prev_role, task)
+            print(f"\nbud FAILED — {task} is bound back to you (role="
+                  f"{prev_role}); nothing was handed over.", file=sys.stderr)
+        except WorkerError as exc:
+            print(f"\nbud FAILED and the re-bind of {task} ALSO failed ({exc}) "
+                  f"— run `bsq morph --role {prev_role} --task {task}` yourself, "
+                  f"or check who claimed it with `bsq ticket status {task}`.",
+                  file=sys.stderr)
+        raise
+
+    print(f"\nyou are now role=user-conversation (task shed — the bud owns "
+          f"{task} and exits when it closes; you never exit).")
+    print("Go back to the user: record requests, dispatch, review. "
+          "`bsq bud` to re-read the ladder.")
+
+
+def cmd_bud_operator(args) -> None:
+    """L1 -> L2: bud an OPERATOR off to run the devs; you stay user-facing.
+
+    «выделение оператора (превращение себя в юзер-сессию оператора)» — after
+    this you talk to the operator, not to the devs. Same spawn the 60s
+    re-drive performs, under the same one-operator-per-project guard.
+    """
+    slug = resolve_slug()
+    sid = my_sid()
+    res = post("bud_operator", {"slug": slug, **({"sid": sid} if sid else {})})
+    if not res.get("spawned"):
+        print(f"no operator budded — {res.get('reason')}")
+        return
+    print(f"✔ {res.get('reason')}")
+
+    # The parent narrows to the conversation only if it is still carrying a
+    # dev task; an operator bud does not take that task, so this is a no-op for
+    # a session that already sheds one (and a refusal if it does hold one —
+    # hand the task to a dev bud first, that is a different rung).
+    dec = _bud_decision(slug, sid) if sid else {}
+    held = ((dec.get("observation") or {}).get("held_task_ids") or [])
+    if held:
+        print(f"note: you still hold {', '.join(held)} — an operator bud does "
+              f"not take it. `bsq bud dev {held[0]}` if you want that off your "
+              f"hands too.")
+
+
+def cmd_bud_absorb(args) -> None:
+    """L1 -> L0 deflation: take the last queued task yourself instead of
+    paying for a second process. The ladder sliding back down."""
+    slug = resolve_slug()
+    sid = require_sid(getattr(args, "sid", None))
+    task = args.task
+    if not task:
+        res = _bud_decision(slug, sid)
+        queued = ((res.get("observation") or {}).get("queued_requests") or [])
+        if len(queued) != 1:
+            die(f"bud absorb: name the task to take — {len(queued)} queued "
+                f"request(s) ({', '.join(queued) or 'none'})")
+        task = queued[0]
+    # Resolve it against THIS board before binding (T-0892), so an absorb can
+    # never bind a same-numbered ticket from another project.
+    _slug, tid, _path = resolve_ticket_ref(task, slug, verb="bud absorb")
+    res = _bud_morph(slug, sid, "dev", tid)
+    print(f"absorbed {tid}: you are now role={res.get('role')} holding it. "
+          f"Read the ticket and build — `bsq bud dev {tid}` hands it off again "
+          f"if the user starts queueing requests.")
+
+
 def _pickup_scope_lines(ds: dict) -> list:
     """The drive-scope header of the `bsq pickup` table (T-0829).
 
@@ -3317,13 +3498,19 @@ _MORPH_ROLE_ALIASES = {
     "dev": "dev",
     "tl": "teamlead", "teamlead": "teamlead", "team-lead": "teamlead",
     "op": "operator", "operator": "operator",
+    # T-0932: the DE-differentiation direction — narrow back down to the
+    # conversation after handing your work to a bud («отделение себя в
+    # юзер-сессию»). Sheds the task binding worker-side.
+    "uc": "user-conversation", "user": "user-conversation",
+    "user-conversation": "user-conversation",
+    "user_conversation": "user-conversation",
 }
 
 
 def _normalize_morph_role(raw: str) -> str:
     role = _MORPH_ROLE_ALIASES.get((raw or "").strip().lower())
     if role is None:
-        die(f"--role must be one of dev|tl|operator (got {raw!r})")
+        die(f"--role must be one of dev|tl|operator|uc (got {raw!r})")
     return role
 
 
@@ -7235,9 +7422,10 @@ def build_parser() -> argparse.ArgumentParser:
     mo = sub.add_parser(
         "morph",
         help="morph THIS user session's role in place: --role dev (take a "
-             "task) | tl (spawn teammates) | operator (iff none running)")
+             "task) | tl (spawn teammates) | operator (iff none running) | "
+             "uc (narrow back to the conversation, shedding the task)")
     mo.add_argument("--role", required=True,
-                    help="target role: dev | tl | operator")
+                    help="target role: dev | tl | operator | uc")
     mo.add_argument("--task", help="task id to take on (for --role dev)")
     mo.add_argument("--initiative", help="initiative to bind (for --role tl/dev)")
     mo.add_argument("--sid", help="session SID (default: derived from tmux)")
@@ -7307,6 +7495,43 @@ def build_parser() -> argparse.ArgumentParser:
     rt.add_argument("--json", action="store_true",
                     help="print the raw decision (counts, thresholds, signals)")
     rt.set_defaults(func=cmd_route)
+
+    # bud (T-0932) — the WRITE side of the same ladder `route` reads: gradual
+    # budding. No subcommand = the read (which rung, and whether to move).
+    bd = sub.add_parser(
+        "bud",
+        help="gradual budding: which rung of the energy ladder you are on, and "
+             "bud off a dev / an operator (T-0932)")
+    bd.add_argument("--json", action="store_true",
+                    help="print the raw decision (level, counts, thresholds)")
+    bd.set_defaults(func=cmd_bud_status)
+    bd_sub = bd.add_subparsers(dest="bud_cmd")
+    bdd = bd_sub.add_parser(
+        "dev",
+        help="hand the task you hold to a DEV bud, then narrow back to the "
+             "conversation (L0 -> L1)")
+    bdd.add_argument("task", nargs="?",
+                     help="task to hand over (default: the one you hold)")
+    bdd.add_argument("--window", help="tmux window name for the bud")
+    bdd.add_argument("--model", help="model override for the bud (T-0909 rules apply)")
+    bdd.add_argument("--why", metavar="REASON",
+                     help="why the bud needs a premium model (T-0909)")
+    bdd.add_argument("--fresh", action="store_true",
+                     help="skip the expert scan — force a fresh bud")
+    bdd.add_argument("--sid", help="session SID (default: derived from tmux)")
+    bdd.set_defaults(func=cmd_bud_dev)
+    bdo = bd_sub.add_parser(
+        "operator",
+        help="bud an OPERATOR off to run the devs; you stay user-facing (L1 -> L2)")
+    bdo.set_defaults(func=cmd_bud_operator)
+    bda = bd_sub.add_parser(
+        "absorb",
+        help="deflation: take the last queued task yourself instead of a "
+             "second process (L1 -> L0)")
+    bda.add_argument("task", nargs="?",
+                     help="task to take (default: the single queued one)")
+    bda.add_argument("--sid", help="session SID (default: derived from tmux)")
+    bda.set_defaults(func=cmd_bud_absorb)
 
     # pickup (T-0783a) — which tickets are takeable. `operator status` reports a
     # COUNT of pending work; this reports WHICH work, which is the question an

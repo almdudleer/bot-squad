@@ -26,6 +26,7 @@ from bot_squad_worker.jobs import (
     drive_stop_tick,
     task_lifecycle_tick,
     deploy_monitor_one,
+    budding_check_tick,
     drift_check_tick,
     graceful_exit_tick,
     heartbeat,
@@ -288,6 +289,24 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=120,
         args=[cfg],
         id="drift_check",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+
+    # budding_check_tick: T-0932 — the gradual-budding ladder. Suggests (never
+    # performs) a bud to a project's root session when the load has outgrown
+    # its rung. Deliberately the slowest pane-touching tick in the file: the
+    # ladder should move rarely, and a suggestion that fires often is one
+    # nobody reads. Gated by BOT_SQUAD_BUDDING (0 = disabled) and by a
+    # per-session cooldown. max_instances=1 so an inject that runs long never
+    # overlaps the next pass.
+    sched.add_job(
+        budding_check_tick,
+        "interval",
+        seconds=300,
+        args=[cfg],
+        id="budding_check",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

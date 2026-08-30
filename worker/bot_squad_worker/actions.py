@@ -4954,6 +4954,65 @@ def _action_topology_decision(params: dict[str, Any]) -> dict[str, Any]:
     return _dispatch.decide_topology(cfg, params["slug"])
 
 
+_BUDDING_DECISION_REQUIRED = {"slug"}
+_BUDDING_DECISION_ALLOWED = _BUDDING_DECISION_REQUIRED | {"sid"}
+
+
+def _action_budding_decision(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0932: which rung of the ENERGY LADDER is this project on, and should
+    the asking session bud right now?
+
+    The WRITE side of the same ladder ``topology_decision`` reads — and it
+    reads that verdict rather than re-deriving it, so the two can never
+    disagree about whether the operator tier is due. Required params: slug.
+    Optional: sid (defaults to the project's single root/user-conversation
+    session). Returns ``{ok, sid, level, verdict, task_id, command, reason,
+    observation}`` where verdict ∈ hold|bud_dev|bud_operator|absorb.
+
+    Advisory + pure read, like ``topology_decision`` / ``dispatch_decision``:
+    it spawns nothing and morphs nothing. Backs ``bsq bud`` (no subcommand).
+    """
+    extra = set(params) - _BUDDING_DECISION_ALLOWED
+    if extra:
+        raise ActionError(f"budding_decision got unexpected params: {sorted(extra)}")
+    missing = _BUDDING_DECISION_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"budding_decision missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import budding as _budding
+    return _budding.decide_budding(cfg, params["slug"], params.get("sid"))
+
+
+_BUD_OPERATOR_REQUIRED = {"slug"}
+_BUD_OPERATOR_ALLOWED = _BUD_OPERATOR_REQUIRED | {"sid"}
+
+
+def _action_bud_operator(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0932: bud an OPERATOR off, deliberately, at a session's request.
+
+    The L1->L2 rung's write. Wraps ``operator_redrive.bud_operator``, which is
+    the SAME spawn the 60s re-drive performs (same pickup brief, same model
+    carry-forward, same singleton + cooldown guards) — so a session doing this
+    by hand and the scheduler doing it on a tick cannot produce two operators.
+
+    Required params: slug. Optional: sid (who asked — journalled). Returns
+    {ok, spawned, operator, reason}; a no-op/deferred outcome reports itself in
+    ``reason`` instead of raising. ``tmux_only``, like ``spawn_session``.
+    """
+    extra = set(params) - _BUD_OPERATOR_ALLOWED
+    if extra:
+        raise ActionError(f"bud_operator got unexpected params: {sorted(extra)}")
+    missing = _BUD_OPERATOR_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"bud_operator missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import operator_redrive as _ord
+    return _ord.bud_operator(cfg, params["slug"],
+                             requested_by=str(params.get("sid") or ""))
+
+
 _SET_DRIFT_PAUSED_REQUIRED = {"slug", "sid", "paused"}
 _SET_DRIFT_PAUSED_ALLOWED = _SET_DRIFT_PAUSED_REQUIRED
 
@@ -5832,6 +5891,8 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     # T-0855: which rung of the scaling ladder this project is on — direct
     # (user-session drives devs) vs operator tier. Backs `bsq route`.
     "topology_decision": _action_topology_decision,
+    "budding_decision": _action_budding_decision,
+    "bud_operator": _action_bud_operator,
     # T-0184: per-session drift-check off-ramp (bsq drift on/off).
     "set_drift_paused": _action_set_drift_paused,
     # T-0926 follow-up: per-session pin against every automatic action
@@ -5935,6 +5996,8 @@ ACTION_MODES: dict[str, str] = {
     # T-0855: same read-only profile — board mds + session mds + the tolerant
     # live-operator pane scan; no coordinator state.
     "topology_decision": "tmux_only",
+    "budding_decision": "tmux_only",
+    "bud_operator": "tmux_only",
     # telemetry_get reads the SHARED install data dir (all users' sampled
     # records land there) → a single coordinator read, not a per-user fan-out.
     "telemetry_get": "coordinator_only",

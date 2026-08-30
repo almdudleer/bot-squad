@@ -43,8 +43,18 @@ ROUTINE_OWNER = "routine:R-0018"
 
 def _stub_tmux(monkeypatch, tmp_path: Path, repo: Path, window: str,
                captured: list[str]) -> None:
+    # T-0933: the handler spawn asks for window "routine-handler", not "dev",
+    # so list-panes must echo back whatever window the LAST new-window
+    # requested — a hardcoded name silently strands every non-"dev" spawn in
+    # "no pane appeared" (measured: the handler test failed exactly there).
+    live = {"window": window}
+
     def fake_run(args, **kwargs):
         if "new-window" in args:
+            try:
+                live["window"] = args[args.index("-n") + 1]
+            except (ValueError, IndexError):
+                pass
             try:
                 captured.append(args[args.index("-lc") + 1])
             except (ValueError, IndexError):
@@ -52,7 +62,7 @@ def _stub_tmux(monkeypatch, tmp_path: Path, repo: Path, window: str,
             return subprocess.CompletedProcess(args, 0, "", "")
         if "list-panes" in args:
             return subprocess.CompletedProcess(
-                args, 0, f"%7|{window}|4321|{repo}|claude\n", "")
+                args, 0, f"%7|{live['window']}|4321|{repo}|claude\n", "")
         return subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(S, "_run", fake_run)
@@ -171,8 +181,9 @@ def test_breach_attaches_a_real_session_and_records_fire(real_spawn_cfg,
     assert [e["kind"] for e in evs] == ["fire"]
     assert evs[0]["sid"] and evs[0]["sid"].startswith("S-")
     assert evs[0]["value"] == 42.0 and evs[0]["threshold"] == 10
-    # the session that was actually launched carries the routine binding
-    assert f"BOT_SQUAD_OWNER=routine:{rid}" in captured[0]
+    # T-0933: the session that was actually launched is the SHARED handler —
+    # one session triages every routine's breaches, not one per routine.
+    assert f"BOT_SQUAD_OWNER={R.ROUTINE_HANDLER_OWNER}" in captured[0]
     # cooldown stamped only because the attach really happened
     st = R.load_state(cfg, slug, rid)
     assert st["fired"] is True and st["last_fired_at"] == R._iso(T0)
@@ -442,3 +453,79 @@ def test_global_user_id_guard_rejects_a_trailing_newline():
     assert S.user_conversation_window("gu_abc") == "gu_abc-user-conversation"
     with pytest.raises(ActionError, match="invalid global_user_id"):
         S.user_conversation_window("gu_abc\nx")
+
+
+# ---------------------------------------------------------------------------
+# T-0933 — ONE shared routine-handler session for every breach
+# ---------------------------------------------------------------------------
+
+def _handler_row(sid="S-u-routine-handler-p7"):
+    return {"sid": sid, "owner": R.ROUTINE_HANDLER_OWNER,
+            "status": "active", "archived": False}
+
+
+def test_second_routine_breach_routes_into_the_live_handler(real_spawn_cfg,
+                                                            tmp_path,
+                                                            monkeypatch):
+    """A live handler absorbs EVERY routine's breach — no second spawn, the
+    breach lands in the handler's input queue instead."""
+    from bot_squad_worker import input_mux
+    cfg, slug, captured = real_spawn_cfg
+    monkeypatch.setattr(S, "list_sessions", lambda c, s: [_handler_row()])
+    metric = tmp_path / "metric2.txt"
+    metric.write_text("42")
+    rid = _declare_spawn_monitor(cfg, slug, metric)
+
+    res = R.monitor_sweep(cfg, slug, now=T0)
+
+    assert res["fired"] == [rid]
+    assert captured == [], "no new session may be spawned while a handler lives"
+    queued = input_mux.read_queue(cfg.data_dir, "S-u-routine-handler-p7")
+    assert len(queued) == 1
+    assert f"[ROUTINE BREACH {rid}]" in queued[0]["text"]
+    assert queued[0]["author"] == f"routine:{rid}"
+    evs = _events(cfg, slug)
+    assert evs[-1]["kind"] == "fire" and evs[-1]["sid"] == "S-u-routine-handler-p7"
+    st = R.load_state(cfg, slug, rid)
+    assert st["fired"] is True  # cooldown stamped: the fire WAS delivered
+
+
+def test_legacy_per_routine_owner_still_takes_the_breach_first(real_spawn_cfg,
+                                                               tmp_path,
+                                                               monkeypatch):
+    """A session already bound to THIS routine (owner routine:R-NNNN — the
+    pre-handler shape, or a hand-spawned owner) outranks the shared handler:
+    one brain per breach, and that brain already holds the context."""
+    from bot_squad_worker import input_mux
+    cfg, slug, captured = real_spawn_cfg
+    metric = tmp_path / "metric3.txt"
+    metric.write_text("42")
+    rid = _declare_spawn_monitor(cfg, slug, metric)
+    owner_row = {"sid": "S-u-owner-p3", "owner": f"routine:{rid}",
+                 "status": "active", "archived": False}
+    monkeypatch.setattr(S, "list_sessions",
+                        lambda c, s: [owner_row, _handler_row()])
+
+    res = R.monitor_sweep(cfg, slug, now=T0)
+
+    assert res["fired"] == [rid]
+    assert captured == []
+    assert len(input_mux.read_queue(cfg.data_dir, "S-u-owner-p3")) == 1
+    assert input_mux.read_queue(cfg.data_dir, "S-u-routine-handler-p7") == []
+
+
+def test_handler_brief_names_the_standing_role(real_spawn_cfg, tmp_path):
+    """The fresh handler must know it is THE handler (later breaches arrive as
+    messages), not a one-breach session that exits when its routine clears."""
+    cfg, slug, _ = real_spawn_cfg
+    metric = tmp_path / "metric4.txt"
+    metric.write_text("42")
+    rid = _declare_spawn_monitor(cfg, slug, metric)
+    routine = R.load(cfg, slug, rid)
+    ev = R.FireEvent(kind="fire", value=42.0, threshold=10,
+                     judge="gt", breach_first_seen="2026-08-30T00:00:00Z")
+    brief = R._handler_brief(cfg, slug, routine, ev, now=T0)
+    assert "SINGLE shared ROUTINE-HANDLER" in brief
+    assert "[ROUTINE BREACH R-NNNN]" in brief
+    assert "Stay resident" in brief
+    assert rid in brief  # the triggering breach rides along

@@ -157,6 +157,11 @@ log = logging.getLogger(__name__)
 # T-0889: `paused` IS pickable. Omitting it would make a paused ticket
 # unpickable — it would silently leave the working set, the exact opposite of
 # what he asked the status for.
+#
+# T-0931: `blocked_on_user` is deliberately ABSENT, unlike `paused`. Both are
+# started-but-unheld work, but a blocked ticket's next move is not "assign a
+# session to it" — no session can make progress until the stakeholder answers,
+# so offering it for pickup would only waste the picker.
 PICKUP_STATUSES = frozenset({"reopened", "open", "planned", "in_progress", "paused"})
 
 #: T-0889 DoD 4 — THE OPERATOR'S WORKING SET, answered rather than defaulted.

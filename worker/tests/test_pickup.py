@@ -70,6 +70,10 @@ def test_a_fresh_prioritised_open_ticket_is_takeable():
     ("totest", "awaiting-review"),
     ("", "not-a-pickup-status:missing"),
     ("bogus", "not-a-pickup-status:bogus"),
+    # T-0931: blocked_on_user is deliberately excluded, like paused's inverse —
+    # no session can make progress on it until the stakeholder answers, so
+    # offering it for pickup would only waste the picker.
+    ("blocked_on_user", "not-a-pickup-status:blocked_on_user"),
 ])
 def test_non_pickup_statuses_are_excluded_with_the_reason_named(status, reject):
     row = _classify(status=status)

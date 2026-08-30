@@ -230,6 +230,39 @@ def composer_ready(buf: str, *, sid: str | None = None,
     return True
 
 
+def composer_free(buf: str, *, sid: str | None = None,
+                  now: float | None = None) -> bool:
+    """:func:`composer_ready` AND no human-typed text sitting in the composer.
+
+    T-0930 (stakeholder, 2026-08-30, verbatim: «только не надо ее компактить,
+    когда у меня текст во вводе»): every compact/handoff send must use THIS
+    gate, not bare ``composer_ready`` — a composer showing ``❯`` with his
+    half-typed message in it is "ready" by the T-0126 rune check, and
+    ``deliver_direct``'s 3-second bounded typing wait then FORCES the send
+    anyway (correct for a wake nudge that must never be dropped, exactly wrong
+    for a compact that can simply wait a tick). Deferring here means the
+    bounded-force path is never reached with his text at risk.
+    """
+    if not composer_ready(buf, sid=sid, now=now):
+        return False
+    from bot_squad_worker import input_mux
+    if input_mux.user_is_typing(buf):
+        _log_not_composer_ready(sid, "human-typed text is sitting in the "
+                                "composer (T-0930: never compact over it)", now)
+        return False
+    return True
+
+
+def ceiling_stay_enabled() -> bool:
+    """T-0930: the ceiling trigger compacts IN PLACE (handoff checkpoint, then
+    native /compact, session continues) instead of relaunching a fresh
+    incarnation. Default ON — the stakeholder's 2026-08-30 ruling makes this
+    the natural lifecycle («handoff + compact без exit было бы правильным
+    поведением, если есть шанс что эта сессия будет продолжаться»).
+    ``BOT_SQUAD_CEILING_COMPACT_STAY=0`` restores the relaunch behaviour."""
+    return os.environ.get("BOT_SQUAD_CEILING_COMPACT_STAY", "1") != "0"
+
+
 def _log_not_composer_ready(sid: str | None, reason: str,
                             now: float | None) -> None:
     """One debounced INFO line per session per window, matching
@@ -244,7 +277,7 @@ def _log_not_composer_ready(sid: str | None, reason: str,
 # --- prompts (the "ask the session to write everything down" + the reload) --
 
 def handoff_prompt(artifact_path: str, role: str | None = None, *,
-                   relaunch: bool = True) -> str:
+                   relaunch: bool = True, stay: bool = False) -> str:
     """The COMPACT HANDOFF — ask a TASK-LESS session to dump its full
     forward-state into its role artifact, then signal done.
 
@@ -262,35 +295,70 @@ def handoff_prompt(artifact_path: str, role: str | None = None, *,
     sentence differs, and it has to: telling a session it is about to be
     relaunched when it is about to be ended is the kind of small lie that
     changes what it bothers to write down.
+
+    ``stay=True`` (T-0930, overrides ``relaunch``) is the compact-in-place
+    ceiling trigger: after the write the SAME session continues with a
+    compacted context — no exit, no fresh incarnation. Truthfulness matters
+    here for the same reason as above, in the opposite direction: a session
+    told it is dying writes a will; a session told it continues writes a
+    checkpoint, and a checkpoint is what the trace is for (the stakeholder's
+    2026-08-29 ruling: «наш компакт лучше встроенного, он оставляет след в
+    системе» — the trace is audit + crash-net, not a successor's only memory).
     """
-    head = (
-        "⏳ CONTEXT FULL — COMPACT HANDOFF. Per the process-paradigm lifecycle you "
-        "are about to be relaunched as a FRESH incarnation with an EMPTY context. "
-        if relaunch else
-        "⏳ CACHE WINDOW EXPIRING — COMPACT HANDOFF. Per the process-paradigm "
-        "lifecycle this session is about to be ENDED. "
-    )
-    tail = ("The system then relaunches you fresh." if relaunch else
-            "The system then ends this session; a later incarnation boots from "
-            "what you wrote.")
-    base = (
-        f"{head}"
-        "NOTHING from this conversation survives EXCEPT what you write to your role "
-        "artifact now.\n\n"
-        "Write your COMPLETE forward-state so your successor continues seamlessly: "
-        "the assignment/goal, what's DONE, what's IN PROGRESS, the EXACT next "
-        "steps, key file paths + decisions + gotchas, and anything you'd need if "
-        "you woke up fresh. Be exhaustive — this is your only memory.\n\n"
-        "Run exactly:\n"
-        '  bsq compact-save "<your full forward-state markdown>"\n\n'
-        f"(It full-replaces your role artifact at {artifact_path}.) After it "
-        f"returns ok, reply: HANDOFF WRITTEN. {tail}"
-    )
+    if stay:
+        head = (
+            "⏳ CONTEXT FULL — CHECKPOINT + COMPACT. Your context is over the "
+            "ceiling and will be COMPACTED IN PLACE: this SAME session "
+            "continues afterwards — no relaunch, no fresh incarnation. Details "
+            "not in the compact summary survive ONLY in what you write to your "
+            "role artifact now (your checkpoint, and the recovery net if this "
+            "session ever dies unexpectedly). "
+        )
+        tail = ("The system then compacts your context in place and you "
+                "continue working in THIS session.")
+    else:
+        head = (
+            "⏳ CONTEXT FULL — COMPACT HANDOFF. Per the process-paradigm lifecycle you "
+            "are about to be relaunched as a FRESH incarnation with an EMPTY context. "
+            if relaunch else
+            "⏳ CACHE WINDOW EXPIRING — COMPACT HANDOFF. Per the process-paradigm "
+            "lifecycle this session is about to be ENDED. "
+        )
+        tail = ("The system then relaunches you fresh." if relaunch else
+                "The system then ends this session; a later incarnation boots from "
+                "what you wrote.")
+    if stay:
+        base = (
+            f"{head}\n\n"
+            "Write your CURRENT forward-state as a checkpoint: the "
+            "assignment/goal, what's DONE, what's IN PROGRESS, the EXACT next "
+            "steps, key file paths + decisions + gotchas — everything you'd "
+            "need if the compact summary loses a detail.\n\n"
+            "Run exactly:\n"
+            '  bsq compact-save "<your full forward-state markdown>"\n\n'
+            f"(It full-replaces your role artifact at {artifact_path}.) After it "
+            f"returns ok, reply: HANDOFF WRITTEN. {tail}"
+        )
+    else:
+        base = (
+            f"{head}"
+            "NOTHING from this conversation survives EXCEPT what you write to your role "
+            "artifact now.\n\n"
+            "Write your COMPLETE forward-state so your successor continues seamlessly: "
+            "the assignment/goal, what's DONE, what's IN PROGRESS, the EXACT next "
+            "steps, key file paths + decisions + gotchas, and anything you'd need if "
+            "you woke up fresh. Be exhaustive — this is your only memory.\n\n"
+            "Run exactly:\n"
+            '  bsq compact-save "<your full forward-state markdown>"\n\n'
+            f"(It full-replaces your role artifact at {artifact_path}.) After it "
+            f"returns ok, reply: HANDOFF WRITTEN. {tail}"
+        )
     guidance = assignment.role_compact_guidance(role)
     return base + ("\n\n" + guidance if guidance else "")
 
 
-def context_handoff_prompt(task_id: str, *, relaunch: bool) -> str:
+def context_handoff_prompt(task_id: str, *, relaunch: bool,
+                           stay: bool = False) -> str:
     """The FINALIZE handoff for a TASK-BOUND session — write the forward-state
     into the ticket's own ``## Context`` (T-0863).
 
@@ -321,19 +389,39 @@ def context_handoff_prompt(task_id: str, *, relaunch: bool) -> str:
     FINALIZE with the status line and lose the forward state, which is the
     whole failure this path exists to prevent. A session that writes only the
     summary runs out the bounded wait and is recorded ``wrote_state=False``.
+
+    ``stay=True`` (T-0930, overrides ``relaunch``): compact-in-place — the
+    session is told the truth that it CONTINUES after the compact, so it
+    writes a checkpoint rather than a will (see :func:`handoff_prompt`).
     """
-    after = (
-        "The system then clears this pane and relaunches you FRESH on the same "
-        "ticket — the Context you just wrote is what you will wake up holding."
-        if relaunch else
-        "The system then ENDS this session. A later session re-drives "
-        f"{task_id} starting from the Context you just wrote."
-    )
+    if stay:
+        after = (
+            "The system then compacts your context in place and you continue "
+            "working on the ticket in THIS session."
+        )
+        opening = (
+            f"⏳ CHECKPOINT — WRITE YOUR FORWARD-STATE ONTO {task_id}. Your "
+            "context is over the ceiling and will be COMPACTED IN PLACE: this "
+            "SAME session continues afterwards — no relaunch. Details not in "
+            "the compact summary survive ONLY in what you write onto the "
+            "ticket now.\n\n"
+        )
+    else:
+        after = (
+            "The system then clears this pane and relaunches you FRESH on the same "
+            "ticket — the Context you just wrote is what you will wake up holding."
+            if relaunch else
+            "The system then ENDS this session. A later session re-drives "
+            f"{task_id} starting from the Context you just wrote."
+        )
+        opening = (
+            f"⏳ FINALIZE — WRITE YOUR FORWARD-STATE ONTO {task_id}. Per the "
+            "process-paradigm lifecycle this incarnation is ending now. NOTHING "
+            "from this conversation survives EXCEPT what you write onto the "
+            "ticket.\n\n"
+        )
     return (
-        f"⏳ FINALIZE — WRITE YOUR FORWARD-STATE ONTO {task_id}. Per the "
-        "process-paradigm lifecycle this incarnation is ending now. NOTHING "
-        "from this conversation survives EXCEPT what you write onto the "
-        "ticket.\n\n"
+        f"{opening}"
         "Run exactly:\n"
         f"  bsq ticket context {task_id} --file <file holding the new Context>\n\n"
         "That REPLACES the ticket's `## Context` — the shared working area, "
@@ -341,7 +429,8 @@ def context_handoff_prompt(task_id: str, *, relaunch: bool) -> str:
         "a diary: the goal, what is DONE, what is IN PROGRESS, the EXACT next "
         "steps, key file paths, decisions and gotchas. Carry over everything in "
         "the existing Context that is still true and drop what is not. Be "
-        "exhaustive — this is your successor's only memory.\n\n"
+        + ("exhaustive — this is your checkpoint.\n\n" if stay else
+           "exhaustive — this is your successor's only memory.\n\n") +
         "One ticket, one artifact: do NOT write a handoff file, and do NOT file "
         "a progress note about this — the Context IS the handoff. Do NOT touch "
         "`## Stakeholder notes`; those are his words and are human-only.\n\n"
@@ -427,17 +516,19 @@ def _send_compact(sid: str) -> None:
 
 
 def _inject_handoff(sid: str, artifact_path: str, role: str | None = None, *,
-                    relaunch: bool = True) -> None:
+                    relaunch: bool = True, stay: bool = False) -> None:
     from bot_squad_worker.actions import _action_inject_input
     _action_inject_input({"sid": sid,
                           "text": handoff_prompt(artifact_path, role,
-                                                 relaunch=relaunch)})
+                                                 relaunch=relaunch, stay=stay)})
 
 
-def _inject_context_handoff(sid: str, task_id: str, *, relaunch: bool) -> None:
+def _inject_context_handoff(sid: str, task_id: str, *, relaunch: bool,
+                            stay: bool = False) -> None:
     from bot_squad_worker.actions import _action_inject_input
     _action_inject_input({"sid": sid,
-                          "text": context_handoff_prompt(task_id, relaunch=relaunch)})
+                          "text": context_handoff_prompt(task_id, relaunch=relaunch,
+                                                         stay=stay)})
 
 
 def _artifact_mtime(path: str | None) -> float:
@@ -708,7 +799,7 @@ def _do_claude_compact(cfg: Any, slug: str, rec: dict, now: float) -> bool:
     pane = _pane_for(sid)
     if not pane:
         return False
-    if not composer_ready(_capture_pane(pane), sid=sid, now=now):
+    if not composer_free(_capture_pane(pane), sid=sid, now=now):
         return False
     try:
         _send_compact(sid)
@@ -861,6 +952,52 @@ def _maybe_finalize(cfg: Any, slug: str, rec: dict, compact: dict, now: float) -
                     "busy pane (hard cap %ds)", sid, int(age),
                     handoff_hard_timeout_sec())
 
+    # --- T-0930: the checkpoint promise — COMPACT IN PLACE, session lives ----
+    # ARM stamped ``stay: true`` and told the session it would continue; honour
+    # that here. The trace is on disk (audit + crash-net), so all that is left
+    # is taking the context down without killing the incarnation: send native
+    # /compact and stamp the cooldown. Requires an idle, typing-free pane —
+    # when the pane stayed busy past the hard cap, fall THROUGH to the old
+    # clear+relaunch below: it is the one move that cannot wedge (measured
+    # T-0905 shape), and the checkpoint the session just wrote is exactly what
+    # a successor boots from, so nothing is lost beyond the in-flight turn.
+    if compact.get("stay"):
+        if idle:
+            pane = _pane_for(sid)
+            if not pane or not composer_free(_capture_pane(pane), sid=sid,
+                                             now=now):
+                return False  # typing/mid-turn — retry next tick, never force
+            try:
+                _send_compact(sid)
+            except Exception:
+                log.exception("autocompact: compact-in-place send failed for "
+                              "%s (will retry)", sid)
+                return False
+            fired = rec.get("alert_fired_at") or {}
+            fired["compact"] = now
+            rec["alert_fired_at"] = fired
+            rec["compact"] = {}
+            wrote_to = (compact.get("task_id") if kind == "context"
+                        else compact.get("artifact_path"))
+            log.info("autocompact: checkpoint complete for %s — forward-state "
+                     "on %s, compacted in place, session continues", sid,
+                     wrote_to)
+            return True
+        log.warning("autocompact: %s checkpoint written but the pane never "
+                    "went idle in %ds — falling back to clear+relaunch (the "
+                    "checkpoint is the successor's boot state)", sid, int(age))
+
+    # T-0930: NEVER clear+relaunch a pane a human is attached to — «я не смогу
+    # ее найти когда вернусь». maybe_compact now lets attached sessions through
+    # (for the compact-in-place path above), so this is the barrier that keeps
+    # the relaunch half off-limits for them: hold the handoff open and retry —
+    # the moment he detaches, the normal flow resumes.
+    if recycle_gate.is_attached(_pane_for(sid), sid=sid, now=now):
+        if recycle_gate.should_log_skip(f"finalize-attached:{sid}", now):
+            log.info("autocompact: %s has its forward-state written but a human "
+                     "client is attached — holding the relaunch (T-0930)", sid)
+        return False
+
     # CLEAR + RELAUNCH: close the old pane, boot a fresh incarnation from what
     # the predecessor wrote, re-bound to the same assignment.
     try:
@@ -914,7 +1051,7 @@ def _maybe_compact_stay_ceiling(sid: str, meta: dict, md_path, level: str, now: 
     if not idle_timeout.compact_stay_due(meta.get("compact_stay_last_at"), now,
                                          idle_timeout.idle_timeout_sec()):
         return False  # already compacted-and-stayed this cache window
-    if not pane or not composer_ready(_capture_pane(pane), sid=sid, now=now):
+    if not pane or not composer_free(_capture_pane(pane), sid=sid, now=now):
         return False
 
     try:
@@ -968,7 +1105,17 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
     if recycle_gate.session_pinned(meta):
         return False
     pane = _pane_for(sid) if sid else None
-    if recycle_gate.is_attached(pane, sid=sid, now=now):
+    # T-0930 (stakeholder, 2026-08-30): an ATTACHED pane no longer blocks the
+    # ceiling response outright — «это разумная компакт логика даже когда я
+    # работаю с сессией». Attended sessions get the compact-in-place flow only
+    # (stay is forced further down; the relaunch/exit paths stay barred — see
+    # _maybe_finalize's attached guard), and the composer_free typing gate is
+    # what protects his half-typed draft. With the stay mode killed
+    # (BOT_SQUAD_CEILING_COMPACT_STAY=0) the old hands-off behaviour returns,
+    # since the only available response would again be the relaunch he must
+    # never get while attached.
+    attached = recycle_gate.is_attached(pane, sid=sid, now=now)
+    if attached and not ceiling_stay_enabled():
         return False
 
     role = rec.get("role") or meta.get("role")
@@ -1005,17 +1152,22 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
     pane = _pane_for(sid)
     if not pane:
         return False
-    if not composer_ready(_capture_pane(pane), sid=sid, now=now):
+    if not composer_free(_capture_pane(pane), sid=sid, now=now):
         return False
 
     # Handoff mode + a resolvable destination → ARM the write-it-down flow.
+    # T-0930: ``stay`` decides what the session is PROMISED (checkpoint +
+    # compact-in-place vs relaunch) — stamped into the phase dict so FINALIZE
+    # honours the promise made at ARM even across a worker restart or an env
+    # flip mid-flight.
     if compact_mode() == "handoff":
+        stay = ceiling_stay_enabled()
         target = _resolve_compact_target(cfg, slug, rec)
         if target["kind"] == "context":
             # T-0863: a task-bound session hands off through its TICKET.
             task_id, task_md = target["task_id"], target["task_md"]
             try:
-                _inject_context_handoff(sid, task_id, relaunch=True)
+                _inject_context_handoff(sid, task_id, relaunch=True, stay=stay)
             except Exception:
                 log.exception("autocompact: context handoff inject failed for "
                               "%s (will retry)", sid)
@@ -1029,15 +1181,17 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
                 "arm_digest": context_digest(task_md),
                 "role": target["role"],
                 "assignment_id": task_id,
+                "stay": stay,
             }
-            log.info("autocompact: armed context handoff for %s → %s ## Context",
+            log.info("autocompact: armed context %s for %s → %s ## Context",
+                     "checkpoint (compact-in-place)" if stay else "handoff",
                      sid, task_id)
             return True
 
         if target["kind"] == "artifact":
             artifact_path, role = target["artifact_path"], target["role"]
             try:
-                _inject_handoff(sid, artifact_path, role)
+                _inject_handoff(sid, artifact_path, role, stay=stay)
             except Exception:
                 log.exception("autocompact: handoff inject failed for %s (will "
                               "retry)", sid)
@@ -1050,9 +1204,11 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
                 "artifact_path": artifact_path,
                 "role": role,
                 "assignment_id": target["assignment_id"],
+                "stay": stay,
             }
-            log.info("autocompact: armed compact handoff for %s → %s", sid,
-                     artifact_path)
+            log.info("autocompact: armed %s for %s → %s",
+                     "checkpoint (compact-in-place)" if stay else
+                     "compact handoff", sid, artifact_path)
             return True
 
     # No destination (or claude mode) → legacy /compact fallback.

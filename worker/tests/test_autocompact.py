@@ -108,7 +108,7 @@ def harness(monkeypatch):
     by both strategies, so we pin ``compact_mode`` to ``claude`` (the T-0467
     write-to-artifact handoff has its own suite in test_compact_handoff.py)."""
     sent: list[str] = []
-    state = {"pane": "%9", "buf": "❯ ready\n"}
+    state = {"pane": "%9", "buf": "❯ \n"}
     monkeypatch.setattr(A, "_pane_for", lambda sid: state["pane"])
     monkeypatch.setattr(A, "_capture_pane", lambda pane: state["buf"])
     monkeypatch.setattr(A, "_send_compact", lambda sid: sent.append(sid))
@@ -206,12 +206,28 @@ def test_user_conversation_role_never_gets_the_handoff_path(harness):
     assert harness["sent"] == []
 
 
-def test_attached_pane_is_never_compacted(harness, monkeypatch):
-    """T-0564: a human client attached to the pane blocks the /compact even
-    when everything else says "go"."""
+def test_attached_pane_compacts_in_place_but_never_without_stay(harness, monkeypatch):
+    """T-0564 -> T-0930: attachment used to block EVERYTHING; the stakeholder's
+    2026-08-30 ruling splits it — an attended session may be compacted (he
+    wants the context down even while he works), it must never be relaunched
+    or typed-over. With the stay mode killed, the old hands-off rule returns
+    wholesale, because the only remaining response would be the relaunch."""
     monkeypatch.setattr(A.recycle_gate, "is_attached", lambda target, **kw: True)
     rec = _rec()
-    assert A.maybe_compact(None, "proj", rec, "urgent", now=1000.0) is False
+    # stay ON (default): the attended pane IS compacted (typing-free composer)
+    assert A.maybe_compact(None, "proj", rec, "urgent", now=1000.0) is True
+    assert harness["sent"] == [rec["sid"]]
+    # ...but never over his half-typed draft
+    harness["sent"].clear()
+    rec2 = _rec(sid="S-almdudleer-dev-p6")
+    harness["state"]["buf"] = "❯ his draft\n"
+    assert A.maybe_compact(None, "proj", rec2, "urgent", now=1000.0) is False
+    assert harness["sent"] == []
+    # stay OFF: attached blocks everything, exactly the pre-T-0930 behaviour
+    harness["state"]["buf"] = "❯ \n"
+    monkeypatch.setenv("BOT_SQUAD_CEILING_COMPACT_STAY", "0")
+    rec3 = _rec(sid="S-almdudleer-dev-p7")
+    assert A.maybe_compact(None, "proj", rec3, "urgent", now=1000.0) is False
     assert harness["sent"] == []
 
 
@@ -231,7 +247,7 @@ def stay_harness(monkeypatch):
     T-0649 ceiling compact-and-stay path needs an actual md_path to arm/
     finalize against."""
     sent: list[str] = []
-    state = {"pane": "%9", "buf": "❯ ready\n"}
+    state = {"pane": "%9", "buf": "❯ \n"}
     monkeypatch.setattr(A, "_pane_for", lambda sid: state["pane"])
     monkeypatch.setattr(A, "_capture_pane", lambda pane: state["buf"])
     monkeypatch.setattr(A, "_send_compact", lambda sid: sent.append(sid))

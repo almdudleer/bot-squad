@@ -212,7 +212,7 @@ def seams(monkeypatch):
     ``calls['compact']`` stays wired so a regression that reintroduces it fails
     loudly instead of passing unnoticed."""
     calls = {"compact": [], "terminate": [], "ctx_handoff": [], "handoff": []}
-    state = {"pane": "%9", "buf": "❯ ready\n", "idle_age": 5000.0,
+    state = {"pane": "%9", "buf": "❯ \n", "idle_age": 5000.0,
              "tokens": 25000}  # default ABOVE the 20k threshold
 
     monkeypatch.setattr(A, "_pane_for", lambda sid, **kw: state["pane"])

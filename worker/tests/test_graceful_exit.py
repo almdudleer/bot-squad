@@ -152,7 +152,7 @@ def _row(sid: str, *, role="dev", window="demo", task_id="T-0042",
 def seams(monkeypatch):
     """Stub every tmux/suspend seam so no real session is touched."""
     calls = {"suspend": []}
-    state = {"pane": "%9", "buf": "❯ ready\n", "idle_age": 5000.0}
+    state = {"pane": "%9", "buf": "❯ \n", "idle_age": 5000.0}
     monkeypatch.setattr(A, "_pane_for", lambda sid: state["pane"])
     monkeypatch.setattr(A, "_capture_pane", lambda pane: state["buf"])
     monkeypatch.setattr(GE, "_suspend",
@@ -401,7 +401,7 @@ def test_no_role_is_exempt_from_idle_recycle(tmp_path, monkeypatch):
     compacted = []
     asked = []
     monkeypatch.setattr(A, "_pane_for", lambda sid, **kw: "%9")
-    monkeypatch.setattr(A, "_capture_pane", lambda pane, **kw: "❯ ready\n")
+    monkeypatch.setattr(A, "_capture_pane", lambda pane, **kw: "❯ \n")
     monkeypatch.setattr(A, "_send_compact", lambda sid: compacted.append(sid))
     # T-0863: the recycle ARM asks a task-LESS role (this TL) to write its
     # forward-state to its role artifact instead of sending /compact. What this

@@ -1270,6 +1270,24 @@ def _live_routine_session(cfg: Any, slug: str, rid: str) -> Optional[str]:
     """SID of a live (pane-backed) session already owning ``routine:<rid>``,
     else ``None``. Unavailable session state fails toward spawning — attaching
     AI to a confirmed breach beats suppressing it on a broken lookup."""
+    return _live_session_with_owner(cfg, slug, f"routine:{rid}")
+
+
+#: T-0933 (stakeholder, 2026-08-30): the SINGLE shared routine-handler session
+#: per project — every monitor breach routes into it, one brain triaging all
+#: routines («под специальную routine-handler сессию, одну, пока она
+#: справляется [...] всё должно в одной быть»). Per-routine sharding is an
+#: explicit LATER («если перестанет [справляться] в перспективе. Но пока что
+#: оч далеко до этой перспективы»). No colon, so plain `_OWNER_RE` accepts it.
+ROUTINE_HANDLER_OWNER = "routine-handler"
+
+
+def _live_routine_handler(cfg: Any, slug: str) -> Optional[str]:
+    """SID of the project's live shared routine-handler session, else None."""
+    return _live_session_with_owner(cfg, slug, ROUTINE_HANDLER_OWNER)
+
+
+def _live_session_with_owner(cfg: Any, slug: str, owner: str) -> Optional[str]:
     from bot_squad_worker import sessions as S
 
     try:
@@ -1277,13 +1295,87 @@ def _live_routine_session(cfg: Any, slug: str, rid: str) -> Optional[str]:
     except Exception:  # noqa: BLE001
         log.exception("monitor owner-dedup: list_sessions failed for %s", slug)
         return None
-    owner = f"routine:{rid}"
     for row in rows:
         if (row.get("owner") == owner
                 and row.get("status") in ("active", "paused")
                 and not row.get("archived")):
             return row.get("sid")
     return None
+
+
+def _handler_breach_message(cfg: Any, slug: str, routine: Routine,
+                            event: FireEvent) -> str:
+    """One breach, rendered as a message into the LIVE handler's composer.
+
+    Points at the routine md rather than inlining the whole Instruction — the
+    handler triages many routines, and each md carries its own known-bad
+    baseline (several are deliberately born-red; their Instructions say to
+    escalate only NEW findings, which is exactly the triage an AI can do and
+    a TG notify to the stakeholder could not)."""
+    md = (_routine_path(cfg, slug, routine.id)
+          or routines_dir(cfg, slug) / f"{routine.id}-*.md")
+    return (f"[ROUTINE BREACH {routine.id}] {routine.title}: value "
+            f"{event.value} vs threshold {event.threshold} (judge "
+            f"{event.judge}), breach since {event.breach_first_seen}. "
+            f"Read {md} — follow its ## Instruction (mind its known-bad "
+            f"baseline; escalate only what it says to escalate).")
+
+
+def _handler_brief(cfg: Any, slug: str, routine: Routine, event: FireEvent,
+                   now: Optional[datetime] = None) -> str:
+    """The boot brief for a FRESH shared handler — orientation plus the breach
+    that woke it. Reuses :func:`spawn_brief` for the triggering routine (the
+    4 assignment primitives + TRIGGER EVENT), prefixed with the standing
+    role: this session is the ONE handler for every routine in the project,
+    and later breaches arrive as ``[ROUTINE BREACH R-NNNN]`` messages rather
+    than new sessions."""
+    routines_dir = Path(cfg.data_dir) / slug / "routines"
+    head = (
+        f"You are the SINGLE shared ROUTINE-HANDLER session for project "
+        f"'{slug}' (T-0933). Every monitor breach in this project is routed "
+        f"to YOU — no per-routine sessions are spawned while you live. Later "
+        f"breaches arrive in your composer as [ROUTINE BREACH R-NNNN] "
+        f"messages; for each one, read its routine md under {routines_dir} "
+        f"and follow that routine's ## Instruction. Many routines are "
+        f"deliberately born-red with a documented known-bad baseline — "
+        f"escalate only NEW findings, never the baseline. Stay resident: "
+        f"when idle, you are waiting for the next breach, not done.\n\n"
+        f"The breach that attached you:\n\n"
+    )
+    return head + spawn_brief(cfg, slug, routine, event, now=now)
+
+
+def _spawn_routine_handler(cfg: Any, slug: str, routine: Routine,
+                           event: FireEvent, *,
+                           now: Optional[datetime] = None
+                           ) -> tuple[Optional[str], Optional[str]]:
+    """Spawn the shared handler (window/owner ``routine-handler``). Same
+    ``(sid, failure)`` contract as :func:`_spawn_for_routine` so the caller's
+    T-0895 capacity-defer / degraded-notify handling applies unchanged."""
+    from bot_squad_worker import sessions as S
+    from bot_squad_worker.actions import ActionError
+
+    try:
+        res = S.spawn(cfg, slug, ROUTINE_HANDLER_OWNER,
+                      initial_prompt=_handler_brief(cfg, slug, routine, event,
+                                                    now=now),
+                      owner=ROUTINE_HANDLER_OWNER,
+                      dispatched_by=ROUTINE_HANDLER_OWNER)
+        sid = res.get("sid")
+        if not sid:
+            log.error("routine-handler spawn returned no sid for %s (%r)",
+                      slug, res)
+            return None, "spawn returned no sid"
+        return sid, None
+    except ActionError as e:
+        if "capacity reached" in str(e):
+            log.debug("routine-handler spawn deferred for %s (%s)", slug, e)
+            return None, SPAWN_DEFER_CAPACITY
+        log.exception("routine-handler spawn failed for %s", slug)
+        return None, str(e) or e.__class__.__name__
+    except Exception as e:  # noqa: BLE001 — one bad routine never kills the sweep
+        log.exception("routine-handler spawn failed for %s", slug)
+        return None, f"{e.__class__.__name__}: {e}"
 
 
 def _monitor_notify(cfg: Any, slug: str, rid: str, text: str) -> bool:
@@ -1365,7 +1457,26 @@ def _handle_fire(cfg: Any, slug: str, routine: Routine, event: FireEvent,
                  routine.id, live_sid, slug)
         return True
 
-    sid, failure = _spawn_for_routine(cfg, slug, routine, event=event, now=now)
+    # T-0933: the shared handler is the DEFAULT AI attachment — one session
+    # triaging every routine's breaches. A live handler gets the breach as a
+    # composer message (input_mux, so it queues behind an in-flight turn and
+    # never types over anything); only when none exists is one spawned.
+    handler_sid = _live_routine_handler(cfg, slug)
+    if handler_sid:
+        from bot_squad_worker import input_mux
+
+        input_mux.enqueue(cfg.data_dir, handler_sid,
+                          _handler_breach_message(cfg, slug, routine, event),
+                          f"routine:{routine.id}", now=now.timestamp())
+        append_event(cfg, slug, ts=_iso(now), routine=routine.id, kind="fire",
+                     value=event.value, threshold=event.threshold,
+                     sid=handler_sid,
+                     note="handler: routed to live routine-handler")
+        log.info("monitor fired: %s -> routed to live routine-handler %s [%s]",
+                 routine.id, handler_sid, slug)
+        return True
+
+    sid, failure = _spawn_routine_handler(cfg, slug, routine, event, now=now)
     if not sid:
         # T-0895: the fire is NOT over just because the spawn failed. Capacity
         # backpressure keeps the intended quiet retry (bounded); any other

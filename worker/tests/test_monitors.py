@@ -532,12 +532,14 @@ def test_walking_skeleton_file_metric_crossing_threshold_spawns_with_event(
     res = R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=5))
     assert res["fired"] == [] and spawns == []
 
-    # persist_s elapsed: FIRE -> one session through the existing spawn path
+    # persist_s elapsed: FIRE -> the SHARED routine-handler session (T-0933:
+    # one handler triages every routine; no per-routine spawn any more)
     res = R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=40))
     assert res["fired"] == [rid]
     assert len(spawns) == 1
-    assert spawns[0]["owner"] == f"routine:{rid}"
+    assert spawns[0]["owner"] == R.ROUTINE_HANDLER_OWNER
     brief = spawns[0]["prompt"]
+    assert "SINGLE shared ROUTINE-HANDLER" in brief
     assert "TRIGGER EVENT" in brief
     assert "42" in brief and "10" in brief and "numeric_gt" in brief
     assert rid in brief

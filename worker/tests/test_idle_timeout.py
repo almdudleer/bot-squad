@@ -1687,3 +1687,74 @@ def test_attached_check_failure_skips_recycle(tmp_path, seams, monkeypatch):
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is False
     assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
+
+
+# --- T-0930: user-conversation ~3h idle exit (stakeholder 2026-08-31) --------
+#
+# «Yes, loosen ... I'd prefer it compacted, however, not exited I think,
+# exited in 3 hours maybe» — the direct answer that reversed T-0720. 55 min
+# idle keeps compact-and-stay; past uc_exit_sec() the attendant EXITS with
+# resume state, and ensure_user_conversation revives it via claude --resume.
+
+def _uc_cfg(tmp_path, seams, idle_age):
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id=None,
+                          extra_md={"role": "user-conversation"})
+    row = _row(sid, window="demo", task_id=None, cwd_repo=data.parent / "repo")
+    row["role"] = "user-conversation"
+    seams["state"]["idle_age"] = idle_age
+    return sid, cfg, data, row
+
+
+def test_uc_past_three_hours_exits_resumable(tmp_path, seams):
+    sid, cfg, data, row = _uc_cfg(tmp_path, seams, idle_age=IT.uc_exit_sec() + 60)
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["terminate"] == [sid]
+    assert seams["calls"]["compact"] == []  # exit, not another compact
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert meta["resumable"] is True  # the revive half depends on this stamp
+
+
+def test_uc_under_three_hours_still_compacts_and_stays(tmp_path, seams):
+    """The 55-min rung is untouched: idle past the compact window but under
+    the exit line → compact-and-stay, никогда terminate."""
+    sid, cfg, data, row = _uc_cfg(tmp_path, seams, idle_age=5000.0)
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["compact"] == [sid]
+    assert seams["calls"]["terminate"] == []
+
+
+def test_uc_exit_disabled_by_env_restores_never_terminate(tmp_path, seams,
+                                                          monkeypatch):
+    monkeypatch.setenv("BOT_SQUAD_UC_EXIT_SEC", "0")
+    sid, cfg, data, row = _uc_cfg(tmp_path, seams, idle_age=999999.0)
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["terminate"] == []
+    assert seams["calls"]["compact"] == [sid]
+
+
+def test_uc_exit_defers_while_the_human_is_typing(tmp_path, seams):
+    """The suspend sequence types C-c/exit into the pane — never over a
+    half-typed draft. Composer busy → no action at all this tick."""
+    sid, cfg, data, row = _uc_cfg(tmp_path, seams, idle_age=IT.uc_exit_sec() + 60)
+    seams["state"]["buf"] = "❯ вот мой недописанный ответ\n"
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert seams["calls"]["terminate"] == [] and seams["calls"]["compact"] == []
+
+
+def test_uc_exit_scoped_to_the_role_not_all_exempt_sessions(tmp_path, seams):
+    """A hand-launched user-session scratch pane (window signal, role dev)
+    was not part of the ruling — it keeps never-exit even at 10x the line."""
+    sid = "S-almdudleer-user-session-p8"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None)
+    row = _row(sid, window="user-session", task_id=None,
+               cwd_repo=data.parent / "repo")
+    seams["state"]["idle_age"] = IT.uc_exit_sec() * 10
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["terminate"] == []
+    assert seams["calls"]["compact"] == [sid]

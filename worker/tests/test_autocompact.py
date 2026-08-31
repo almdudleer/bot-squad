@@ -277,10 +277,38 @@ def test_exempt_session_ceiling_compacts_in_place_no_suspend(tmp_path, stay_harn
     assert "idle_recycle_phase" not in meta
 
 
-def test_pinned_session_ceiling_never_compacts(tmp_path, stay_harness, monkeypatch):
-    """T-0926 follow-up: a ``pinned: true`` session gets no ceiling action at
-    all — unlike the plain exempt case above (still compacts in place), pin
-    is a stronger "do not touch" override."""
+def test_pinned_session_ceiling_compacts_in_place_but_never_exits(
+        tmp_path, stay_harness, monkeypatch):
+    """T-0926 made a pin mean "no ceiling action at all". T-0945 narrows that to
+    the destructive half: «и если контекст разросся, нужно сделать тоже компакт»
+    applies to his manual sessions too, and a pinned session over the ceiling
+    with no way to compact is starvation, not protection. What the pin still
+    guarantees — and this is the assertion that matters — is that it is never
+    suspended or relaunched."""
+    sid = "S-almdudleer-operator-p9"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None,
+                          extra_md={"pinned": True})
+    suspended = []
+    monkeypatch.setattr(S, "suspend", lambda *a, **k: suspended.append(a))
+
+    rec = {"sid": sid, "activity": "idle", "role": "user-conversation"}
+    assert A.maybe_compact(cfg, "bot-squad", rec, "urgent", now=1000.0) is True
+    assert stay_harness["sent"] == [sid]
+    assert suspended == []
+
+    meta = S._read_session_metadata(S._session_file(data, "bot-squad", sid))
+    assert meta["compact_stay_phase"] == "compacting"
+    # the terminate-flow fields are never touched on this path
+    assert "idle_recycle_phase" not in meta
+
+
+def test_pinned_session_ceiling_takes_no_action_with_stay_disabled(
+        tmp_path, stay_harness, monkeypatch):
+    """Control for the above: with compact-in-place killed
+    (BOT_SQUAD_CEILING_COMPACT_STAY=0) the only remaining ceiling response is
+    the clear+relaunch a pin must never get — so a pinned session goes back to
+    taking no action at all, exactly as T-0926 left it."""
+    monkeypatch.setenv("BOT_SQUAD_CEILING_COMPACT_STAY", "0")
     sid = "S-almdudleer-operator-p9"
     cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None,
                           extra_md={"pinned": True})
@@ -289,9 +317,7 @@ def test_pinned_session_ceiling_never_compacts(tmp_path, stay_harness, monkeypat
 
     rec = {"sid": sid, "activity": "idle", "role": "user-conversation"}
     assert A.maybe_compact(cfg, "bot-squad", rec, "urgent", now=1000.0) is False
-    assert stay_harness["sent"] == []
-    assert suspended == []
-
+    assert stay_harness["sent"] == [] and suspended == []
     meta = S._read_session_metadata(S._session_file(data, "bot-squad", sid))
     assert "compact_stay_phase" not in meta
 

@@ -1176,11 +1176,25 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
             md_path = None
     if not recycle_gate.project_allowed(cfg, slug, now):
         return False
-    # T-0926 follow-up: an explicit human pin beats every other signal here —
-    # including the compact-and-stay ceiling path a few lines down.
-    if recycle_gate.session_pinned(meta):
-        return False
     pane = _pane_for(sid) if sid else None
+    # T-0926 made an explicit human pin beat every other signal here, including
+    # the compact-and-stay path below: no ceiling action at all.
+    #
+    # T-0945 KEEPS the half that protects the session and drops the half that
+    # starved it. A pin still bars the clear+relaunch and every exit — but the
+    # stakeholder's ruling on manual sessions names this exact case: «В целом к
+    # ручной сессии актуальны те же правила … и если контекст разросся, нужно
+    # сделать тоже компакт», and he reads pinning itself as «симптом плохо
+    # настроенного вот этого процесса». A pinned session over the ceiling with
+    # no way to compact is the starvation that produced. Same treatment as an
+    # ATTACHED pane, which T-0930 had already routed here for the same reason
+    # («это разумная компакт логика даже когда я работаю с сессией»); the
+    # typing gate inside `_maybe_compact_stay_ceiling` is what protects a
+    # half-typed draft.
+    if recycle_gate.session_pinned(meta):
+        if md_path is None or not ceiling_stay_enabled():
+            return False
+        return _maybe_compact_stay_ceiling(sid, meta, md_path, level, now, pane)
     # T-0930 (stakeholder, 2026-08-30): an ATTACHED pane no longer blocks the
     # ceiling response outright — «это разумная компакт логика даже когда я
     # работаю с сессией». Attended sessions get the compact-in-place flow only

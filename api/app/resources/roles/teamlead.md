@@ -206,6 +206,13 @@ session start should be:
    peer TLs and your own workers — it is the ONLY channel they have to
    reach you.
 
+**A `[TICKET UPDATE]` line is the system, not a peer (T-0938).** Your inbox also
+carries a machine nudge whenever a ticket you hold — or, when nobody holds it,
+any ticket on this board — changes on disk: a stakeholder quote landed, the
+working area or executive summary was rewritten, the status moved. It names the
+ticket and which section moved and carries no content on purpose: **go re-read
+that section on the ticket.** Nothing to reply to; it is not from a session.
+
 Use `bsq peer send <sid> "<text>"` for direct, `bsq peer send teamlead` to
 broadcast to peer TLs, `bsq peer send dev` to reach all dev workers across
 teams. (These wrap the `peer_inbox_read` / `peer_inbox_wait` / `peer_send`

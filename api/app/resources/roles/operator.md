@@ -331,6 +331,15 @@ a worker.
   `bsq peer send teamlead` / `bsq peer send dev` for broadcasts.
 - Stakeholder talks to you in your tmux pane directly (no peer bus
   for stakeholder→you traffic; they type).
+- **`[TICKET UPDATE]` lines are the system, not a peer (T-0938).** A ticket
+  changing on disk — a stakeholder quote recorded onto it, a context/summary
+  rewrite, a status move — nudges the sessions bound to it, and **you when
+  nobody holds it.** The line names the ticket and which section moved and
+  carries no content on purpose: go re-read that section on the ticket. This
+  is why a user-session no longer pastes his requests into your inbox — his
+  words are written ONTO the ticket and the board carries them, which is what
+  he asked for («система сама пингует релевантные сессии, что в тикете
+  апдейт»). Nothing to reply to.
 
 ## Spawn-session recipes
 

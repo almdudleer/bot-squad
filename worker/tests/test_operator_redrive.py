@@ -93,6 +93,40 @@ def test_paused_is_not_redriven(cfg_slug):
     assert spawns == []
 
 
+# --- T-0929: pause is the "stop everything automatic" lever — it must also
+# end a currently-running autopilot, not just gate future re-drive respawns.
+
+def test_pause_also_stops_a_running_autopilot(cfg_slug):
+    """A live autopilot (T-0153) is a separate mechanism from re-drive with its
+    own stop condition — before this fix, pausing operator_redrive left it
+    running untouched, matching the stakeholder's report of sessions still
+    working after an explicit stop."""
+    from bot_squad_worker import autopilot as AP
+
+    cfg, slug, spawns = cfg_slug
+    state = AP.AutopilotState(
+        slug=slug, key="session-S-x", kind="session", ref="S-x",
+        target_sid="S-x", prompt="keep driving",
+    )
+    AP.save_state(cfg, state)
+    assert AP.list_states(cfg, slug)[0].status == "running"
+
+    ord_.pause(cfg, slug, by="user", reason="stop and work with me")
+
+    reloaded = AP.list_states(cfg, slug)[0]
+    assert reloaded.status == "stopped"
+    assert reloaded.enabled is False
+
+
+def test_pause_with_no_autopilots_is_unaffected(cfg_slug):
+    """No autopilot state on disk at all -> pause still succeeds (no crash on
+    an absent _worker/autopilot/ dir)."""
+    cfg, slug, spawns = cfg_slug
+    meta = ord_.pause(cfg, slug, by="user")
+    assert ord_.is_paused(cfg, slug) is True
+    assert meta["paused_by"] == "user"
+
+
 def test_resume_reenables_redrive(cfg_slug):
     """After resume the operator is re-driven again."""
     cfg, slug, spawns = cfg_slug

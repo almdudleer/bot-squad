@@ -97,6 +97,21 @@ def bus(monkeypatch):
     return sent
 
 
+def _stub_fallbacks(monkeypatch, *, operators=(), seat=None):
+    """Pin BOTH unheld-ticket rungs (T-0937 seat, T-0938 operator).
+
+    Stubbing the two SSOTs rather than TW.resolve_fallbacks on purpose: the
+    thing under test is which SSOT this module asks and in what order, and a
+    stub of its own resolver would answer that question for it.
+    """
+    from bot_squad_worker import dispatch as _dispatch
+    from bot_squad_worker import operator_seat as _seat
+    monkeypatch.setattr(_dispatch, "live_operator_sids",
+                        lambda cfg, slug: list(operators))
+    monkeypatch.setattr(_seat, "seat_holder",
+                        lambda cfg, slug: {"sid": seat, "kind": "claim"} if seat else None)
+
+
 # --- env knob ----------------------------------------------------------------
 
 def test_enabled_default_on_and_kill_switch(monkeypatch):
@@ -201,10 +216,11 @@ def test_archived_sessions_are_never_recipients(tmp_path):
 def test_an_unheld_ticket_falls_back_to_the_live_operator(tmp_path, monkeypatch):
     cfg, data = _make_cfg(tmp_path)
     _write_ticket(data, "T-0042")
-    from bot_squad_worker import dispatch as _dispatch
-    monkeypatch.setattr(_dispatch, "live_operator_sids",
-                        lambda cfg, slug: ["S-almdudleer-bot-squad-operator-p4"])
+    _stub_fallbacks(monkeypatch, operators=["S-almdudleer-bot-squad-operator-p4"],
+                    seat="S-almdudleer-bot-squad-seat-p9")
     sids, why = TW.recipients_for(cfg, "bot-squad", "T-0042")
+    # The operator ROLE outranks the seat: when a real operator session is live
+    # it is the dispatcher, and the seat is the answer only in its absence.
     assert sids == ["S-almdudleer-bot-squad-operator-p4"]
     assert why == "operator"
 
@@ -213,9 +229,8 @@ def test_a_held_ticket_does_not_also_go_to_the_operator(tmp_path, monkeypatch):
     cfg, data = _make_cfg(tmp_path)
     _write_ticket(data, "T-0042")
     _write_session(data, "S-almdudleer-bot-squad-dev-p1", task_id="T-0042")
-    from bot_squad_worker import dispatch as _dispatch
-    monkeypatch.setattr(_dispatch, "live_operator_sids",
-                        lambda cfg, slug: ["S-almdudleer-bot-squad-operator-p4"])
+    _stub_fallbacks(monkeypatch, operators=["S-almdudleer-bot-squad-operator-p4"],
+                    seat="S-almdudleer-bot-squad-seat-p9")
     sids, why = TW.recipients_for(cfg, "bot-squad", "T-0042")
     assert sids == ["S-almdudleer-bot-squad-dev-p1"] and why == "bound"
 
@@ -579,3 +594,130 @@ def test_an_idle_sweep_reads_no_roster_at_all(tmp_path, bus, monkeypatch):
     monkeypatch.setattr(TW, "session_rows", lambda cfg, slug: calls.append(1) or [])
     TW._scan_project(cfg, "bot-squad")
     assert calls == []
+
+
+# --- the operator SEAT rung (T-0937 x T-0938) ---------------------------------
+
+def test_an_unheld_ticket_reaches_the_seat_holder_when_no_operator_is_live(
+        tmp_path, bus, monkeypatch):
+    """The rung the live board actually needed. Measured 2026-08-31: bot-squad
+    had NO operator-role pane — the only operator window belonged to another
+    project and was correctly scoped out — so every unheld ticket's change
+    reached nobody. The seat exists precisely so "no operator ROLE" stops
+    meaning "nobody drives": a live root wearing the hat IS the dispatcher."""
+    cfg, data = _make_cfg(tmp_path)
+    path = _write_ticket(data, "T-0042")
+    seat = "S-almdudleer-bot-squad-root-p7"
+    _stub_fallbacks(monkeypatch, operators=[], seat=seat)
+    TW._scan_project(cfg, "bot-squad")
+
+    path.write_text(path.read_text().replace("status: planned", "status: in_progress"))
+    out = TW._scan_project(cfg, "bot-squad")
+
+    assert [(r["sid"], r["why"]) for r in out] == [(seat, "seat")]
+    assert len(bus) == 1 and bus[0][0] == seat
+    assert "T-0042" in bus[0][1] and "status planned -> in_progress" in bus[0][1]
+
+
+def test_a_vacant_seat_and_no_operator_still_reaches_nobody_and_warns(
+        tmp_path, bus, monkeypatch, caplog):
+    """The seat rung must not become a recipient-inventing machine. With no
+    operator AND no seat the board genuinely has no driver, and the honest
+    answer is the warning — not a guessed destination, which would put the
+    change back on a relay."""
+    import logging
+
+    cfg, data = _make_cfg(tmp_path)
+    path = _write_ticket(data, "T-0042")
+    _stub_fallbacks(monkeypatch, operators=[], seat=None)
+    TW._scan_project(cfg, "bot-squad")
+
+    path.write_text(path.read_text().replace("status: planned", "status: paused"))
+    with caplog.at_level(logging.WARNING, logger="bot_squad_worker.ticket_watch"):
+        assert TW._scan_project(cfg, "bot-squad") == []
+    assert bus == []
+    assert any("reached NOBODY" in r.getMessage() for r in caplog.records)
+    assert any("seat is vacant" in r.getMessage() for r in caplog.records)
+
+
+def test_the_seat_holder_is_not_nudged_about_its_own_write(tmp_path, bus, monkeypatch):
+    """Self-suppression is a property of the RECIPIENT, not of why they are one.
+    The seat holder is the session most likely to be curating unheld tickets —
+    it is the one driving the board — so a rung that skipped the author filter
+    would make it the loudest self-nudger in the fleet."""
+    cfg, data = _make_cfg(tmp_path)
+    path = _write_ticket(data, "T-0042")
+    seat = "S-almdudleer-bot-squad-root-p7"
+    _stub_fallbacks(monkeypatch, operators=[], seat=seat)
+    TW._scan_project(cfg, "bot-squad")
+
+    path.write_text(path.read_text().replace("ctx", "the seat holder's own edit"))
+    TW.note_author(cfg, "bot-squad", "T-0042", seat, ("context",))
+    assert TW._scan_project(cfg, "bot-squad") == []
+    assert bus == []
+
+
+def test_the_seat_holder_still_hears_about_someone_elses_write(
+        tmp_path, bus, monkeypatch):
+    """...and the suppression stays per-SECTION on this rung too."""
+    cfg, data = _make_cfg(tmp_path)
+    path = _write_ticket(data, "T-0042")
+    seat = "S-almdudleer-bot-squad-root-p7"
+    _stub_fallbacks(monkeypatch, operators=[], seat=seat)
+    TW._scan_project(cfg, "bot-squad")
+
+    text = path.read_text().replace("ctx", "the seat holder's own edit")
+    path.write_text(text.replace("status: planned", "status: in_progress"))
+    TW.note_author(cfg, "bot-squad", "T-0042", seat, ("context",))
+    out = TW._scan_project(cfg, "bot-squad")
+
+    assert [(r["sid"], r["keys"]) for r in out] == [(seat, ["status"])]
+    assert "## Context" not in bus[0][1]
+
+
+def test_an_unreadable_seat_falls_open_to_the_warning(tmp_path, bus, monkeypatch,
+                                                      caplog):
+    """Fail-open, matching the seat module's own contract: a seat nobody can
+    read resolves to VACANT, never to a raise inside the sweep and never to a
+    held seat. `seat_holder` already promises this; this pins that ticket_watch
+    does not undo it by letting the exception escape."""
+    import logging
+
+    cfg, data = _make_cfg(tmp_path)
+    path = _write_ticket(data, "T-0042")
+    from bot_squad_worker import dispatch as _dispatch
+    from bot_squad_worker import operator_seat as _seat
+    monkeypatch.setattr(_dispatch, "live_operator_sids", lambda cfg, slug: [])
+    monkeypatch.setattr(_seat, "seat_holder",
+                        lambda cfg, slug: (_ for _ in ()).throw(RuntimeError("boom")))
+    TW._scan_project(cfg, "bot-squad")
+
+    path.write_text(path.read_text().replace("status: planned", "status: paused"))
+    with caplog.at_level(logging.WARNING, logger="bot_squad_worker.ticket_watch"):
+        assert TW._scan_project(cfg, "bot-squad") == []
+    assert bus == []
+    assert any("reached NOBODY" in r.getMessage() for r in caplog.records)
+
+
+def test_the_fallbacks_are_resolved_once_per_sweep(tmp_path, bus, monkeypatch):
+    """Same cost guard as the roster hoist, extended to the second SSOT: the
+    seat read walks the claim file AND the pace config, and doing it per changed
+    ticket would repeat that up to 25 times inside a 60s tick."""
+    cfg, data = _make_cfg(tmp_path)
+    ids = [f"T-{n:04d}" for n in range(1, 5)]
+    for tid in ids:
+        _write_ticket(data, tid)
+    _stub_fallbacks(monkeypatch, operators=[], seat="S-almdudleer-bot-squad-root-p7")
+    TW._scan_project(cfg, "bot-squad")
+
+    calls: list[int] = []
+    real = TW.resolve_fallbacks
+    monkeypatch.setattr(TW, "resolve_fallbacks",
+                        lambda cfg, slug: calls.append(1) or real(cfg, slug))
+    for tid in ids:
+        p = data / "bot-squad" / "backlog" / f"{tid}-demo.md"
+        p.write_text(p.read_text().replace("status: planned", "status: in_progress"))
+    out = TW._scan_project(cfg, "bot-squad")
+
+    assert len(out) == len(ids)
+    assert calls == [1]

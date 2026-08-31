@@ -45,7 +45,14 @@ Recipients, in order:
   than a fifth local copy of that walk);
 * failing that, the live operator (``dispatch.live_operator_sids``, the
   identity SSOT) — an unheld ticket that just changed is the operator's, which
-  is also the direction T-0936 takes for umbrella tickets.
+  is also the direction T-0936 takes for umbrella tickets;
+* failing THAT, whoever holds the operator SEAT (``operator_seat.seat_holder``,
+  T-0937). Measured on the live install the day this shipped: bot-squad had no
+  operator-ROLE pane at all, so the rung above answered nobody and every unheld
+  ticket's change reached no one. The seat exists precisely so that "no operator
+  role" stops meaning "nobody drives" — a live root session wearing the hat IS
+  the board's dispatcher, and it is the right destination for a change nobody
+  else holds.
 
 Delivery is the existing bus: a durable inbox line (``intersession.send_notice``
 — a tick has nowhere to report a refusal, so it splits rather than refuses) plus
@@ -66,7 +73,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 log = logging.getLogger(__name__)
 
@@ -349,29 +356,74 @@ def bound_sids(cfg: Any, slug: str, task_id: str,
     return out
 
 
+class Fallbacks(NamedTuple):
+    """Who catches a change on a ticket NOBODY holds — resolved once per sweep.
+
+    One object rather than two optional arguments because the two answers have
+    the same shape and a different meaning of "empty": passing ``None`` for a
+    list would be ambiguous between "not resolved yet" and "resolved, nobody
+    there", and that ambiguity is how a fallback silently stops firing.
+    """
+
+    operator_sids: list[str]
+    seat_sid: str | None
+
+
+def resolve_fallbacks(cfg: Any, slug: str) -> Fallbacks:
+    """The two unheld-ticket destinations, in precedence order.
+
+    Both read their own SSOT and both FAIL OPEN — an unreadable roster or an
+    unreadable seat resolves to "nobody there", never to a raise inside the
+    sweep. ``seat_holder`` already fails open by contract (T-0937: holding a
+    seat nobody can read would strand the backlog), so this only has to match
+    that posture, not re-implement it.
+    """
+    try:
+        from bot_squad_worker.dispatch import live_operator_sids
+        operators = list(live_operator_sids(cfg, slug))
+    except Exception:  # noqa: BLE001
+        log.exception("ticket_watch: live_operator_sids failed for %s", slug)
+        operators = []
+    try:
+        from bot_squad_worker import operator_seat as _seat
+        holder = _seat.seat_holder(cfg, slug) or {}
+        seat_sid = str(holder.get("sid") or "") or None
+    except Exception:  # noqa: BLE001
+        log.exception("ticket_watch: seat_holder failed for %s", slug)
+        seat_sid = None
+    return Fallbacks(operators, seat_sid)
+
+
 def recipients_for(cfg: Any, slug: str, task_id: str,
                    rows: list[dict] | None = None,
-                   operator_sids: list[str] | None = None) -> tuple[list[str], str]:
+                   fallbacks: Fallbacks | None = None) -> tuple[list[str], str]:
     """``(sids, why)`` — who hears about this ticket's change.
 
-    Bound sessions when there are any; otherwise the live operator, because an
-    unheld ticket that just moved is the operator's business (the same holder
-    logic T-0936 makes explicit for umbrella tickets). An empty list is a
-    legitimate outcome — an unheld ticket with no live operator has nobody to
-    tell, and inventing a recipient would put the change back on a relay.
+    Three rungs, in order:
+
+    1. the sessions BOUND to the ticket;
+    2. the live operator — an unheld ticket that just moved is the operator's
+       business (the direction T-0936 takes for umbrella tickets);
+    3. the operator SEAT holder (T-0937) — the session actually driving this
+       board whatever its role. Without this rung a project with no
+       operator-role pane has no destination at all for an unheld ticket, which
+       is exactly what bot-squad measured on the day this shipped.
+
+    An empty list is still a legitimate outcome: a ticket nobody holds, on a
+    board nobody drives, has nobody to tell — and inventing a recipient would
+    put the change back on a relay. The caller logs that case rather than
+    swallowing it.
     """
     sids = bound_sids(cfg, slug, task_id, rows)
     if sids:
         return sids, "bound"
-    if operator_sids is not None:
-        return list(operator_sids), "operator"
-    try:
-        from bot_squad_worker.dispatch import live_operator_sids
-
-        return list(live_operator_sids(cfg, slug)), "operator"
-    except Exception:  # noqa: BLE001
-        log.exception("ticket_watch: live_operator_sids failed for %s", slug)
-        return [], "operator"
+    if fallbacks is None:
+        fallbacks = resolve_fallbacks(cfg, slug)
+    if fallbacks.operator_sids:
+        return list(fallbacks.operator_sids), "operator"
+    if fallbacks.seat_sid:
+        return [fallbacks.seat_sid], "seat"
+    return [], "operator"
 
 
 # ---------------------------------------------------------------------------
@@ -513,33 +565,29 @@ def _scan_project(cfg: Any, slug: str) -> list[dict]:
             # `session_rows`. Resolved lazily so a pass with nothing to say
             # (the overwhelmingly common one) pays for neither.
             rows: list[dict] | None = None
-            operator_sids: list[str] | None = None
+            fallbacks: Fallbacks | None = None
             for tid, name, cur, prev, keys in pending:
                 if rows is None:
                     rows = session_rows(cfg, slug)
-                    try:
-                        from bot_squad_worker.dispatch import live_operator_sids
-                        operator_sids = list(live_operator_sids(cfg, slug))
-                    except Exception:  # noqa: BLE001
-                        log.exception(
-                            "ticket_watch: live_operator_sids failed for %s", slug)
-                        operator_sids = []
+                    fallbacks = resolve_fallbacks(cfg, slug)
                 rel = f"data/{slug}/backlog/{name}"
-                sids, why = recipients_for(cfg, slug, tid, rows, operator_sids)
+                sids, why = recipients_for(cfg, slug, tid, rows, fallbacks)
                 if not sids:
-                    # Measured on the live install 2026-08-31: bot-squad has NO
-                    # live operator pane (the only operator window belongs to
-                    # another project and is correctly scoped out), so EVERY
-                    # unheld ticket's change resolves to nobody. That is the
-                    # honest answer from the identity SSOT and this module will
-                    # not invent a recipient — but it must not be silent either,
-                    # for the same reason `intersession.send` warns when the
-                    # `operator` keyword reaches nobody: a change that told no
-                    # one is exactly the state the relay habit grew in.
+                    # Reached only when NOBODY holds the ticket, no operator
+                    # session is live, AND the seat is vacant — i.e. the board
+                    # genuinely has no driver. (The two-rung version of this hit
+                    # on every unheld ticket, because bot-squad had no
+                    # operator-ROLE pane at all; the seat rung is what fixed
+                    # that.) This module will not invent a recipient — but it
+                    # must not be silent either, for the same reason
+                    # `intersession.send` warns when the `operator` keyword
+                    # reaches nobody: a change that told no one is exactly the
+                    # state the relay habit grew in.
                     log.warning(
                         "ticket_watch: %s changed (%s) and reached NOBODY — no "
-                        "session is bound to it and %s has no live operator; "
-                        "nothing was notified", tid, ", ".join(keys), slug,
+                        "session is bound to it, %s has no live operator, and "
+                        "the operator seat is vacant; nothing was notified",
+                        tid, ", ".join(keys), slug,
                     )
                     continue
                 ticket_authors = authors.get(tid) or {}

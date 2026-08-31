@@ -144,13 +144,35 @@ and the `bsq task digest` paste. Not to peer sends between sessions.
    put the user id / message ref in `provenance` (that belongs in the
    task's Context). The user + message attribution is preserved separately.
 
-3. **Dispatch it — directly when the task flow is small, through the
-   operator when it isn't (T-0855).** Run **`bsq route`**. It answers, from
-   the project's actual load (tasks held by LIVE dev sessions + how many devs
-   are live — not the board's `in_progress` labels, which drift), which of the
-   two this request gets:
+3. **Do the work yourself by default (stakeholder, 2026-08-20, T-0924
+   follow-up) — spawning is the exception, not the baseline.** The scaling
+   ladder's own starting rung (F-2026-08-06-bsq-6c16cca10b.md) is "one
+   universal session — it talks to the user AND does the work itself." A
+   single, ordinary request (read the code, make the change, test it, reply)
+   stays in THIS session's own context: no `bsq spawn`, no hand-off. You
+   already have full tool access and no restriction on fixing things
+   yourself — use it.
 
-   - **`route: direct`** — **spawn and steer the dev session yourself**:
+   Only reach past this baseline when the reason is genuine **parallelism**,
+   not merely that the request is code-shaped:
+
+   - **Too many concurrent USER requests to record/clarify/implement without
+     dropping one** — that is when a second dedicated user-conversation-style
+     attendant would earn its keep (currently theoretical: one live attendant
+     is bound per (project, user) by design, so in practice this means
+     working the queue in order, not silently dropping the older ask — flag
+     it to the stakeholder rather than inventing a second session ad hoc).
+   - **Too many concurrent pieces of DEV work that need to keep running while
+     you keep attending the user thread, or that need real orchestration
+     across several dev sessions** — that is what `bsq route` (T-0855) still
+     governs, unchanged below.
+
+   Run **`bsq route`** only once you've judged the request needs a dedicated
+   session at all. It answers, from the project's actual load (tasks held by
+   LIVE dev sessions + how many devs are live — not the board's `in_progress`
+   labels, which drift), which of the two THAT dispatch gets:
+
+   - **`route: direct`** — spawn and steer the dev session yourself:
      `bsq spawn <T-id> …`, then stay with it (read its progress notes, answer
      its questions, relay its result into your thread). **Do not spawn an
      operator to relay for you and do not wait for one** — while the flow
@@ -163,12 +185,10 @@ and the `bsq task digest` paste. Not to peer sends between sessions.
      second dispatcher double-drives it — or the load has outgrown what one
      session can steer.
 
-   **The threshold is the verb's, not yours.** Don't re-derive it from how
-   busy you feel and don't override it because a request looks small or
-   urgent; `bsq route --json` prints the counts, ceilings and signals it
-   used. On the direct route you are the dispatcher **for that task** — the
-   no-drop guarantee below still binds, and you still do not do the build
-   work in your own context.
+   Once you're in `bsq route`'s territory: **The threshold is the verb's, not yours.**
+   Don't re-derive it from how busy you feel. But getting there in the first
+   place, for an ordinary single request, is itself the wrong default: check
+   the "do it yourself" gate above BEFORE running `bsq route` at all.
 
 ## Why the operator hop is now conditional (T-0855, stakeholder 2026-08-11)
 

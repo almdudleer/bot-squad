@@ -3387,11 +3387,55 @@ def cmd_routine_declare(args) -> None:
     print(f"{res['id']}  ->  {res['file_path']}  (next run: {res.get('next_run_at')})")
 
 
+def _routine_print_row(r: dict) -> None:
+    """Render one `bsq routine list` row. Pulled out of ``cmd_routine_list``
+    so a test can pin the render against a fabricated dict without hitting
+    the live worker socket (T-0899; same shape as ``_pace_print_drive``)."""
+    muted = ""
+    if r.get("muted_until"):
+        reason = f" ({r['mute_reason']})" if r.get("mute_reason") else ""
+        muted = f"  MUTED until {r['muted_until']}{reason}"
+    mon = r.get("monitor")
+    if mon:
+        spec = f"{mon.get('probe')} {mon.get('interval_s')}s"
+        if mon.get("judge") and mon.get("judge") != "http":
+            spec += f" {mon.get('judge')}/{mon.get('threshold')}"
+        last = mon.get("last_value")
+        # T-0899: a healthy routine renders exactly as before (no
+        # marking — the pass leg). A probe in error gets a visible
+        # marker so `last=` can't be mistaken for a fresh reading, and
+        # once errors cross MONITOR_ERROR_BOUND it reads BROKEN — which
+        # stays shown for as long as it's true, unlike the one-time
+        # alert message, so it can't go silently blind forever.
+        errors = mon.get("consecutive_errors") or 0
+        if mon.get("broken"):
+            health = (f"  BROKEN ({errors} consecutive probe errors, "
+                      f"last ok value stale since "
+                      f"{mon.get('last_value_at') or '—'})")
+        elif errors:
+            health = (f"  error×{errors} (stale since "
+                      f"{mon.get('last_value_at') or '—'})")
+        else:
+            health = ""
+        print(f"{r['id']}  [{r.get('status')}]  monitor({spec})  "
+              f"last={'—' if last is None else last}{health}  "
+              f"breach={'YES' if mon.get('breach') else 'no'}  "
+              f"last_fire={mon.get('last_fired_at') or '—'}"
+              f"{muted}  {r.get('title', '')}")
+    else:
+        print(f"{r['id']}  [{r.get('status')}]  "
+              f"{r.get('trigger')}:{r.get('schedule')}  "
+              f"next={r.get('next_run_at')}{muted}  {r.get('title', '')}")
+
+
 def cmd_routine_list(args) -> None:
     """T-0464/T-0604: list declared Routines for this project.
 
     Monitor routines render live columns from the worker's sidecar state:
-    last probed value, breach state, last fire — plus any standing mute."""
+    last probed value, breach state, last fire — plus any standing mute.
+    T-0899: a probe in error (or blind past MONITOR_ERROR_BOUND, BROKEN)
+    is marked and its `last=` reading flagged stale — a healthy routine
+    renders unmarked."""
     slug = resolve_slug()
     res = post("routine_list", {"slug": slug})
     routines = res.get("routines", [])
@@ -3399,25 +3443,7 @@ def cmd_routine_list(args) -> None:
         print("no routines declared. `bsq routine declare --help` to add one.")
         return
     for r in routines:
-        muted = ""
-        if r.get("muted_until"):
-            reason = f" ({r['mute_reason']})" if r.get("mute_reason") else ""
-            muted = f"  MUTED until {r['muted_until']}{reason}"
-        mon = r.get("monitor")
-        if mon:
-            spec = f"{mon.get('probe')} {mon.get('interval_s')}s"
-            if mon.get("judge") and mon.get("judge") != "http":
-                spec += f" {mon.get('judge')}/{mon.get('threshold')}"
-            last = mon.get("last_value")
-            print(f"{r['id']}  [{r.get('status')}]  monitor({spec})  "
-                  f"last={'—' if last is None else last}  "
-                  f"breach={'YES' if mon.get('breach') else 'no'}  "
-                  f"last_fire={mon.get('last_fired_at') or '—'}"
-                  f"{muted}  {r.get('title', '')}")
-        else:
-            print(f"{r['id']}  [{r.get('status')}]  "
-                  f"{r.get('trigger')}:{r.get('schedule')}  "
-                  f"next={r.get('next_run_at')}{muted}  {r.get('title', '')}")
+        _routine_print_row(r)
 
 
 def cmd_routine_mute(args) -> None:

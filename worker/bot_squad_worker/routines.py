@@ -436,6 +436,10 @@ class MonitorTrigger(Trigger):
             return None
         st["consecutive_errors"] = 0
         st["last_value"] = value
+        # T-0899: stamped only here, alongside last_value — last_probe_at
+        # advances on every tick including errors, so it can't tell a fresh
+        # value from a stale one held through an error streak.
+        st["last_value_at"] = _iso(now)
 
         if verdict == "breach":
             if not st.get("breach_first_seen"):
@@ -769,6 +773,17 @@ def list_routines(cfg: Any, slug: str) -> list[dict]:
             # Absent state (pre-first-probe) renders as no-observation-yet.
             spec = r.monitor or {}
             st = load_state(cfg, slug, r.id)
+            # T-0899: error state was invisible here — last_value silently
+            # held its last-good reading through an error streak, and
+            # consecutive_errors (the only signal a probe is blind) rendered
+            # nowhere. `broken` mirrors the exact bound `poll()` alerts at
+            # once (MONITOR_ERROR_BOUND, see the comment at its declaration
+            # above) but, unlike that one-time alert, stays true for as long
+            # as the routine actually is — a durable STATE signal in the
+            # list, not a repeated message to the stakeholder (project rule:
+            # only an EVENT metric may be loud; a red state metric that never
+            # resets gets muted, and a muted watchdog doesn't watch).
+            consecutive_errors = int(st.get("consecutive_errors") or 0)
             summary["monitor"] = {
                 "probe": spec.get("probe"),
                 "interval_s": spec.get("interval_s"),
@@ -776,7 +791,10 @@ def list_routines(cfg: Any, slug: str) -> list[dict]:
                 "threshold": spec.get("threshold"),
                 "on_breach": spec.get("on_breach"),
                 "last_value": st.get("last_value"),
+                "last_value_at": st.get("last_value_at"),
                 "last_probe_at": st.get("last_probe_at"),
+                "consecutive_errors": consecutive_errors,
+                "broken": consecutive_errors >= MONITOR_ERROR_BOUND,
                 "breach": bool(st.get("breach_first_seen")),
                 "last_fired_at": st.get("last_fired_at"),
             }
@@ -1060,6 +1078,7 @@ def _default_state() -> dict:
     return {
         "last_probe_at": None,
         "last_value": None,
+        "last_value_at": None,
         "breach_first_seen": None,
         "fired": False,
         "last_fired_at": None,

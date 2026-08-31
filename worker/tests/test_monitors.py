@@ -422,6 +422,34 @@ def test_poll_monitor_broken_alerts_once_at_bound():
     assert st["consecutive_errors"] == R.MONITOR_ERROR_BOUND + 1
 
 
+def test_poll_error_does_not_touch_last_value_or_its_timestamp():
+    """T-0899 DoD 2/4 (fail leg): the error branch returns before the
+    last_value assignment — a routine gone blind must keep showing its last
+    GOOD reading, not clobber it with error text, and last_value_at must not
+    advance either (it is the freshness signal for that reading)."""
+    trig = R.MonitorTrigger(_spec(threshold=10))
+    st: dict = {"last_value": 42, "last_value_at": R._iso(T0)}
+    ev = _poll(trig, T0 + timedelta(seconds=5), st, ok=False, error="timeout")
+    assert ev is None
+    assert st["last_value"] == 42
+    assert st["last_value_at"] == R._iso(T0)
+    assert st["consecutive_errors"] == 1
+    # last_probe_at DOES advance on every tick, including errors — it is
+    # not a usable staleness signal for last_value on its own.
+    assert st["last_probe_at"] == R._iso(T0 + timedelta(seconds=5))
+
+
+def test_poll_ok_stamps_last_value_at():
+    """T-0899 DoD 2 (pass leg): a healthy probe stamps last_value_at
+    alongside last_value, so its freshness can be told apart from a value
+    held stale through an error streak."""
+    trig = R.MonitorTrigger(_spec(threshold=10))
+    st: dict = {}
+    _poll(trig, T0, st, output="5")
+    assert st["last_value"] == 5
+    assert st["last_value_at"] == R._iso(T0)
+
+
 # --- Sidecar state io (atomic, corrupt = reseed-safe) -----------------------
 
 def test_state_roundtrip_and_location(mcfg):
@@ -1409,16 +1437,56 @@ def test_list_routines_monitor_columns_from_sidecar(mcfg, tmp_path):
     assert fresh["monitor"]["last_fired_at"] is None
     assert fresh["monitor"]["judge"] == "numeric_gt"
     assert fresh["monitor"]["interval_s"] == 5
+    # T-0899 (pass leg): a routine with zero probe errors carries no error
+    # signal at all — a healthy routine is not marked.
+    assert fresh["monitor"]["consecutive_errors"] == 0
+    assert fresh["monitor"]["broken"] is False
     assert "muted_until" not in fresh
 
     R.monitor_sweep(cfg, slug, now=T0)
     R.mute(cfg, slug, rid, duration_s=3600, reason="known flap", now=T0)
     listed = {r["id"]: r for r in R.list_routines(cfg, slug)}[rid]
     assert listed["monitor"]["last_value"] == 42
+    assert listed["monitor"]["last_value_at"] == R._iso(T0)
     assert listed["monitor"]["breach"] is True
     assert listed["monitor"]["last_fired_at"] == R._iso(T0)
     assert listed["muted_until"] == R._iso(T0 + timedelta(seconds=3600))
     assert listed["mute_reason"] == "known flap"
+
+
+def test_list_routines_surfaces_error_state_T0899(mcfg, tmp_path):
+    """T-0899 DoD 2/4 (fail leg): `bsq routine list`'s underlying dict must
+    make a blind probe visible without reading state json by hand — before
+    the bound, an error count; at/after MONITOR_ERROR_BOUND, `broken`."""
+    cfg, slug, _ = mcfg
+    metric = tmp_path / "metric.txt"
+    metric.write_text("5")
+    rid = _declare_file_monitor(cfg, slug, metric, threshold=10)
+
+    R.monitor_sweep(cfg, slug, now=T0)  # one good probe: last_value=5
+    metric.unlink()  # next probes fail to run -> error path
+    for i in range(1, R.MONITOR_ERROR_BOUND):
+        R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=5 * i))
+        row = {r["id"]: r for r in R.list_routines(cfg, slug)}[rid]["monitor"]
+        assert row["consecutive_errors"] == i
+        assert row["broken"] is False
+        # the stale last-good reading survives, unclobbered
+        assert row["last_value"] == 5
+        assert row["last_value_at"] == R._iso(T0)
+
+    R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=5 * R.MONITOR_ERROR_BOUND))
+    row = {r["id"]: r for r in R.list_routines(cfg, slug)}[rid]["monitor"]
+    assert row["consecutive_errors"] == R.MONITOR_ERROR_BOUND
+    assert row["broken"] is True
+    assert row["last_value"] == 5  # still preserved, still flagged stale
+
+    # recovers -> broken clears, error count resets, fresh value replaces it
+    metric.write_text("6")
+    R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=5 * (R.MONITOR_ERROR_BOUND + 1)))
+    row = {r["id"]: r for r in R.list_routines(cfg, slug)}[rid]["monitor"]
+    assert row["consecutive_errors"] == 0
+    assert row["broken"] is False
+    assert row["last_value"] == 6
 
 
 def test_list_routines_schedule_rows_unchanged(mcfg):

@@ -125,6 +125,9 @@ def test_registry_lists_only_allowed_actions():
         # read (which rung, should this session bud) and the one deliberate
         # spawn a session performs on the operator rung. Back `bsq bud`.
         "budding_decision", "bud_operator",
+        # T-0937: the operator SEAT — the ladder's OTHER move on that rung, a
+        # live root driving the board itself. Back `bsq operator seat`.
+        "operator_seat_claim", "operator_seat_release",
         # T-0184: per-session drift-check off-ramp (bsq drift on/off).
         "set_drift_paused",
         # T-0926 follow-up: per-session pin against every automatic action

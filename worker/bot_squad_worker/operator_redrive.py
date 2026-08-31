@@ -495,6 +495,10 @@ def bud_operator(cfg: Any, slug: str, *, requested_by: str = "") -> dict:
       * the spawn cooldown, shared with the re-drive through the same state
         file so the two paths cannot stampede each other.
 
+    T-0937 adds a third: the operator SEAT. A session holding it is handing the
+    wheel over, so the seat is released once the new operator exists; ANY OTHER
+    holder refuses the bud, same as a live operator does.
+
     What it deliberately does NOT re-check is the load threshold: a session
     asking for this has read :func:`dispatch.decide_topology` (via ``bsq bud``)
     and decided — triggers suggest, sessions decide (T-0929). Returns
@@ -518,6 +522,23 @@ def bud_operator(cfg: Any, slug: str, *, requested_by: str = "") -> dict:
                 "reason": f"operator {live[0]} is already driving this board "
                           f"— exactly one per project (T-0472); route through it"}
 
+    # T-0937: the seat is the OTHER way this board can already have a driver. A
+    # session budding an operator while it itself holds the seat is not blocked
+    # — that IS the L1→L2 handover, «выделение оператора», and it is the only
+    # move that legitimately ends a root's own drive — so it releases the seat
+    # first, in the same call, rather than leaving a claim behind that would
+    # then contradict the operator it just spawned. Somebody ELSE holding the
+    # seat is refused for exactly the reason a live operator is: two dispatchers
+    # double-drive the backlog.
+    from bot_squad_worker import operator_seat as _seat
+    seat = _seat.seat_holder(cfg, slug)
+    if seat is not None and seat["sid"] != (requested_by or ""):
+        return {"ok": True, "spawned": False, "operator": None,
+                "reason": f"{seat['sid']} holds the operator seat (via "
+                          f"{seat['kind']}) and is driving this board directly "
+                          f"— route through it, or have it hand the seat over "
+                          f"(`bsq operator seat release`)"}
+
     state = _load_state(cfg, slug)
     last_spawn = float(state.get("last_spawn_at", 0) or 0)
     if time.time() - last_spawn < _SPAWN_COOLDOWN_SEC:
@@ -530,6 +551,17 @@ def bud_operator(cfg: Any, slug: str, *, requested_by: str = "") -> dict:
         return {"ok": True, "spawned": False, "operator": None,
                 "reason": "spawn deferred under capacity/quota backpressure — "
                           "retry when a session slot frees"}
+
+    # The handover, completed: the seat is dropped only once the operator that
+    # replaces it actually exists. Releasing before the spawn would open a
+    # window in which the 60s tick could mint a SECOND operator behind this one.
+    # Best-effort — a failed release must not un-spawn a live operator; the
+    # claim is inert anyway once `live_operator_sids` sees the new session.
+    if seat is not None:
+        try:
+            _seat.release(cfg, slug, seat["sid"], force=True)
+        except Exception:  # noqa: BLE001
+            log.exception("operator_redrive: seat release failed for %s", slug)
 
     state["last_spawn_at"] = time.time()
     _save_state(cfg, slug, state)
@@ -545,7 +577,7 @@ def tick(cfg: Any, slug: str) -> dict:
     ``{action, ...}`` describing what the pass decided (for tests + the journal).
 
     actions: ``disabled`` | ``paused`` | ``idle-empty-backlog`` | ``continue`` |
-    ``direct-tier`` | ``cooldown`` | ``deferred`` | ``respawned``.
+    ``seat-held`` | ``direct-tier`` | ``cooldown`` | ``deferred`` | ``respawned``.
     """
     if not _enabled():
         return {"action": "disabled"}
@@ -567,6 +599,26 @@ def tick(cfg: Any, slug: str) -> dict:
     live = _dispatch.live_operator_sids(cfg, slug)
     if live:
         return {"action": "continue", "operator": live[0], "pending": pending}
+
+    # T-0937 — the SEAT gate. Everything below asks "does the load justify an
+    # operator TIER"; this asks the prior question, "does the board already have
+    # a DRIVER". It was answered by `live_operator_sids` alone, which sees only
+    # sessions whose ROLE is operator — so a root user-conversation session that
+    # had just set the drive mode and was actively clearing the board was
+    # invisible here, and the tick minted a second dispatcher 25s behind it
+    # («ты должен стать оператором одновременно с юзер-сессией»). The seat is
+    # the root's claim, and it outranks the tier: while a live root wears the
+    # operator hat there is nothing for a spawned operator to do but double-drive.
+    #
+    # Ordered BEFORE decide_topology deliberately: the seat holds even at
+    # operator tier (that is the whole point — parallelism WITHOUT a separate
+    # operator), and reading it here keeps the journal action distinguishable
+    # from T-0855's load-based `direct-tier`. `seat_holder` never raises and
+    # degrades to "vacant", i.e. to the behaviour below.
+    from bot_squad_worker import operator_seat as _seat
+    seat = _seat.seat_holder(cfg, slug)
+    if seat is not None:
+        return {"action": "seat-held", "pending": pending, "seat": seat}
 
     # T-0855 — the SCALING-LADDER gate, and the reason this ticket is code and
     # not a role-doc edit. Everything above says "there is pending work and no

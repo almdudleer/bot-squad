@@ -160,6 +160,15 @@ operator is respawned. His reason, verbatim:
 
 What this changes for you:
 
+- **A live ROOT session can be holding the operator SEAT (T-0937)** — driving
+  this board itself while staying a `user-conversation` session, because the
+  stakeholder asked for exactly that («ты должен стать оператором одновременно
+  с юзер-сессией»). `bsq operator status` reports it as `SEAT HELD` and
+  `bsq route` names the holder. Treat it the way you treat a peer operator:
+  one dispatcher per board (T-0472), so route through it rather than taking the
+  board back. It hands the wheel over deliberately (`bsq bud operator`), and
+  the seat vacates by itself if that session dies — which is when the re-drive
+  spawns you.
 - **A project running without an operator is not a fault.** Don't "fix" it,
   don't page him about it, and don't spawn yourself back in on a quiet board.
 - **You are still spawned the moment the load justifies it** — the tier

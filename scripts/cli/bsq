@@ -3009,9 +3009,19 @@ def cmd_operator_status(args) -> None:
         print(f"operator re-drive: ⏸ PAUSED for {slug} ({pending} pending)")
         return
     live = res.get("live_operators") or []
+    seat = (res.get("operator_seat") or {}).get("holder")
     if live:
         print(f"operator re-drive: ▶ DRIVING for {slug} "
               f"(operator {live[0]}, {pending} pending)")
+    elif res.get("state") == "seat-held":
+        # T-0937: no operator SESSION, and not because nothing is happening —
+        # a root session holds the seat and is driving the board itself. This
+        # holds at any tier, which is what separates it from `direct-tier`.
+        print(f"operator re-drive: 🪑 SEAT HELD for {slug} — no operator "
+              f"by design ({pending} pending)")
+        print(f"  driving           : {_seat_line(seat)}")
+        print("  `bsq operator seat status` for the claim, `bsq route` for "
+              "the load")
     elif res.get("state") == "direct-tier":
         # T-0855: no operator ON PURPOSE — small flow, a user session drives the
         # devs. Printing this as "pending re-drive" would read as a stuck project.
@@ -3025,6 +3035,94 @@ def cmd_operator_status(args) -> None:
               f"the thresholds")
     else:
         print(f"operator re-drive: idle for {slug} (empty backlog)")
+
+
+# --------------------------------------------------------------------------
+# T-0937: the operator SEAT — who is DRIVING this board, whatever their role.
+# `live_operators` only ever showed sessions whose ROLE is operator, so a root
+# user-conversation session that had claimed the drive was invisible to every
+# gate and the 60s re-drive minted a second dispatcher behind it. The seat is
+# that root's claim, and it is a HAT rather than a morph: the session keeps its
+# own role, its TG attendance and its routing («ты должен стать оператором
+# одновременно с юзер-сессией»). Read-and-write; the worker owns the rule.
+# --------------------------------------------------------------------------
+
+def _seat_line(seat: dict | None) -> str:
+    """One line describing a seat record from `operator_seat.seat_holder`."""
+    if not seat:
+        return "(vacant)"
+    how = {"claim": "claimed", "drive": "drive mode"}.get(seat.get("kind"), seat.get("kind"))
+    since = f", since {seat['since']}" if seat.get("since") else ""
+    return f"{seat.get('sid')}  [{seat.get('role')} session, via {how}{since}]"
+
+
+def cmd_operator_seat_status(args) -> None:
+    slug = resolve_slug()
+    res = post("operator_status", {"slug": slug})
+    seat = res.get("operator_seat") or {}
+    if getattr(args, "json", False):
+        print(json.dumps(seat, indent=2, sort_keys=True))
+        return
+    if seat.get("enabled") is False:
+        print(f"operator seat: DISABLED for this worker "
+              f"(BOT_SQUAD_OPERATOR_SEAT=0) — the re-drive ignores every claim")
+        return
+    # An unreadable seat is NOT an empty one: printing them the same way is the
+    # silent-None failure the drive-mode design (D-0069) names as its worst case.
+    if seat.get("error"):
+        print(f"operator seat: UNREADABLE for {slug} — {seat['error']}")
+        print("  the re-drive treats this as VACANT and will mint an operator")
+        return
+    holder = seat.get("holder")
+    print(f"operator seat for {slug}: "
+          + ("HELD by " + _seat_line(holder) if holder else "VACANT"))
+    if holder and holder.get("source"):
+        print(f"  source            : {holder['source']}")
+    live = res.get("live_operators") or []
+    if live:
+        print(f"  live operator     : {live[0]}   (it drives the board by role)")
+    for why in (seat.get("rejected") or []):
+        # WHY a candidate is not the holder — a claim by a session that has since
+        # died reads identically to no claim at all unless this is printed.
+        print(f"  not holding       : {why}")
+    if not holder and not live:
+        print("  → `bsq operator seat claim` to drive the board yourself, or "
+              "let the 60s re-drive mint an operator")
+
+
+def cmd_operator_seat_claim(args) -> None:
+    slug = resolve_slug()
+    sid = require_sid(getattr(args, "sid", None))
+    params = {"slug": slug, "sid": sid}
+    if getattr(args, "source_text", None):
+        params["source"] = args.source_text
+    if getattr(args, "force", False):
+        params["force"] = True
+    res = post("operator_seat_claim", params)
+    seat = res.get("seat") or {}
+    print(f"🪑 {sid} holds the operator seat for {slug}"
+          + (f" (taken over from {res['replaced']})" if res.get("replaced") else ""))
+    print(f"   via {seat.get('kind')}; your own role stays {seat.get('role')} "
+          f"— this is a HAT, not a morph")
+    print("   the 60s re-drive will not mint an operator while you live; "
+          "`bsq pickup` is the queue you are now driving")
+    print("   hand it over with `bsq bud operator`, or drop it with "
+          "`bsq operator seat release`")
+
+
+def cmd_operator_seat_release(args) -> None:
+    slug = resolve_slug()
+    sid = require_sid(getattr(args, "sid", None))
+    params = {"slug": slug, "sid": sid}
+    if getattr(args, "force", False):
+        params["force"] = True
+    res = post("operator_seat_release", params)
+    if not res.get("released"):
+        print(f"operator seat for {slug} was already vacant (no-op)")
+        return
+    was = res.get("was") or {}
+    print(f"operator seat for {slug} released (was {was.get('sid')}) — the "
+          f"re-drive may mint an operator again")
 
 
 # --------------------------------------------------------------------------
@@ -3054,6 +3152,10 @@ def cmd_route(args) -> None:
     print(f"  live dev sessions : {c.get('live_devs')}  "
           f"(direct while < {t.get('max_devs')})")
     print(f"  live operator     : {ops[0] if ops else '(none)'}")
+    # T-0937: the seat is the reason `tier: operator` can coexist with
+    # `route: direct` — the load justifies an operator, and the board already
+    # has a driver. Showing only the verdict would hide the first half.
+    print(f"  operator seat     : {_seat_line(res.get('operator_seat'))}")
     print(f"  attending user s. : {ucs[0] if ucs else '(none)'}")
     # Reported because it drifts (a dev that died leaves the label behind) and
     # is the number a reader would otherwise assume this decision used.
@@ -3100,6 +3202,10 @@ def cmd_bud_status(args) -> None:
           + (f"   {', '.join(obs.get('bud_dev_sids') or [])}"
              if obs.get("bud_dev_sids") else ""))
     print(f"  live operator     : {(obs.get('operator_sids') or ['(none)'])[0]}")
+    # T-0937: the L2 rung has two shapes — a separate operator process, or the
+    # root wearing the hat. Showing only the first would keep the ladder
+    # reading as "no dispatcher" on a board that has one.
+    print(f"  operator seat     : {_seat_line(obs.get('operator_seat'))}")
     print(f"  root session(s)   : {', '.join(obs.get('root_sids') or []) or '(none)'}")
     print(f"  queued requests   : {c.get('queued_requests')}  "
           f"(bud a dev at >= {t.get('request_pressure')} while you hold a task)"
@@ -7521,6 +7627,28 @@ def build_parser() -> argparse.ArgumentParser:
     opr.set_defaults(func=cmd_operator_resume)
     ops = op_sub.add_parser("status", help="show whether re-drive is paused vs driving")
     ops.set_defaults(func=cmd_operator_status)
+    # T-0937: the seat — a live ROOT session drives the board itself and the
+    # re-drive honours the claim instead of minting a second dispatcher.
+    seat_p = op_sub.add_parser(
+        "seat",
+        help="operator SEAT: claim/release/status — drive the board yourself "
+             "while staying a user-conversation session (T-0937)")
+    seat_sub = seat_p.add_subparsers(dest="seat_sub", required=True)
+    sts = seat_sub.add_parser("status", help="who holds the operator seat")
+    sts.add_argument("--json", action="store_true", help="raw seat record")
+    sts.set_defaults(func=cmd_operator_seat_status)
+    stc = seat_sub.add_parser("claim", help="take the seat — you drive this board")
+    stc.add_argument("--sid", help="override this session's SID")
+    stc.add_argument("--source-text", dest="source_text",
+                     help="the words that asked for it, stored verbatim")
+    stc.add_argument("--force", action="store_true",
+                     help="take the seat over from another live root session")
+    stc.set_defaults(func=cmd_operator_seat_claim)
+    str_ = seat_sub.add_parser("release", help="give the seat up")
+    str_.add_argument("--sid", help="override this session's SID")
+    str_.add_argument("--force", action="store_true",
+                      help="release someone else's claim")
+    str_.set_defaults(func=cmd_operator_seat_release)
 
     # route (T-0855) — WHO dispatches: you (a user-conversation session driving
     # a dev directly, when the task flow is small) or the operator. Not a

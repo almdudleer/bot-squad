@@ -824,7 +824,7 @@ def _relaunch(cfg: Any, slug: str, rec: dict, make_prompt,
     window = (_clean(meta.get("window")) or _clean(rec.get("window"))
               or f"recover-{assignment_id or role or 'session'}")
     model, effort, model_reason = _inherited_model_choice(meta)
-    sessions.spawn(
+    res = sessions.spawn(
         cfg, slug, window, make_prompt(role, task_id, assignment_id),
         task_id=task_id,
         initiative=_clean(meta.get("initiative")),
@@ -836,6 +836,52 @@ def _relaunch(cfg: Any, slug: str, rec: dict, make_prompt,
         model_reason=model_reason,
         dispatched_by=dispatched_by,
     )
+    _carry_role_stamp(cfg, slug, meta, (res or {}).get("sid"))
+
+
+def _carry_role_stamp(cfg: Any, slug: str, meta: dict, new_sid: str | None) -> None:
+    """T-0937: carry a MORPHED role onto the successor's md.
+
+    A morph (T-0509/T-0932) stamps ``role`` WITHOUT renaming the tmux window,
+    because renaming would rotate the peer-bus SID. The successor's role is
+    derived from that same unchanged window, and ``spawn`` has no ``role``
+    parameter to override it — so a session that morphed to ``operator``
+    relaunches as whatever its ORIGINAL window says. Measured: a morphed
+    operator on a ``gu_*-user-conversation`` window comes back as
+    ``user-conversation``, ``dispatch.live_operator_sids`` stops seeing it, and
+    the 60s re-drive mints a SECOND operator behind the one still working —
+    the T-0523 duplicate-operator failure, from the other direction.
+
+    This is the same shape as the T-0678 model carry-forward two lines above,
+    and for the same reason: a full relaunch mints a BRAND-NEW SID, so nothing
+    the predecessor stamped on its own md survives unless it is carried.
+
+    It carries an identity, it does not create one — no new operator exists
+    afterwards that did not exist before — so it deliberately does NOT go
+    through ``morph_session``'s singleton guard, which would refuse precisely
+    when the predecessor's md is still on the roster.
+
+    Best-effort: a failure here leaves the successor with its derived role,
+    i.e. the behaviour before this existed. It must never un-launch a session
+    that is already running.
+    """
+    from bot_squad_worker import sessions
+
+    stamped = (meta.get("role") or "").strip()
+    if not stamped or stamped == "~" or not new_sid:
+        return
+    try:
+        path = sessions._session_file(cfg.data_dir, slug, new_sid)
+        succ = sessions._read_session_metadata(path)
+        if succ is None or sessions._role_of(succ) == stamped:
+            return
+        succ["role"] = stamped
+        sessions._write_session_metadata(path, succ, atomic=True)
+        log.info("autocompact: carried role %s onto relaunched %s (window %s "
+                 "derives %s)", stamped, new_sid, succ.get("window"),
+                 sessions._role_of({k: v for k, v in succ.items() if k != "role"}))
+    except Exception:  # noqa: BLE001 — never fail a completed relaunch
+        log.exception("autocompact: could not carry role %s onto %s", stamped, new_sid)
 
 
 def _relaunch_from_ticket(cfg: Any, slug: str, rec: dict, task_md: str | None) -> None:

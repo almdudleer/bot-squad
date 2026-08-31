@@ -93,19 +93,63 @@ def exit_grace_sec() -> int:
 
 # --- pure decision helpers (unit-testable, no I/O) --------------------------
 
-def work_done(role: str, task_id: Any, task_status: str, pending_backlog: int) -> bool:
+def work_done(role: str, task_id: Any, task_status: str, pending_backlog: int,
+              *, initiative_pending: int | None = None) -> bool:
     """True when the session's assignment is complete — role-agnostic policy, the
     done-signal differing ONLY by role.
 
     * operator: backlog empty (``pending_backlog == 0``).
     * task-bound role (has a real ``task_id``): bound task is terminal.
+    * team-lead bound only to an initiative (no primary task_id): the
+      initiative's own backlog is empty (``initiative_pending == 0`` — T-0930,
+      "TL with nothing open"). ``initiative_pending=None`` means "not
+      computed" (no initiative to scope by), not "zero" — stays False.
     * otherwise (user-conversation / role-only): no auto-done signal → False.
     """
     if role == "operator":
         return pending_backlog == 0
     if task_id and task_id != "~":
         return task_status in DONE_STATUSES
+    if role == "teamlead" and initiative_pending is not None:
+        return initiative_pending == 0
     return False
+
+
+def count_pending_initiative_tasks(cfg: Any, slug: str, initiative: Any) -> int:
+    """T-0930: the task-less TL's "nothing open" done-signal — the
+    initiative-scoped analogue of ``operator_redrive.count_pending_backlog``'s
+    project-wide count. Same terminal-status criterion (``closed`` only — a
+    ``totest`` task is still the TL's to review/close, same reasoning
+    ``operator_redrive`` already uses for the operator's own empty-backlog
+    signal)."""
+    from bot_squad_worker import frontmatter as _fm
+    from bot_squad_worker.actions import normalize_id
+
+    target = normalize_id(str(initiative or "").strip())
+    if not target or target == "~":
+        return 0
+    backlog = cfg.data_dir / slug / "backlog"
+    if not backlog.exists():
+        return 0
+    n = 0
+    for md in sorted(backlog.glob("*.md")):
+        try:
+            parsed = _fm.parse_or_none(md.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if not parsed:
+            continue
+        meta, _body = parsed
+        meta = meta or {}
+        task_init = normalize_id(str(meta.get("initiative") or "").strip())
+        if task_init != target:
+            continue
+        if str(meta.get("archived", "")).strip().lower() in ("true", "yes", "1", "on"):
+            continue
+        if str(meta.get("status", "")).strip().lower() == "closed":
+            continue
+        n += 1
+    return n
 
 
 def exit_due(idle_age: float | None, grace: int) -> bool:
@@ -267,13 +311,19 @@ def maybe_exit(cfg: Any, slug: str, row: dict, now: float, user_home: str) -> bo
     # Done-signal — role selects which trigger; compute only the one we need.
     pending = 0
     task_status = ""
+    initiative_pending = None
     if role == "operator":
         from bot_squad_worker import operator_redrive
         pending = operator_redrive.count_pending_backlog(cfg, slug)
     elif task_id and task_id != "~":
         from bot_squad_worker import recovery
         task_status = recovery.read_task_status(cfg, slug, task_id)
-    if not work_done(role, task_id, task_status, pending):
+    elif role == "teamlead":
+        initiative = row.get("initiative")
+        if initiative and initiative != "~":
+            initiative_pending = count_pending_initiative_tasks(cfg, slug, initiative)
+    if not work_done(role, task_id, task_status, pending,
+                     initiative_pending=initiative_pending):
         return False
 
     # GRACE: only exit a session that has actually gone quiet (finished its own

@@ -82,6 +82,97 @@ def test_work_done_dev_not_special_cased_among_task_bound_roles():
             assert GE.work_done(other, "T-0477", st, pending_backlog=7) is dev
 
 
+# --- T-0930: task-less TL — "nothing open" in its initiative --------------
+
+def test_work_done_teamlead_no_task_keyed_on_initiative_pending():
+    assert GE.work_done("teamlead", None, "", pending_backlog=0,
+                        initiative_pending=0) is True
+    assert GE.work_done("teamlead", None, "", pending_backlog=0,
+                        initiative_pending=3) is False
+
+
+def test_work_done_teamlead_initiative_pending_none_means_not_computed():
+    # None (no initiative to scope by) is NOT the same as zero — stays False,
+    # same "no auto-done signal" posture as any other role-only session.
+    assert GE.work_done("teamlead", None, "", pending_backlog=0,
+                        initiative_pending=None) is False
+
+
+def test_work_done_teamlead_with_a_real_task_ignores_initiative_pending():
+    # A task-bound TL still rides the generic task-bound path — initiative
+    # scoping only kicks in when there is NO primary task_id.
+    assert GE.work_done("teamlead", "T-0042", "totest", pending_backlog=0,
+                        initiative_pending=5) is True
+    assert GE.work_done("teamlead", "T-0042", "open", pending_backlog=0,
+                        initiative_pending=0) is False
+
+
+def test_count_pending_initiative_tasks(tmp_path):
+    cfg, data_dir = _make_cfg(tmp_path, sid="S-x", window="demo", task_id=None)
+    backlog = data_dir / "bot-squad" / "backlog"
+    backlog.mkdir(parents=True, exist_ok=True)
+    (backlog / "T-0001-a.md").write_text(
+        "---\nid: T-0001\ntitle: A\nstatus: open\ninitiative: my-init.md\n---\n\nx\n")
+    (backlog / "T-0002-b.md").write_text(
+        "---\nid: T-0002\ntitle: B\nstatus: totest\ninitiative: my-init\n---\n\nx\n")
+    (backlog / "T-0003-c.md").write_text(
+        "---\nid: T-0003\ntitle: C\nstatus: closed\ninitiative: my-init.md\n---\n\nx\n")
+    (backlog / "T-0004-d.md").write_text(
+        "---\nid: T-0004\ntitle: D\nstatus: open\ninitiative: other-init.md\n---\n\nx\n")
+    (backlog / "T-0005-e.md").write_text(
+        "---\nid: T-0005\ntitle: E\nstatus: open\ninitiative: my-init.md\n"
+        "archived: true\n---\n\nx\n")
+    # T-0001 (open) and T-0002 (totest, bare-stem match) count; T-0003
+    # (closed), T-0004 (other initiative), T-0005 (archived) don't.
+    assert GE.count_pending_initiative_tasks(cfg, "bot-squad", "my-init.md") == 2
+    assert GE.count_pending_initiative_tasks(cfg, "bot-squad", "my-init") == 2
+    assert GE.count_pending_initiative_tasks(cfg, "bot-squad", "other-init") == 1
+    assert GE.count_pending_initiative_tasks(cfg, "bot-squad", None) == 0
+    assert GE.count_pending_initiative_tasks(cfg, "bot-squad", "~") == 0
+    assert GE.count_pending_initiative_tasks(cfg, "bot-squad", "no-such-init") == 0
+
+
+def test_taskless_tl_exits_when_initiative_backlog_is_empty(tmp_path, seams):
+    sid = "S-almdudleer-bot-squad-tl-p1"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="tl", task_id=None,
+                          extra_md={"role": "teamlead"})
+    backlog = data / "bot-squad" / "backlog"
+    backlog.mkdir(parents=True, exist_ok=True)
+    (backlog / "T-0001-a.md").write_text(
+        "---\nid: T-0001\ntitle: A\nstatus: closed\ninitiative: my-init.md\n---\n\nx\n")
+    row = _row(sid, role="teamlead", cwd_repo=data.parent / "repo",
+              task_id=None, initiative="my-init.md")
+    assert GE.maybe_exit(cfg, "bot-squad", row, now=time.time(),
+                         user_home="/home/x") is True
+    assert seams["calls"]["suspend"] == [sid]
+
+
+def test_taskless_tl_not_exited_when_initiative_has_open_work(tmp_path, seams):
+    sid = "S-almdudleer-bot-squad-tl-p1"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="tl", task_id=None,
+                          extra_md={"role": "teamlead"})
+    backlog = data / "bot-squad" / "backlog"
+    backlog.mkdir(parents=True, exist_ok=True)
+    (backlog / "T-0001-a.md").write_text(
+        "---\nid: T-0001\ntitle: A\nstatus: open\ninitiative: my-init.md\n---\n\nx\n")
+    row = _row(sid, role="teamlead", cwd_repo=data.parent / "repo",
+              task_id=None, initiative="my-init.md")
+    assert GE.maybe_exit(cfg, "bot-squad", row, now=time.time(),
+                         user_home="/home/x") is False
+    assert seams["calls"]["suspend"] == []
+
+
+def test_taskless_tl_with_no_initiative_never_exits(tmp_path, seams):
+    sid = "S-almdudleer-bot-squad-tl-p1"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="tl", task_id=None,
+                          extra_md={"role": "teamlead"})
+    row = _row(sid, role="teamlead", cwd_repo=data.parent / "repo",
+              task_id=None, initiative=None)
+    assert GE.maybe_exit(cfg, "bot-squad", row, now=time.time(),
+                         user_home="/home/x") is False
+    assert seams["calls"]["suspend"] == []
+
+
 def test_exit_due_grace():
     assert GE.exit_due(180, 180) is True
     assert GE.exit_due(181, 180) is True
@@ -142,10 +233,10 @@ def _write_task(data_dir: Path, task_id: str, status: str, *, title="Demo task")
 
 
 def _row(sid: str, *, role="dev", window="demo", task_id="T-0042",
-         cwd_repo: Path, status="active"):
+         cwd_repo: Path, status="active", initiative=None):
     return {"sid": sid, "status": status, "window": window, "task_id": task_id,
             "role": role, "cwd": str(cwd_repo), "claude_uuid": "uuid-" + sid,
-            "linux_user": ""}
+            "linux_user": "", "initiative": initiative}
 
 
 @pytest.fixture

@@ -24,6 +24,14 @@ under load and slides back down when the load drops:
               operator instead of to devs ("превращение себя в юзер-сессию
               оператора").
 
+    ★ T-0937 — the L2 rung has TWO moves, not one. The root can also wear the
+      operator HAT itself (``operator_seat``), keeping its own role and driving
+      the board directly, and that is the cheaper answer whenever the user
+      queue is quiet: «от меня сейчас не так много запросов, но запрос на
+      параллелизм». Which move :func:`decide_budding` suggests is decided by
+      the USER-request pressure this module already measures, not by the
+      orchestration load alone — see the split there.
+
 WHAT IS NEW HERE, AND WHAT IS NOT. Almost every moving part already existed;
 the gap this module fills is COMPOSITION + TRIGGERS.
 
@@ -97,6 +105,9 @@ LEVEL_ORCH_SPLIT = "L2-orchestration-split"
 HOLD = "hold"
 BUD_DEV = "bud_dev"
 BUD_OPERATOR = "bud_operator"
+#: T-0937 — the L1→L2 rung's OTHER move: wear the operator hat yourself instead
+#: of paying for a second process. See the split in :func:`decide_budding`.
+TAKE_SEAT = "take_seat"
 ABSORB = "absorb"
 
 
@@ -251,8 +262,8 @@ def is_root_session(sid: str, meta: dict | None = None) -> bool:
 def observe(cfg: Any, slug: str) -> dict:
     """The ladder's current rung + the two pressures that move it. Pure read.
 
-    Returns ``{ok, level, counts, thresholds, topology, queued_requests,
-    held_task_ids, root_sids, signals}``.
+    Returns ``{ok, level, counts, thresholds, topology, operator_seat,
+    queued_requests, held_task_ids, root_sids, signals}``.
     """
     from bot_squad_worker import dispatch as _dispatch
     from bot_squad_worker import sessions as S
@@ -295,6 +306,12 @@ def observe(cfg: Any, slug: str) -> dict:
         topo_error = None
 
     operators = (topo or {}).get("live_operator_sids") or []
+    # T-0937: the OTHER kind of dispatcher — a live root wearing the operator
+    # hat. Read directly rather than off `topo`, so a topology error (which is
+    # reported, not raised) cannot make a held seat look vacant and put the
+    # ladder back to suggesting a second process.
+    from bot_squad_worker import operator_seat as _oseat
+    seat_rec = _oseat.seat_holder(cfg, slug)
     if operators:
         level = LEVEL_ORCH_SPLIT
     elif devs:
@@ -308,6 +325,7 @@ def observe(cfg: Any, slug: str) -> dict:
         "counts": {
             "bud_devs": len(devs),
             "live_operators": len(operators),
+            "seat_held": 1 if seat_rec else 0,
             "root_sessions": len(roots),
             "queued_requests": len(queued),
             "held_tasks": len(held),
@@ -318,6 +336,7 @@ def observe(cfg: Any, slug: str) -> dict:
         },
         "topology": topo,
         "topology_error": topo_error,
+        "operator_seat": seat_rec,      # T-0937; None = vacant
         "queued_requests": queued,
         "held_task_ids": sorted(held),
         "root_sids": roots,
@@ -330,8 +349,9 @@ def decide_budding(cfg: Any, slug: str, sid: str | None = None) -> dict:
     """Should ``sid`` bud right now — and into what? Advisory, pure read.
 
     Returns ``{ok, sid, level, verdict, task_id, command, reason, observation}``
-    where ``verdict`` ∈ ``hold`` | ``bud_dev`` | ``bud_operator`` | ``absorb``
-    and ``command`` is the exact ``bsq`` verb that performs it (empty on hold).
+    where ``verdict`` ∈ ``hold`` | ``bud_dev`` | ``bud_operator`` |
+    ``take_seat`` | ``absorb`` and ``command`` is the exact ``bsq`` verb that
+    performs it (empty on hold).
 
     ``sid=None`` answers for the project's root session when there is exactly
     one, so the scheduler and ``bsq bud`` ask the same question.
@@ -367,20 +387,72 @@ def decide_budding(cfg: Any, slug: str, sid: str | None = None) -> dict:
     # is drowning in orchestration should not also be handed a task.
     if topo.get("tier") == "operator" and not obs["operator_sids"]:
         if is_root_session(sid, meta) or role == "user-conversation":
+            load = (
+                f"{topo.get('counts', {}).get('live_devs')} live dev(s), "
+                f"{topo.get('counts', {}).get('tasks_in_flight')} task(s) in "
+                f"flight; ceilings {topo.get('thresholds', {}).get('max_devs')}"
+                f"/{topo.get('thresholds', {}).get('max_tasks')}"
+            )
+            # T-0937 — WHICH move, and this split IS the stakeholder's own
+            # correction. He interrupted a `bsq bud operator` call with «от меня
+            # сейчас не так много запросов, но запрос на параллелизм, так что ты
+            # должен стать оператором одновременно с юзер-сессией», then named
+            # the reflex itself as the thing to introspect on: «ты подумал что
+            # тебе надо поставить отдельного оператора». So a rung that answers
+            # heavy orchestration with "spawn a process" REGARDLESS of whether
+            # the root has anything else to do keeps reproducing that reflex.
+            #
+            # The load above says the board needs a dispatcher. What decides
+            # WHICH dispatcher is the OTHER pressure this module already
+            # measures — how much the user is asking of you:
+            #   * user queue quiet  -> take the seat. You are free to drive; a
+            #     second process buys nothing and costs a session.
+            #   * user queue deep   -> bud. You cannot both attend a queue at
+            #     the pressure threshold and orchestrate the board.
+            seat_holder = obs.get("operator_seat")
+            if seat_holder and seat_holder.get("sid") == sid:
+                return _hold(sid, obs,
+                             f"you already hold the operator seat ({load}) — "
+                             f"you ARE the dispatcher on this board. Spawn and "
+                             f"steer devs directly (`bsq spawn`); `bsq bud "
+                             f"operator` only if you want to hand the wheel over.")
+            if seat_holder:
+                return _hold(sid, obs,
+                             f"{seat_holder['sid']} holds the operator seat and "
+                             f"is driving this board ({load}) — one dispatcher "
+                             f"per board (T-0472). Route through it.")
+            if pressure < threshold:
+                return {
+                    "ok": True, "sid": sid, "level": obs["level"],
+                    "verdict": TAKE_SEAT, "task_id": None,
+                    "command": "bsq operator seat claim",
+                    "reason": (
+                        f"orchestration load has passed the direct-drive "
+                        f"ceiling ({load}) and no operator is live — but only "
+                        f"{pressure} user request(s) are queued, under the "
+                        f"pressure threshold of {threshold}. Take the operator "
+                        f"SEAT and keep driving the board yourself instead of "
+                        f"paying for a second process: you stay a "
+                        f"user-conversation session (it is a hat, not a morph) "
+                        f"and the 60s re-drive mints no operator while you "
+                        f"live. `bsq bud operator` remains the move if you want "
+                        f"a separate process after all."
+                    ),
+                    "observation": obs,
+                }
             return {
                 "ok": True, "sid": sid, "level": obs["level"],
                 "verdict": BUD_OPERATOR, "task_id": None,
                 "command": "bsq bud operator",
                 "reason": (
                     f"orchestration load has passed the direct-drive ceiling "
-                    f"({topo.get('counts', {}).get('live_devs')} live dev(s), "
-                    f"{topo.get('counts', {}).get('tasks_in_flight')} task(s) in "
-                    f"flight; ceilings {topo.get('thresholds', {}).get('max_devs')}"
-                    f"/{topo.get('thresholds', {}).get('max_tasks')}) and no "
-                    f"operator is live — bud one off and stay user-facing. "
-                    f"(The 60s re-drive would also spawn one; running it "
-                    f"yourself is the deliberate, immediate form and reads the "
-                    f"SAME thresholds.)"
+                    f"({load}) and no operator is live, AND {pressure} user "
+                    f"request(s) are queued at or over the pressure threshold "
+                    f"of {threshold} — you cannot attend that queue and "
+                    f"orchestrate the board at once. Bud one off and stay "
+                    f"user-facing. (The 60s re-drive would also spawn one; "
+                    f"running it yourself is the deliberate, immediate form "
+                    f"and reads the SAME thresholds.)"
                 ),
                 "observation": obs,
             }

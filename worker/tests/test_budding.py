@@ -236,10 +236,18 @@ def test_pressure_states_track_the_t0931_state_ssot(tmp_path):
 
 # --- L1 -> L2: the operator rung -------------------------------------------
 
-def test_orchestration_load_suggests_budding_an_operator(tmp_path, monkeypatch):
+def test_orchestration_load_with_a_quiet_user_queue_suggests_the_seat(
+        tmp_path, monkeypatch):
     """The trigger IS T-0855's verdict — not a second threshold. Push the
     direct-dispatch ceiling down to 1 and the same read that gates the
-    scheduler's re-drive now tells the root to bud an operator."""
+    scheduler's re-drive fires the L1→L2 rung.
+
+    T-0937 changed WHICH move it names. The board needs a dispatcher; with the
+    user queue quiet the root is free to be one, so a second process buys
+    nothing — «от меня сейчас не так много запросов, но запрос на
+    параллелизм». It was this branch answering "spawn an operator"
+    unconditionally that produced the reflex he asked us to introspect on.
+    """
     from bot_squad_worker import dispatch
 
     cfg = _make_cfg(tmp_path)
@@ -250,9 +258,77 @@ def test_orchestration_load_suggests_budding_an_operator(tmp_path, monkeypatch):
 
     d = budding.decide_budding(cfg, "test-project", ROOT)
 
+    assert d["verdict"] == budding.TAKE_SEAT
+    assert d["command"] == "bsq operator seat claim"
+    assert d["observation"]["topology"]["tier"] == "operator"
+    # The bud is still named — the seat is the default, not the only option.
+    assert "bsq bud operator" in d["reason"]
+
+
+def test_orchestration_load_with_a_deep_user_queue_still_suggests_the_bud(
+        tmp_path, monkeypatch):
+    """CONTROL for the split above, and the case the seat does NOT cover: a
+    root at the request-pressure threshold cannot both attend that queue and
+    orchestrate the board, so the second process is worth paying for."""
+    from bot_squad_worker import dispatch
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(dispatch, "direct_max_devs", lambda: 1)
+    monkeypatch.setattr(budding, "request_pressure_threshold", lambda: 2)
+    _task(cfg, "T-0001", "in_progress")
+    _task(cfg, "T-0002", "open")
+    _task(cfg, "T-0003", "open")
+    _root(cfg)
+    _session(cfg, "S-u-d1-dev-p1", window="d1-dev", task_id="T-0001")
+
+    d = budding.decide_budding(cfg, "test-project", ROOT)
+
     assert d["verdict"] == budding.BUD_OPERATOR
     assert d["command"] == "bsq bud operator"
-    assert d["observation"]["topology"]["tier"] == "operator"
+
+
+def test_the_ladder_does_not_nag_the_session_that_holds_the_seat(
+        tmp_path, monkeypatch):
+    """The seat holder IS the dispatcher. Suggesting it bud one off is the
+    reflex T-0937 exists to remove."""
+    from bot_squad_worker import dispatch
+    from bot_squad_worker import operator_seat
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(dispatch, "direct_max_devs", lambda: 1)
+    monkeypatch.setattr(dispatch, "live_operator_sids", lambda c, s: [])
+    _task(cfg, "T-0001", "in_progress")
+    _root(cfg)
+    _session(cfg, "S-u-d1-dev-p1", window="d1-dev", task_id="T-0001")
+    operator_seat.claim(cfg, "test-project", ROOT)
+
+    d = budding.decide_budding(cfg, "test-project", ROOT)
+
+    assert d["verdict"] == budding.HOLD
+    assert "already hold the operator seat" in d["reason"]
+    assert d["observation"]["operator_seat"]["sid"] == ROOT
+
+
+def test_the_ladder_routes_through_someone_elses_seat(tmp_path, monkeypatch):
+    """One dispatcher per board (T-0472) — a held seat is as good as a live
+    operator for the purposes of NOT minting a second one."""
+    from bot_squad_worker import dispatch
+    from bot_squad_worker import operator_seat
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(dispatch, "direct_max_devs", lambda: 1)
+    monkeypatch.setattr(dispatch, "live_operator_sids", lambda c, s: [])
+    _task(cfg, "T-0001", "in_progress")
+    _root(cfg)
+    other = "S-u-gu_other-user-conversation-p77"
+    _session(cfg, other, window="gu_other-user-conversation")
+    _session(cfg, "S-u-d1-dev-p1", window="d1-dev", task_id="T-0001")
+    operator_seat.claim(cfg, "test-project", other)
+
+    d = budding.decide_budding(cfg, "test-project", ROOT)
+
+    assert d["verdict"] == budding.HOLD
+    assert other in d["reason"]
 
 
 def test_no_operator_bud_while_the_flow_stays_under_the_ceiling(tmp_path):

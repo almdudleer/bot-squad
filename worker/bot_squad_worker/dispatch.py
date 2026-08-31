@@ -775,6 +775,17 @@ def classify_drive_mode(text: str) -> dict:
 #     already driving the board and a second dispatcher would double-drive it
 #     (the T-0472 invariant). That tier then de-escalates on its own — the next
 #     re-drive after it recycles finds a direct tier and does not bring it back.
+#
+# T-0937 — THE SEAT SITS ABOVE BOTH. The rule above answers "how much load is
+# there"; it cannot answer "does this board already have a driver", because it
+# reads drivers only as sessions whose ROLE is operator. A root
+# user-conversation session that has claimed the drive is one — «ты должен
+# стать оператором одновременно с юзер-сессией» — and while it holds the seat
+# (``operator_seat.seat_holder``) ``operator_needed`` is FALSE at any tier and
+# ``route`` is ``direct``, with the reason naming the holder. ``tier`` is left
+# telling the truth about the load, so the two never collapse into one number:
+# "the load would justify an operator" and "we already have one" are different
+# facts, and a surface that showed only their AND would hide the first.
 # ---------------------------------------------------------------------------
 
 # At most this many tasks held by live dev sessions under direct drive.
@@ -853,7 +864,8 @@ def decide_topology(cfg: Any, slug: str) -> dict:
     user-conversation session drive dev sessions directly? (T-0855)
 
     Returns ``{ok, tier, route, operator_needed, may_dispatch_directly, counts,
-    thresholds, live_operator_sids, live_user_session_sids, signals, reason}``.
+    thresholds, live_operator_sids, operator_seat, live_user_session_sids,
+    signals, reason}``.
     ``tier`` is ``direct``/``operator`` (the load verdict), ``route`` is
     ``direct``/``via_operator`` (what the ASKING user session should do) — see
     the section comment above for why they are two answers, not one.
@@ -916,11 +928,40 @@ def decide_topology(cfg: Any, slug: str) -> dict:
     if operators:
         signals.append("operator-live:" + operators[0])
 
-    operator_needed = tier == "operator" or not attending
-    may_direct = tier == "direct" and not operators
+    # T-0937 — the operator SEAT: a live ROOT session can hold the board
+    # DIRECTLY while keeping its user-conversation role («ты должен стать
+    # оператором одновременно с юзер-сессией»). It is a prior question to the
+    # tier: `tier` still answers honestly how much load there is, but a board
+    # that already has a driver does not need a second one minted, however
+    # heavy the load — which is precisely the case the ceilings alone got
+    # wrong. Same read `operator_redrive.tick` makes, so the session and the
+    # scheduler cannot disagree about who is driving.
+    from bot_squad_worker import operator_seat as _seat
+    seat = _seat.seat_holder(cfg, slug)
+    if seat is not None:
+        signals.append(f"operator-seat-held:{seat['sid']}:{seat['kind']}")
+
+    operator_needed = (tier == "operator" or not attending) and seat is None
+    may_direct = (tier == "direct" or seat is not None) and not operators
     route = "direct" if may_direct else "via_operator"
 
-    if route == "direct":
+    if seat is not None and not operators:
+        reason = (
+            f"{seat['sid']} holds the operator SEAT (via {seat['kind']}"
+            + (f", since {seat['since']}" if seat.get("since") else "")
+            + f") — it is a {seat['role']} session driving this board itself "
+            "(T-0937), so no operator is minted while it lives. If that is "
+            "you, spawn/steer dev sessions yourself (`bsq spawn`); if it is "
+            "not, route through it. It hands the wheel over with `bsq bud "
+            "operator`, and the seat vacates by itself if it dies"
+        )
+        if tier == "operator":
+            reason += (
+                f" — note: the LOAD ({len(in_flight)} task(s) in flight, "
+                f"{len(devs)} live dev(s); ceilings {max_tasks}/{max_devs}) "
+                "would otherwise justify the operator tier"
+            )
+    elif route == "direct":
         reason = (
             f"small flow ({len(in_flight)} task(s) in flight < {max_tasks}, "
             f"{len(devs)} live dev(s) < {max_devs}) and no operator on the "
@@ -971,6 +1012,7 @@ def decide_topology(cfg: Any, slug: str) -> dict:
         "counts": counts,
         "thresholds": thresholds,
         "live_operator_sids": operators,
+        "operator_seat": seat,          # T-0937; None = the seat is vacant
         "attending_user_session_sids": attending,
         "tasks_in_flight": sorted(in_flight),
         "signals": signals,

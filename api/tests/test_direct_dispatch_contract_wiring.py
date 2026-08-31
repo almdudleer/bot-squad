@@ -75,6 +75,41 @@ def test_the_operator_contract_knows_an_absent_operator_can_be_correct():
     assert "T-0855" in OPERATOR
 
 
+# ---------------------------------------------------------------------------
+# T-0937: the operator SEAT — the root drives the board itself. Same join, same
+# reason: a capability the contract does not name is code no session invokes,
+# and a contract naming a verb the CLI does not have is a session that cannot
+# act on what it was told.
+# ---------------------------------------------------------------------------
+
+def test_the_seat_verbs_the_user_contract_names_actually_exist():
+    assert "bsq operator seat claim" in USERCONV
+    assert "bsq operator seat release" in USERCONV
+    assert "bsq operator seat status" in USERCONV
+    assert 'add_parser(\n        "seat"' in CLI, "no `operator seat` subcommand"
+    for fn in ("cmd_operator_seat_claim", "cmd_operator_seat_release",
+               "cmd_operator_seat_status"):
+        assert f"def {fn}(" in CLI
+    # ...and the verbs must reach the WORKER, which owns the rule — a CLI-local
+    # claim would suppress nothing, since the 60s tick never reads the CLI.
+    assert "operator_seat_claim" in CLI and "operator_seat_release" in CLI
+
+
+def test_the_user_contract_says_the_seat_is_a_hat_not_a_morph():
+    """The whole reason the seat exists rather than a role change: morphing the
+    root to `operator` breaks its attendance/routing. A contract that lost this
+    would have sessions morphing themselves and re-opening the bug."""
+    assert "HAT, not a morph" in USERCONV
+    assert "T-0937" in USERCONV
+
+
+def test_the_operator_contract_knows_a_held_seat_is_not_a_fault():
+    """An operator that reads a seat-held board as an operator-less one takes
+    the board back and undoes the ticket — the same failure T-0855 guarded."""
+    assert "T-0937" in OPERATOR
+    assert "SEAT" in OPERATOR
+
+
 def test_both_contracts_keep_the_one_dispatcher_invariant():
     """Direct dispatch narrows WHEN an operator exists; it never allows two
     dispatchers on one board (T-0472)."""

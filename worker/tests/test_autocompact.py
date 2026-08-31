@@ -402,3 +402,101 @@ def test_worker_session_ceiling_unaffected_by_exempt_path(tmp_path, stay_harness
     meta = S._read_session_metadata(S._session_file(data, "bot-squad", sid))
     assert "compact_stay_phase" not in meta
     assert "compact_stay_last_at" not in meta
+
+
+# --- T-0937: a MORPHED role survives the relaunch ---------------------------
+#
+# A morph (T-0509/T-0932) stamps `role` on the md WITHOUT renaming the tmux
+# window — renaming would rotate the peer-bus SID. `spawn` has no `role`
+# parameter, so the successor's role is DERIVED from that same unchanged
+# window: a session that morphed to `operator` came back as whatever its
+# original window said, `dispatch.live_operator_sids` stopped seeing it, and
+# the 60s re-drive minted a SECOND operator behind the one still working. This
+# is T-0523's duplicate-operator failure reached from the other direction, and
+# the twin of the T-0678 model carry-forward in the same function.
+
+
+def _relaunch_env(tmp_path, monkeypatch, *, stamped_role, window):
+    """A predecessor md with `stamped_role`, and a spawn stub that writes the
+    successor md the way the real one does — role DERIVED, never passed."""
+    data = tmp_path / "data"
+    (data / "p" / "sessions").mkdir(parents=True)
+    cfg = types.SimpleNamespace(
+        data_dir=data, projects={"p": types.SimpleNamespace(slug="p")})
+    sid, new_sid = "S-u-x-p1", "S-u-x-p2"
+    meta = {"sid": sid, "status": "active", "window": window, "cwd": "/tmp",
+            "claude_uuid": "u1", "task_id": "~"}
+    if stamped_role:
+        meta["role"] = stamped_role
+    S._write_session_metadata(S._session_file(data, "p", sid), meta)
+
+    def _fake_spawn(c, s, win, prompt=None, **kw):
+        S._write_session_metadata(S._session_file(data, "p", new_sid), {
+            "sid": new_sid, "status": "active", "window": win, "cwd": "/tmp",
+            "claude_uuid": "u2", "task_id": kw.get("task_id") or "~",
+            "role": S._role_of({"window": win, "task_id": kw.get("task_id")}),
+        })
+        return {"ok": True, "sid": new_sid}
+
+    monkeypatch.setattr(S, "spawn", _fake_spawn)
+    return cfg, data, sid, new_sid
+
+
+def test_relaunch_carries_a_morphed_operator_role(tmp_path, monkeypatch):
+    """The fix: the successor is still an operator, so the singleton detector
+    finds it and the re-drive does not mint a duplicate."""
+    cfg, data, sid, new_sid = _relaunch_env(
+        tmp_path, monkeypatch, stamped_role="operator",
+        window="gu_root-user-conversation")
+
+    A._relaunch(cfg, "p", {"sid": sid, "role": "operator"},
+                lambda role, task_id, aid: "boot")
+
+    succ = S._read_session_metadata(S._session_file(data, "p", new_sid))
+    assert S._role_of(succ) == "operator"
+    # CONTROL for that assertion: the window alone still derives something else,
+    # so the stamp is what carried it — not the window happening to agree.
+    assert S._derive_role(succ["window"], None, None) == "user-conversation"
+
+
+def test_relaunch_leaves_an_unmorphed_session_deriving_its_role(tmp_path,
+                                                                monkeypatch):
+    """CONTROL: no stamp on the predecessor, nothing invented on the successor.
+    The carry must not start stamping roles onto sessions that never morphed."""
+    cfg, data, sid, new_sid = _relaunch_env(
+        tmp_path, monkeypatch, stamped_role=None, window="d1-dev")
+
+    A._relaunch(cfg, "p", {"sid": sid, "role": "dev"},
+                lambda role, task_id, aid: "boot")
+
+    succ = S._read_session_metadata(S._session_file(data, "p", new_sid))
+    assert S._role_of(succ) == "dev"
+
+
+def test_relaunch_survives_a_failed_role_carry(tmp_path, monkeypatch):
+    """Best-effort: the session is already running, so a stamping failure must
+    be logged and swallowed, never propagated into the relaunch caller."""
+    cfg, data, sid, new_sid = _relaunch_env(
+        tmp_path, monkeypatch, stamped_role="operator",
+        window="gu_root-user-conversation")
+
+    # The spawn's own md write must still succeed — it is the CARRY that has to
+    # fail, otherwise this would test a session that never launched.
+    real_write = S._write_session_metadata
+    calls = {"n": 0}
+
+    def _boom_on_the_carry(*a, **k):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise OSError("read-only")
+        return real_write(*a, **k)
+
+    monkeypatch.setattr(S, "_write_session_metadata", _boom_on_the_carry)
+
+    A._relaunch(cfg, "p", {"sid": sid, "role": "operator"},
+                lambda role, task_id, aid: "boot")
+
+    assert calls["n"] == 2, "the carry never attempted its write"
+    # The successor is running, with its derived role — pre-T-0937 behaviour.
+    succ = S._read_session_metadata(S._session_file(data, "p", new_sid))
+    assert S._role_of(succ) == "user-conversation"

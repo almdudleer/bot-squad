@@ -4062,6 +4062,12 @@ def _action_operator_status(params: dict[str, Any]) -> dict[str, Any]:
     ``state`` is the one-word steer:
       * ``paused``             — user paused; re-drive is off.
       * ``driving``            — an operator is currently live.
+      * ``seat-held``          — backlog has work and no operator session BY
+                                 DESIGN: a live ROOT session holds the operator
+                                 SEAT and is driving the board itself (T-0937).
+                                 Holds at ANY tier — that is what distinguishes
+                                 it from ``direct-tier``, which is a verdict
+                                 about the LOAD.
       * ``direct-tier``        — backlog has work and no operator BY DESIGN: the
                                  flow is small and a user-conversation session is
                                  driving devs directly (T-0855). Reported before
@@ -4073,7 +4079,7 @@ def _action_operator_status(params: dict[str, Any]) -> dict[str, Any]:
       * ``idle-empty-backlog`` — nothing to clear; the only idle state.
 
     Required params: slug. Returns: {ok, paused, state, live_operators,
-    pending_backlog, topology?}.
+    operator_seat, pending_backlog, topology?}.
     """
     extra = set(params) - _OPERATOR_STATUS_ALLOWED
     if extra:
@@ -4089,10 +4095,16 @@ def _action_operator_status(params: dict[str, Any]) -> dict[str, Any]:
 
     from bot_squad_worker import operator_redrive as _ord
     from bot_squad_worker import dispatch as _dispatch
+    from bot_squad_worker import operator_seat as _seat
 
     paused = _ord.is_paused(cfg, slug)
     live = _dispatch.live_operator_sids(cfg, slug)
     pending = _ord.count_pending_backlog(cfg, slug)
+    # T-0937: a live ROOT session wearing the operator hat is the OTHER way this
+    # board can have a driver, and `live_operators` cannot show it (that list is
+    # role-derived). Reporting it here is what makes "no operator" readable as
+    # "somebody else is driving" instead of "nothing is happening".
+    seat = _seat.seat_status(cfg, slug)
 
     topo = None
     if not paused and not live and pending > 0:
@@ -4110,8 +4122,16 @@ def _action_operator_status(params: dict[str, Any]) -> dict[str, Any]:
     elif live:
         state = "driving"
     elif pending > 0:
-        state = "direct-tier" if (topo and not topo["operator_needed"]) \
-            else "pending-redrive"
+        if seat.get("held"):
+            # Ordered ahead of `direct-tier` for the same reason `direct-tier`
+            # is ordered ahead of `pending-redrive`: all three look like "no
+            # operator" from outside, and only one of them is a project waiting
+            # on a spawn. `seat-held` additionally holds at operator tier.
+            state = "seat-held"
+        elif topo and not topo["operator_needed"]:
+            state = "direct-tier"
+        else:
+            state = "pending-redrive"
     else:
         state = "idle-empty-backlog"
 
@@ -4120,6 +4140,7 @@ def _action_operator_status(params: dict[str, Any]) -> dict[str, Any]:
         "paused": paused,
         "state": state,
         "live_operators": live,
+        "operator_seat": seat,
         "pending_backlog": pending,
     }
     if topo is not None:
@@ -5020,7 +5041,9 @@ def _action_budding_decision(params: dict[str, Any]) -> dict[str, Any]:
     disagree about whether the operator tier is due. Required params: slug.
     Optional: sid (defaults to the project's single root/user-conversation
     session). Returns ``{ok, sid, level, verdict, task_id, command, reason,
-    observation}`` where verdict ∈ hold|bud_dev|bud_operator|absorb.
+    observation}`` where verdict ∈ hold|bud_dev|bud_operator|take_seat|absorb
+    (``take_seat`` is T-0937's L1→L2 alternative: wear the operator hat rather
+    than spawn a second process).
 
     Advisory + pure read, like ``topology_decision`` / ``dispatch_decision``:
     it spawns nothing and morphs nothing. Backs ``bsq bud`` (no subcommand).
@@ -5064,6 +5087,67 @@ def _action_bud_operator(params: dict[str, Any]) -> dict[str, Any]:
     from bot_squad_worker import operator_redrive as _ord
     return _ord.bud_operator(cfg, params["slug"],
                              requested_by=str(params.get("sid") or ""))
+
+
+_OPERATOR_SEAT_CLAIM_REQUIRED = {"slug", "sid"}
+_OPERATOR_SEAT_CLAIM_ALLOWED = _OPERATOR_SEAT_CLAIM_REQUIRED | {"source", "force"}
+
+
+def _action_operator_seat_claim(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0937: ``sid`` takes the operator SEAT — it drives this board itself.
+
+    The write behind ``bsq operator seat claim``. The seat is a HAT, not a
+    morph: the session keeps its user-conversation role (and its TG attendance,
+    ``role_exempt``, ``ensure_user_conversation`` routing) and additionally
+    holds the board, so the 60s re-drive does not mint an operator behind it.
+
+    Wraps ``operator_seat.claim``, which enforces eligibility (a LIVE ROOT
+    session), the T-0472 singleton (refuses while an operator session is live)
+    and single-holder-ness. Required params: slug, sid. Optional: source (the
+    words that asked for it, stored verbatim), force (take the seat over from
+    another live root). Returns {ok, seat, replaced}. ``tmux_only`` — it reads
+    the per-user session roster, like ``bud_operator``.
+    """
+    extra = set(params) - _OPERATOR_SEAT_CLAIM_ALLOWED
+    if extra:
+        raise ActionError(f"operator_seat_claim got unexpected params: {sorted(extra)}")
+    missing = _OPERATOR_SEAT_CLAIM_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"operator_seat_claim missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import operator_seat as _seat
+    return _seat.claim(cfg, params["slug"], str(params["sid"]),
+                       source=str(params.get("source") or ""),
+                       force=bool(params.get("force")))
+
+
+_OPERATOR_SEAT_RELEASE_REQUIRED = {"slug"}
+_OPERATOR_SEAT_RELEASE_ALLOWED = _OPERATOR_SEAT_RELEASE_REQUIRED | {"sid", "force"}
+
+
+def _action_operator_seat_release(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0937: give the operator seat up — the re-drive may mint an operator again.
+
+    The write behind ``bsq operator seat release``. Idempotent: releasing a
+    vacant seat returns ``released: False`` rather than raising. Refuses to drop
+    ANOTHER session's claim without ``force``, because a seat someone else can
+    silently take from you is not a claim.
+
+    Required params: slug. Optional: sid (who is releasing — defaults to
+    releasing whoever holds it), force. Returns {ok, released, was}.
+    """
+    extra = set(params) - _OPERATOR_SEAT_RELEASE_ALLOWED
+    if extra:
+        raise ActionError(f"operator_seat_release got unexpected params: {sorted(extra)}")
+    missing = _OPERATOR_SEAT_RELEASE_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"operator_seat_release missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    from bot_squad_worker import operator_seat as _seat
+    return _seat.release(cfg, params["slug"], str(params.get("sid") or ""),
+                         force=bool(params.get("force")))
 
 
 _SET_DRIFT_PAUSED_REQUIRED = {"slug", "sid", "paused"}
@@ -5946,6 +6030,10 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "topology_decision": _action_topology_decision,
     "budding_decision": _action_budding_decision,
     "bud_operator": _action_bud_operator,
+    # T-0937: the operator SEAT — a live root session drives the board itself,
+    # keeping its user-conversation role, and the re-drive respects the claim.
+    "operator_seat_claim": _action_operator_seat_claim,
+    "operator_seat_release": _action_operator_seat_release,
     # T-0184: per-session drift-check off-ramp (bsq drift on/off).
     "set_drift_paused": _action_set_drift_paused,
     # T-0926 follow-up: per-session pin against every automatic action
@@ -6051,6 +6139,10 @@ ACTION_MODES: dict[str, str] = {
     "topology_decision": "tmux_only",
     "budding_decision": "tmux_only",
     "bud_operator": "tmux_only",
+    # T-0937: both read the per-user session roster to resolve the holder, so
+    # they carry bud_operator's routing profile, not the coordinator's.
+    "operator_seat_claim": "tmux_only",
+    "operator_seat_release": "tmux_only",
     # telemetry_get reads the SHARED install data dir (all users' sampled
     # records land there) → a single coordinator read, not a per-user fan-out.
     "telemetry_get": "coordinator_only",

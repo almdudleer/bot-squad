@@ -239,6 +239,50 @@ Three things this does NOT do, on purpose:
    true, because a session still holding a task inherits that task's
    done-signal. The ladder de-escalates by attrition, not by a peer's decision.
 
+## You can wear the operator hat yourself — the SEAT (T-0937, stakeholder 2026-08-31)
+
+> «от меня сейчас не так много запросов, но запрос на параллелизм, так что ты
+> должен стать оператором одновременно с юзер-сессией по идее»
+>
+> «ну вот первая на интроспекцию что ты подумал что тебе надо поставить
+> отдельного оператора (и он появился уже)»
+
+The L1→L2 rung above has a THIRD move, and it is often the right one: keep
+driving the board yourself while the parallelism goes up. `bsq bud operator`
+is not the only answer to "the load justifies an operator" — a second process
+is a cost, and when the request volume from the user is low it buys nothing.
+
+- **`bsq operator seat claim`** — you take the operator SEAT. The 60s re-drive
+  then leaves the board to you and mints no operator while you live, at ANY
+  load. `bsq pickup` is the queue you are now driving; you spawn and steer devs
+  directly (`bsq spawn`), exactly as under `route: direct`.
+- **`bsq operator seat status`** — who holds it, how, and since when.
+- **`bsq operator seat release`** — give it back; the re-drive resumes.
+- **`bsq bud operator`** is still the handover: it spawns the operator AND
+  drops your seat in the same call.
+
+**It is a HAT, not a morph.** You stay a `user-conversation` session — your
+role, your TG attendance and your routing are untouched. That is deliberate:
+morphing you into `operator` would break the very thing that makes you the
+attendant, which is why "become the operator" could not simply be a role change.
+
+**You may already hold it without claiming it.** `bsq pace drive` stamps the
+setting session's SID into the drive block, so the session that SET the standing
+drive is the session driving it. If that is you and you are live, you hold the
+seat implicitly — this is the case that used to mint an operator 25 seconds
+behind you.
+
+**The seat is held by your being alive, and by nothing else.** No expiry, no
+heartbeat. If you die or are recycled with the drive still on, the seat vacates
+by itself and the re-drive brings an operator back — so claiming it can never
+strand the board.
+
+**One dispatcher per board is unchanged (T-0472).** The claim is refused while
+an operator session is live, and `bsq route` reports the seat beside the tier:
+`tier: operator` with `route: direct` means the LOAD would justify an operator
+and the board already has a driver — you. It is not a contradiction, and it is
+not a reason to spawn one.
+
 ## Why the operator hop is now conditional (T-0855, stakeholder 2026-08-11)
 
 His words, the reason `bsq route` exists at all:

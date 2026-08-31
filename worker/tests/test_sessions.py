@@ -2556,6 +2556,123 @@ def test_deliver_prompt_raises_when_never_submitted(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# T-0897: _composer_content must not read claude's empty-composer placeholder
+# hint (or an unrelated screen sharing the ❯ rune) as real content
+# ---------------------------------------------------------------------------
+
+def test_composer_content_reads_empty_composer_with_placeholder_as_empty(monkeypatch):
+    """T-0897: on a genuinely empty composer, claude fills it with a dim,
+    rotating placeholder hint right after the marker (e.g. 'Try "how do I log
+    an error?"'). Before the fix this text was indistinguishable from real
+    content, so _deliver_prompt's paste-landed check went true instantly on a
+    still-empty composer — this is the input that gave the false positive.
+    Fixture is the raw `tmux capture-pane -e` bytes measured live on a fresh
+    pane (v2.1.251, T-0897); without the fix this test fails."""
+    import bot_squad_worker.sessions as S
+
+    def fake_run(args, **kwargs):
+        assert "-e" in args, "must capture with -e to see the placeholder's styling"
+        return _CP(args, '\x1b[39m❯\xa0\x1b[2mTry "how do I log an error?"\x1b[0m\n')
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    assert S._composer_content("%5") == ""
+
+
+def test_composer_content_placeholder_wording_is_never_pinned(monkeypatch):
+    """T-0897 DoD: the hint's WORDING is not part of the criterion — it
+    rotates between several example prompts and changes across claude
+    versions. A second, differently-worded live capture must ALSO read as
+    empty, or the fix would just be today's placeholder string hardcoded."""
+    import bot_squad_worker.sessions as S
+
+    def fake_run(args, **kwargs):
+        return _CP(args, '\x1b[39m❯\xa0\x1b[2mTry "refactor <filepath>"\x1b[0m\n')
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    assert S._composer_content("%5") == ""
+
+
+def test_composer_content_typed_text_still_reads_as_content(monkeypatch):
+    """Positive control (DoD): real typed content must still be read, not
+    swept up by the placeholder fix. Fixture measured live (T-0897)."""
+    import bot_squad_worker.sessions as S
+
+    def fake_run(args, **kwargs):
+        return _CP(args, "\x1b[39m❯\xa0hello world test\n")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    assert S._composer_content("%5") == "hello world test"
+
+
+def test_composer_content_pasted_placeholder_still_reads_as_content(monkeypatch):
+    """Positive control (DoD/T-0201): a large bracketed paste's own
+    '[Pasted text #N +M lines]' placeholder must still read as landed
+    content — it renders unstyled, unlike claude's empty-composer hint.
+    Fixture measured live (T-0897)."""
+    import bot_squad_worker.sessions as S
+
+    def fake_run(args, **kwargs):
+        return _CP(args, "\x1b[39m❯\xa0[Pasted text #1 +150 lines]\n")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    assert S._composer_content("%5") == "[Pasted text #1 +150 lines]"
+
+
+def test_composer_content_trust_dialog_selector_not_read_as_content(monkeypatch):
+    """T-0897 (companion finding): claude's first-run 'trust this folder'
+    dialog reuses the ❯ rune for its own list selector ('❯ No, exit'), which
+    a plain capture cannot tell apart from real composer content either.
+    Unlike the placeholder it isn't dim — it's highlight-colored — but it is
+    still styled right after the marker, so the same "no styling = real
+    content" check must reject it too; otherwise _deliver_prompt's
+    confirm-then-Enter can act on the dialog instead of the real composer.
+    Fixture measured live (T-0897)."""
+    import bot_squad_worker.sessions as S
+
+    def fake_run(args, **kwargs):
+        return _CP(
+            args,
+            " \x1b[38;5;153m❯\x1b[39m \x1b[38;5;153mNo,\x1b[39m \x1b[38;5;153mexit\x1b[39m\n"
+            "   Yes, I trust this folder\n",
+        )
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    assert S._composer_content("%5") == ""
+
+
+def test_wait_for_composer_ready_dismisses_trust_dialog(monkeypatch):
+    """T-0897: claude's first-run-in-this-directory trust dialog blocks the
+    real composer and shares its ready-marker rune, so
+    _wait_for_agent_composer_ready must recognize and answer it ('Yes, I
+    trust this folder') instead of reporting ready on the dialog itself — a
+    bare Enter on the dialog's DEFAULT row ('No, exit') kills the whole
+    claude process (measured live, T-0897: pane_current_command flips from
+    'claude' to 'bash')."""
+    import bot_squad_worker.sessions as S
+    monkeypatch.setattr(S.time, "sleep", lambda x: None)
+
+    keys_sent: list[str] = []
+    dialog_dismissed = [False]
+
+    def fake_run(args, **kwargs):
+        if "send-keys" in args:
+            key = args[-1]
+            keys_sent.append(key)
+            if key == "Enter" and "Down" in keys_sent:
+                dialog_dismissed[0] = True
+            return _CP(args)
+        if "capture-pane" in args:
+            if not dialog_dismissed[0]:
+                return _CP(args, " ❯ No, exit\n   Yes, I trust this folder\n")
+            return _CP(args, "❯ \n")
+        return _CP(args)
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    assert S._wait_for_agent_composer_ready("%5", "claude") is True
+    assert keys_sent == ["Down", "Enter"], keys_sent
+
+
+# ---------------------------------------------------------------------------
 # T-0165: resume preserves a multi-bound session's extra_task_ids on rotation
 # ---------------------------------------------------------------------------
 

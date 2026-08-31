@@ -655,3 +655,58 @@ def test_no_role_is_exempt_from_idle_recycle(tmp_path, monkeypatch):
                             user_home="/home/x") is True
     assert asked == [sid]  # teamlead recycled → not exempt
     assert compacted == []  # ...and never via the retired /compact (T-0863)
+
+
+# --- T-0944/T-0945: to_accept is a DELIVERED status for the lifecycle -------
+
+def test_the_three_done_sets_are_one_set():
+    """graceful_exit's own comment claims these three are the same set. A
+    comment is not a control — this is (T-0945). They govern three different
+    decisions about the same fact ("the deliverable exists"): whether to exit
+    the session, whether to respawn onto the task, whether to nag the dev about
+    its DoD. A status added to one and missed in another is a session that
+    exits and is immediately respawned, or one that is kept alive and nagged
+    about work it already delivered."""
+    from bot_squad_worker import drift, recovery
+    assert set(GE.DONE_STATUSES) == set(recovery.DONE_STATUSES)
+    assert set(GE.DONE_STATUSES) == set(drift._TERMINAL_TICKET_STATUSES)
+
+
+def test_done_set_matches_the_task_state_machine_after_in_progress():
+    """The set is pinned to the STATE MACHINE, not hand-listed: every status
+    reachable from in_progress that means "the dev is finished" must be in it.
+    T-0944 inserted to_accept there, and missing it would leave a delivered dev
+    nudged «продолжай» forever (idle_timeout.task_alive reads this set)."""
+    from bot_squad_worker import task_states
+    assert "to_accept" in GE.DONE_STATUSES
+    # to_accept really is a state of this graph, and really is where in_progress
+    # delivers to — read from the state machine, not asserted as a literal here
+    assert "to_accept" in task_states.TICKET_STATUSES
+    assert "to_accept" in task_states.TRANSITIONS["in_progress"]
+    # every done status is a real state of the machine
+    assert set(GE.DONE_STATUSES) <= set(task_states.TICKET_STATUSES)
+    # NOT asserted: disjointness from task_states.ACTIVE_STATES. That set is a
+    # different axis — "the TICKET is still open on the board" — and it
+    # deliberately contains to_accept and totest, both of which are delivered
+    # work whose SESSION is done. Conflating the two is what would put a
+    # delivered dev back on the nudge path.
+    assert {"to_accept", "totest"} <= set(task_states.ACTIVE_STATES)
+    # ...and the statuses that mean work is STILL LIVE stay out of DONE_STATUSES
+    for still_live in ("open", "in_progress", "reopened", "paused",
+                       "planned", "blocked_on_user"):
+        assert still_live not in GE.DONE_STATUSES, still_live
+
+
+def test_dev_at_to_accept_exits_and_is_not_nudged(tmp_path, seams):
+    """The end-to-end of the coupling: a dev whose ticket is to_accept has
+    delivered — graceful_exit takes it (after the ticket handoff, no compact),
+    and idle_timeout stops treating its task as live work."""
+    from bot_squad_worker import idle_timeout as _IT
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="to_accept")
+    row = _row(sid, role="dev", cwd_repo=data.parent / "repo")
+    assert _IT.task_alive(cfg, "bot-squad", "T-0042") is False
+    assert _exit_after_handoff(cfg, data, row, seams) is True
+    assert seams["calls"]["suspend"] == [sid]
+    assert seams["calls"]["compact"] == []

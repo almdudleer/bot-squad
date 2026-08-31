@@ -75,8 +75,16 @@ log = logging.getLogger(__name__)
 
 # A task-bound role is "done" when its bound task reaches a terminal status. Same
 # set as recovery.DONE_STATUSES / drift._TERMINAL_TICKET_STATUSES — a dev that set
-# ``totest`` has reported READY and handed off to its TL (kill-not-resume).
-DONE_STATUSES = frozenset({"totest", "closed"})
+# ``totest`` has reported READY and handed off to its TL (kill-not-resume); the
+# three are pinned equal by test_graceful_exit.py so they cannot drift apart.
+#
+# T-0944 (2026-08-31) inserted ``to_accept`` between ``in_progress`` and
+# ``totest``: the dev delivers into ``to_accept``, the OPERATOR accepts it into
+# ``totest``, which is the human's queue. T-0945 owns the lifecycle half of
+# that, and it is this line — «когда to test для меня, не имеет смысла держать
+# сессию уже». The dev's part is finished at ``to_accept``, so that is where its
+# session exits (handoff into the ticket first, never a compact).
+DONE_STATUSES = frozenset({"to_accept", "totest", "closed"})
 
 # Default grace: a session must have been quiet (jsonl idle) for at least this
 # long after going "done" before we exit it — covers the dev's own

@@ -75,7 +75,14 @@ log = logging.getLogger(__name__)
 
 # Canonical task statuses (see reference_task_status_schema).
 ACTIVE_STATUSES = {"open", "in_progress", "reopened", "paused"}  # still needs work → recover
-DONE_STATUSES = {"totest", "closed"}                   # deliverable exists → leave it
+# T-0945 lifecycle coupling for T-0944's new `to_accept`: a dev that reaches it
+# has DELIVERED — the ticket is now the operator's to accept and `totest` is the
+# human's queue beyond that — so the deliverable exists and nothing should
+# respawn a session onto it. Leaving it out would have read as "still needs
+# work" everywhere this set is consulted, which is how a delivered dev ends up
+# nudged «продолжай» forever on a ticket it has already handed over
+# (`idle_timeout.task_alive` reads exactly this set).
+DONE_STATUSES = {"to_accept", "totest", "closed"}      # deliverable exists → leave it
 # T-0931: deliberately NEITHER — a blocked_on_user task is not done, but
 # respawning a session onto it accomplishes nothing until the stakeholder
 # answers, which is the exact wasted-cache-window pattern blocked_on_user

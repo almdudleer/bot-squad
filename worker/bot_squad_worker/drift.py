@@ -89,7 +89,11 @@ _CONSTANT_TEAM_OWNER = "constant-team"
 # ~89 min after setting it to ``totest``). ``reopened`` is deliberately NOT
 # terminal — when a TL reopens a ticket the work is live again and the dev
 # should be re-anchored.
-_TERMINAL_TICKET_STATUSES = {"totest", "closed"}
+# T-0944/T-0945: ``to_accept`` joins them — a dev that has delivered into the
+# operator's acceptance queue is as done as one that set ``totest``, and nagging
+# it to re-anchor on its DoD is the same structurally-meaningless nag this set
+# exists to suppress.
+_TERMINAL_TICKET_STATUSES = {"to_accept", "totest", "closed"}
 
 # T-0931: a dev whose bound ticket is blocked_on_user asked the stakeholder a
 # blocking question and is waiting on an answer — nagging "still no answer"

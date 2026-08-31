@@ -314,6 +314,20 @@ def test_terminal_ticket_status_not_nudged(tmp_path, monkeypatch, terminal_statu
     assert res["nudged"] == [] and not delivered
 
 
+def test_blocked_on_user_ticket_not_nudged(tmp_path, monkeypatch):
+    # T-0931: the exact failure the stakeholder described — a dev whose task
+    # is blocked_on_user must not be nagged "still no answer".
+    cfg, slug, now, ticket, patch = _setup(
+        tmp_path, updated_ago_min=90, activity_ago_sec=30, ticket_status="blocked_on_user")
+    patch(monkeypatch)
+    monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
+    monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
+    delivered = []
+    monkeypatch.setattr(S, "_deliver_prompt", lambda pane, text, **_kw: delivered.append((pane, text)))
+    res = drift.drift_check(cfg, slug)
+    assert res["nudged"] == [] and not delivered
+
+
 def test_in_progress_ticket_still_nudges(tmp_path, monkeypatch):
     # in_progress is NOT terminal → a stale, actively-working dev is still nagged.
     cfg, slug, now, ticket, patch = _setup(

@@ -76,6 +76,13 @@ log = logging.getLogger(__name__)
 # Canonical task statuses (see reference_task_status_schema).
 ACTIVE_STATUSES = {"open", "in_progress", "reopened", "paused"}  # still needs work → recover
 DONE_STATUSES = {"totest", "closed"}                   # deliverable exists → leave it
+# T-0931: deliberately NEITHER — a blocked_on_user task is not done, but
+# respawning a session onto it accomplishes nothing until the stakeholder
+# answers, which is the exact wasted-cache-window pattern blocked_on_user
+# exists to stop. It also stays out of the has_artifact branch below (a
+# WAITING session's handoff+compact+exit artifact must not trigger a generic
+# dead-pane respawn — resume is T-0930's dedicated wait-state path, not this).
+WAITING_STATUSES = {"blocked_on_user"}
 
 
 def recovery_enabled() -> bool:
@@ -186,6 +193,8 @@ def classify(*, pane_live: bool, task_status: str, has_artifact: bool,
         return "none"  # live work is never touched here
     if task_status in DONE_STATUSES:
         return "none"  # deliverable exists → leave to stale-archive
+    if task_status in WAITING_STATUSES:
+        return "none"  # T-0931: blocked on the stakeholder → leave to the wait-state resume, not a generic respawn
     recoverable = (task_status in ACTIVE_STATUSES) or has_artifact
     if not recoverable:
         return "none"

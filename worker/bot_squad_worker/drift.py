@@ -91,6 +91,16 @@ _CONSTANT_TEAM_OWNER = "constant-team"
 # should be re-anchored.
 _TERMINAL_TICKET_STATUSES = {"totest", "closed"}
 
+# T-0931: a dev whose bound ticket is blocked_on_user asked the stakeholder a
+# blocking question and is waiting on an answer — nagging "still no answer"
+# (or T-0930's "продолжай" nudge) at it is the literal failure the
+# stakeholder described this status to stop. Deliberately a SEPARATE set from
+# `_TERMINAL_TICKET_STATUSES` rather than merged into it: terminal means
+# "done, awaiting review"; blocked means "stuck, will resume when answered" —
+# T-0930's idle-window WAITING branch reads that distinction to decide
+# handoff+compact+exit-with-wait-state instead of DONE.
+_BLOCKED_TICKET_STATUSES = {"blocked_on_user"}
+
 # T-0184: appended to every drift reminder so the user always has an obvious
 # off-ramp. ``bsq drift off`` sets ``drift_paused: true`` on the SessionMd.
 _OFF_RAMP_FOOTER = (
@@ -456,6 +466,10 @@ def drift_check(cfg: Any, slug: str) -> dict:
         # is NOT terminal: the work is live again, so it still gets nagged. Composes
         # with the constant-team + initiative-match guards above/below.
         if ticket_status in _TERMINAL_TICKET_STATUSES:
+            continue
+
+        # T-0931: blocked_on_user — waiting on the stakeholder, not drifting.
+        if ticket_status in _BLOCKED_TICKET_STATUSES:
             continue
 
         # T-0185: only nag about a ticket whose initiative matches the session's.

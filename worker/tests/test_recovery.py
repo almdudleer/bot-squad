@@ -86,6 +86,17 @@ def test_classify_dead_pane_done_task_is_none():
                       respawn_count=0, bound=2) == "none"
 
 
+def test_classify_dead_pane_blocked_on_user_is_none():
+    # T-0931: blocked on the stakeholder → leave to the wait-state resume, not
+    # a generic respawn. Critically, this holds even WITH an artifact present
+    # (a WAITING session's handoff+compact+exit artifact must not itself
+    # trigger a dead-pane respawn — that would defeat the point of the status).
+    assert R.classify(pane_live=False, task_status="blocked_on_user", has_artifact=True,
+                      respawn_count=0, bound=2) == "none"
+    assert R.classify(pane_live=False, task_status="blocked_on_user", has_artifact=False,
+                      respawn_count=0, bound=2) == "none"
+
+
 def test_classify_dead_pane_no_state_is_none():
     # never started + nothing written → nothing in-flight to recover
     assert R.classify(pane_live=False, task_status="planned", has_artifact=False,

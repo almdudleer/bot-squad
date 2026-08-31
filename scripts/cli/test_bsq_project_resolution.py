@@ -149,12 +149,14 @@ def test_own_project_own_repo_passes_even_on_a_colliding_id(world):
     guard that stopped here would stop most work in the fleet."""
     before_alpha = world["alpha"].read_bytes()
 
-    r = run(world, "ticket", "update", "T-0655", "totest",
+    # T-0944 removed in_progress -> totest; to_accept is the valid delivery
+    # edge from the fixture's "in_progress" beta ticket.
+    r = run(world, "ticket", "update", "T-0655", "to_accept",
             cwd_slug="beta", sid="S-t-p2")
 
     assert r.returncode == 0, r.stderr
-    assert "status: totest" in world["beta"].read_text()   # it really wrote
-    assert world["alpha"].read_bytes() == before_alpha     # and only there
+    assert "status: to_accept" in world["beta"].read_text()  # it really wrote
+    assert world["alpha"].read_bytes() == before_alpha       # and only there
 
 
 def test_explicit_at_slug_writes_the_named_board_from_any_directory(world):
@@ -195,7 +197,7 @@ def test_the_slug_and_the_file_are_named_on_the_passing_path_too(world):
     """«context set on T-0655» was true of both tickets. What distinguishes
     them is the slug and the path, so those are what gets printed — including
     when the command succeeds, which is when nobody is looking."""
-    r = run(world, "ticket", "update", "T-0655", "totest",
+    r = run(world, "ticket", "update", "T-0655", "to_accept",
             cwd_slug="beta", sid="S-t-p2")
 
     assert r.returncode == 0

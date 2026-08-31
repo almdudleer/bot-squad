@@ -1212,9 +1212,14 @@ def uc_exit_sec() -> int:
     a drive=off operator) terminates — :func:`idle_timeout_sec` by default, i.e.
     the same 55 min window every other plan fires on.
 
-    ``BOT_SQUAD_UC_EXIT_SEC=0`` disables the exit, which downgrades those roles
-    to plain compact-and-stay (:data:`PLAN_STAY`, the pre-T-0945 behaviour) —
-    the kill switch for this ruling. Garbage falls back to the default."""
+    ``BOT_SQUAD_UC_EXIT_SEC=0`` disables the exit for user-conversation, which
+    downgrades it to plain compact-and-stay (:data:`PLAN_STAY`, the
+    pre-T-0945 behaviour). The drive=off operator does NOT get the same
+    downgrade — it still terminates via :data:`PLAN_HANDOFF_EXIT` (its own
+    pre-T-0945 behaviour was a plain handoff exit, uncompacted), just without
+    the compact step this knob would otherwise add. This is the kill switch
+    for the ruling as it applies to each role; garbage falls back to the
+    default."""
     raw = os.environ.get("BOT_SQUAD_UC_EXIT_SEC")
     if raw is not None and raw.strip() != "":
         try:
@@ -1417,16 +1422,18 @@ def _worker_nudge_text(role: str | None) -> str:
             "because you still hold live work.")
     if (role or "") == "teamlead":
         return base + (
-            " At least one task in your scope is still open (not totest/"
-            "closed/blocked_on_user). If you are waiting on a dev, check its "
-            "state (`bsq team status`) rather than sitting; if the wait is on "
-            "the stakeholder, move the ticket to blocked_on_user — that stops "
-            "this nudge and lets the system handle the wait properly.")
+            " At least one task in your scope is still open (not to_accept/"
+            "totest/closed/blocked_on_user). If you are waiting on a dev, "
+            "check its state (`bsq team status`) rather than sitting; if the "
+            "wait is on the stakeholder, move the ticket to blocked_on_user "
+            "— that stops this nudge and lets the system handle the wait "
+            "properly.")
     return base + (
-        " Your bound task is not yet in totest/closed. If you are genuinely "
-        "blocked on the stakeholder, set the task to blocked_on_user instead "
-        "of sitting idle (`bsq ticket update <id> blocked_on_user`) — that "
-        "stops this nudge and lets the system handle the wait properly.")
+        " Your bound task is not yet in to_accept/totest/closed. If you are "
+        "genuinely blocked on the stakeholder, set the task to "
+        "blocked_on_user instead of sitting idle (`bsq ticket update <id> "
+        "blocked_on_user`) — that stops this nudge and lets the system "
+        "handle the wait properly.")
 
 
 def _send_dev_nudge(sid: str, text: str) -> None:

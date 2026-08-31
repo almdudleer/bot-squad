@@ -14,8 +14,10 @@ whose assignment is complete suspends itself with NO relaunch, because the
 deliverable already exists.
 
 Uniform across roles; the done-signal differs ONLY by role + trigger:
-  * a **task-bound** role (dev / team-lead) is done when its bound task is
-    terminal — ``totest``/``closed`` (it has committed + reported READY);
+  * a **task-bound** role (dev / team-lead) is done when its bound task has
+    reached ``to_accept``/``totest``/``closed`` (it has committed + reported
+    READY — T-0944 inserted ``to_accept`` as the dev's actual delivery point,
+    one step before the human's ``totest`` queue);
   * an **operator** is done when its backlog is empty (no non-closed task left to
     clear — the operator's standing assignment, T-0474).
 A session with no done-signal (a user-conversation / role-only session) is never
@@ -25,8 +27,8 @@ so it still never blocks indefinitely.
 Why EXIT is record-FREE (the deliberate asymmetry vs idle_timeout/autocompact):
 the recycle paths must record-then-relaunch because work is unfinished; EXIT does
 not re-ask the session to record because (1) the deliverable that proves "done"
-already exists (committed code + ``totest`` for a dev; a cleared backlog for an
-operator), (2) a done dev frequently has NO role artifact at all, so the
+already exists (committed code + ``to_accept`` for a dev; a cleared backlog for
+an operator), (2) a done dev frequently has NO role artifact at all, so the
 write-then-relaunch handoff would never even fire for it, and (3) there is no
 successor. So EXIT = a clean :func:`sessions.suspend` (visible-close stamp,
 T-0444). Operator continuity is owned by ``operator_redrive`` (it re-drives the
@@ -35,8 +37,8 @@ empty-backlog operator here merely stops the ~1h ``idle_timeout`` churn it would
 otherwise suffer; the two compose, both keyed on the same empty-backlog signal.
 
 A GRACE window (default ~3min, the session's jsonl idle age) protects a session
-that JUST finished from being cut mid-finish-sequence — a dev sets ``totest`` then
-commits then pings READY; we only exit it once it has actually gone quiet. The
+that JUST finished from being cut mid-finish-sequence — a dev sets ``to_accept``
+then commits then pings READY; we only exit it once it has actually gone quiet. The
 pane must also be idle + composer-ready (never cut mid-turn). Every gate fails
 closed.
 

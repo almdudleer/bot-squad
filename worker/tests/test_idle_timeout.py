@@ -2209,7 +2209,8 @@ def test_compact_exit_without_a_handoff_destination_still_compacts(tmp_path, sea
 def test_handoff_exit_prompt_carries_the_deadline_and_the_status_criterion():
     text = A.context_handoff_prompt("T-0042", relaunch=False)
     assert f"{A.handoff_timeout_sec() // 60} minutes" in text
-    assert "bsq ticket update T-0042 totest" in text
+    # T-0944/T-0947: delivery lands in to_accept, not totest directly.
+    assert "bsq ticket update T-0042 to_accept" in text
     assert "blocked_on_user" in text
     assert "YOU decide whether the work is finished" in text
     # ...and it does NOT promise a resume it will not get

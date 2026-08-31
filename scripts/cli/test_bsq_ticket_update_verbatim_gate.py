@@ -71,8 +71,10 @@ def test_gate_only_applies_to_the_in_progress_transition(tmp_path, monkeypatch):
     p = tmp_path / "T-0001-demo.md"
     _write(p, provenance="stakeholder:2026-07-05", verbatim="(filed via task_new)",
            status="in_progress")
-    _run_update(tmp_path, monkeypatch, status="totest")
-    assert bsq.read_frontmatter(p)["status"] == "totest"
+    # T-0944 removed in_progress -> totest; to_accept is now the delivery edge
+    # out of in_progress, so it's the transition this test needs.
+    _run_update(tmp_path, monkeypatch, status="to_accept")
+    assert bsq.read_frontmatter(p)["status"] == "to_accept"
 
 
 def test_mixed_provenance_token_list_is_detected():

@@ -23,7 +23,8 @@ For any verification DoD item: (1) write the user scenario in plain English (`bs
 ## Report READY
 
 When DoD (incl. manual walkthrough) is green:
-1. `bsq ticket update <id> totest`
+1. `bsq ticket update <id> to_accept` (T-0944: `totest` is the human's queue —
+   delivery lands in `to_accept`, one step before that)
 2. `bsq ticket note <id> '<one-line summary>'`
 3. `bsq peer send <your-TL-SID> 'READY <id> — <summary>'` (find the TL via the worker `list_sessions` action / `bsq team status`).
 

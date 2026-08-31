@@ -1181,6 +1181,20 @@ def graceful_exit_tick(cfg: Config) -> None:
         log.exception("graceful_exit_tick error")
 
 
+def wait_resume_tick(cfg: Config) -> None:
+    """T-0930: auto-resume a suspended WAITING session (blocked_on_user, T-0931)
+    the moment its condition clears — no human needed to notice and resume it
+    by hand. Sibling of idle_timeout_tick/graceful_exit_tick (its own 60s job).
+    No-op under ``BOT_SQUAD_WAIT_RESUME=0``. The sweep swallows per-session/
+    per-project errors so one bad session never kills it.
+    """
+    from bot_squad_worker import wait_resume as _wait_resume
+    try:
+        _wait_resume.tick(cfg)
+    except Exception:
+        log.exception("wait_resume_tick error")
+
+
 def input_flush_tick(cfg: Config) -> None:
     """T-0469 / M1-F1.6: deferred-delivery pass for the input multiplexer.
 

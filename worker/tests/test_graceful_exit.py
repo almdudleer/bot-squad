@@ -242,18 +242,50 @@ def _row(sid: str, *, role="dev", window="demo", task_id="T-0042",
 @pytest.fixture
 def seams(monkeypatch):
     """Stub every tmux/suspend seam so no real session is touched."""
-    calls = {"suspend": []}
+    calls = {"suspend": [], "ctx_handoff": [], "compact": []}
     state = {"pane": "%9", "buf": "❯ \n", "idle_age": 5000.0}
     monkeypatch.setattr(A, "_pane_for", lambda sid: state["pane"])
     monkeypatch.setattr(A, "_capture_pane", lambda pane: state["buf"])
     monkeypatch.setattr(GE, "_suspend",
                         lambda cfg, slug, sid: calls["suspend"].append(sid))
+    # T-0945: the pre-exit handoff ask (never a /compact — `compact` is wired so
+    # a regression that reintroduces one on this path fails loudly).
+    monkeypatch.setattr(A, "_inject_context_handoff",
+                        lambda sid, task_id, *, relaunch=True, stay=False:
+                        calls["ctx_handoff"].append((sid, task_id, relaunch)))
+    monkeypatch.setattr(A, "_send_compact",
+                        lambda sid: calls["compact"].append(sid))
+    # T-0945: this path now consults recycle_gate; no human is attached and
+    # nothing is pinned in these tests unless a test says otherwise.
+    monkeypatch.setattr(GE.recycle_gate, "is_attached", lambda target, **kw: False)
+    monkeypatch.delenv("BOT_SQUAD_EXIT_HANDOFF", raising=False)
     # idle clock: jsonl mtime = now - idle_age
     monkeypatch.setattr(S, "_pane_activity_at",
                         lambda cwd, uuid, home: time.time() - state["idle_age"])
     monkeypatch.delenv("BOT_SQUAD_GRACEFUL_EXIT", raising=False)
     monkeypatch.setenv("BOT_SQUAD_GRACEFUL_EXIT_GRACE_SEC", "180")
     return {"calls": calls, "state": state}
+
+
+# --- T-0945: the pre-exit handoff (handoff + exit, NEVER a compact) ---------
+
+def _write_context(data, task_id: str, text: str) -> None:
+    """Stand in for the session answering the handoff ask — the ONLY thing
+    `_maybe_arm_exit_handoff` watches is the ticket's `## Context` digest."""
+    md = data / "bot-squad" / "backlog" / f"{task_id}-demo.md"
+    body = md.read_text()
+    head, _, _tail = body.partition("## Context")
+    md.write_text(head + "## Context\n\n" + text + "\n")
+
+
+def _exit_after_handoff(cfg, data, row, seams, *, task_id="T-0042"):
+    """Two ticks: the first ARMS the handoff, the second (after the session has
+    written) exits. Returns the second tick's result."""
+    now = time.time()
+    assert GE.maybe_exit(cfg, "bot-squad", row, now=now, user_home="/home/x") is True
+    assert seams["calls"]["suspend"] == []       # not yet — the ticket first
+    _write_context(data, task_id, "what is true now")
+    return GE.maybe_exit(cfg, "bot-squad", row, now=now + 1, user_home="/home/x")
 
 
 # --- DEV: work-done → graceful exit -----------------------------------------
@@ -263,9 +295,12 @@ def test_dev_done_suspends_no_relaunch(tmp_path, seams):
     cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
                           task_status="totest")
     row = _row(sid, role="dev", cwd_repo=data.parent / "repo")
-    assert GE.maybe_exit(cfg, "bot-squad", row, now=time.time(),
-                         user_home="/home/x") is True
+    assert _exit_after_handoff(cfg, data, row, seams) is True
     assert seams["calls"]["suspend"] == [sid]
+    # T-0945: the ask goes to the TICKET, and no compact is ever spent here —
+    # «когда to test для меня … компакты делать не надо».
+    assert seams["calls"]["ctx_handoff"] == [(sid, "T-0042", False)]
+    assert seams["calls"]["compact"] == []
 
 
 def test_dev_closed_also_exits(tmp_path, seams):
@@ -273,9 +308,9 @@ def test_dev_closed_also_exits(tmp_path, seams):
     cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
                           task_status="closed")
     row = _row(sid, role="dev", cwd_repo=data.parent / "repo")
-    assert GE.maybe_exit(cfg, "bot-squad", row, now=time.time(),
-                         user_home="/home/x") is True
+    assert _exit_after_handoff(cfg, data, row, seams) is True
     assert seams["calls"]["suspend"] == [sid]
+    assert seams["calls"]["compact"] == []
 
 
 def test_dev_not_done_is_left_alone(tmp_path, seams):
@@ -403,8 +438,7 @@ def test_maybe_exit_stamps_resume_hint_on_md(tmp_path, seams):
     cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
                           task_status="totest")
     row = _row(sid, role="dev", cwd_repo=data.parent / "repo")
-    assert GE.maybe_exit(cfg, "bot-squad", row, now=time.time(),
-                         user_home="/home/x") is True
+    assert _exit_after_handoff(cfg, data, row, seams) is True
     meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
     assert meta["resume_recommended"] is False
     assert meta["resume_hint_reason"]
@@ -421,8 +455,7 @@ def test_maybe_exit_stamp_failure_does_not_undo_exit(tmp_path, seams, monkeypatc
     monkeypatch.setattr(GE, "_stamp_resume_hint",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     row = _row(sid, role="dev", cwd_repo=data.parent / "repo")
-    assert GE.maybe_exit(cfg, "bot-squad", row, now=time.time(),
-                         user_home="/home/x") is True
+    assert _exit_after_handoff(cfg, data, row, seams) is True
     assert seams["calls"]["suspend"] == [sid]
 
 
@@ -461,8 +494,104 @@ def test_tick_exits_done_active_skips_suspended(tmp_path, seams, monkeypatch):
     monkeypatch.setattr(S, "list_sessions", lambda cfg, slug: [active, dead])
     monkeypatch.setattr(S, "_get_user_home", lambda: "/home/x")
     monkeypatch.setattr(S, "_get_current_user", lambda: "almdudleer")
-    GE.tick(cfg)
+    GE.tick(cfg)                      # tick 1 — arms the pre-exit handoff
+    assert seams["calls"]["suspend"] == []
+    _write_context(data, "T-0042", "what is true now")
+    GE.tick(cfg)                      # tick 2 — the write landed, exit
     assert seams["calls"]["suspend"] == [sid]
+
+
+# --- T-0945: pin/attach hold the exit; the handoff never wedges -------------
+
+def test_pinned_done_session_is_not_exited(tmp_path, seams):
+    """«исчезновение сессии у меня из под носа» — this path had NO recycle_gate
+    check at all, so a done session the human had pinned was suspended anyway."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="totest", extra_md={"pinned": True})
+    row = _row(sid, role="dev", cwd_repo=data.parent / "repo")
+    assert GE.maybe_exit(cfg, "bot-squad", row, now=time.time(),
+                         user_home="/home/x") is False
+    assert seams["calls"]["suspend"] == []
+    assert seams["calls"]["ctx_handoff"] == []
+
+
+def test_attached_done_session_is_not_exited(tmp_path, seams, monkeypatch):
+    """Same rule for a live tmux client — the exit waits out the attachment."""
+    monkeypatch.setattr(GE.recycle_gate, "is_attached", lambda target, **kw: True)
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="totest")
+    row = _row(sid, role="dev", cwd_repo=data.parent / "repo")
+    assert GE.maybe_exit(cfg, "bot-squad", row, now=time.time(),
+                         user_home="/home/x") is False
+    assert seams["calls"]["suspend"] == []
+
+
+def test_exit_handoff_waits_for_the_write_then_exits(tmp_path, seams):
+    """The wait is real: an unchanged `## Context` inside the window keeps the
+    session alive, and the mark is what distinguishes the two."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="totest")
+    row = _row(sid, role="dev", cwd_repo=data.parent / "repo")
+    now = time.time()
+    assert GE.maybe_exit(cfg, "bot-squad", row, now=now, user_home="/home/x") is True
+    md = data / "bot-squad" / "sessions" / f"{sid}.md"
+    assert S._read_session_metadata(md)["exit_handoff_phase"] == "writing"
+    # nothing written yet, still inside the window → hold
+    assert GE.maybe_exit(cfg, "bot-squad", row, now=now + 60,
+                         user_home="/home/x") is False
+    assert seams["calls"]["suspend"] == []
+    _write_context(data, "T-0042", "what is true now")
+    assert GE.maybe_exit(cfg, "bot-squad", row, now=now + 61,
+                         user_home="/home/x") is True
+    assert seams["calls"]["suspend"] == [sid]
+    assert "exit_handoff_phase" not in S._read_session_metadata(md)
+
+
+def test_exit_handoff_never_wedges_on_a_session_that_ignores_it(tmp_path, seams):
+    """Past the bounded window with nothing written, the session exits anyway —
+    the same never-wedge posture every other handoff in the system has."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="totest")
+    row = _row(sid, role="dev", cwd_repo=data.parent / "repo")
+    now = time.time()
+    assert GE.maybe_exit(cfg, "bot-squad", row, now=now, user_home="/home/x") is True
+    late = now + A.handoff_timeout_sec() + 60
+    assert GE.maybe_exit(cfg, "bot-squad", row, now=late,
+                         user_home="/home/x") is True
+    assert seams["calls"]["suspend"] == [sid]
+    assert seams["calls"]["compact"] == []   # never, on this path
+
+
+def test_exit_handoff_kill_switch_restores_the_record_free_exit(tmp_path, seams,
+                                                                monkeypatch):
+    monkeypatch.setenv("BOT_SQUAD_EXIT_HANDOFF", "0")
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="totest")
+    row = _row(sid, role="dev", cwd_repo=data.parent / "repo")
+    assert GE.maybe_exit(cfg, "bot-squad", row, now=time.time(),
+                         user_home="/home/x") is True
+    assert seams["calls"]["suspend"] == [sid]      # one tick, as before T-0945
+    assert seams["calls"]["ctx_handoff"] == []
+
+
+def test_taskless_operator_exit_asks_for_nothing(tmp_path, seams, monkeypatch):
+    """The handoff is scoped to a session with a TICKET to write onto. An
+    operator on an empty backlog has none — it exits in one tick, unchanged."""
+    from bot_squad_worker import operator_redrive
+    monkeypatch.setattr(operator_redrive, "count_pending_backlog",
+                        lambda cfg, slug: 0)
+    sid = "S-almdudleer-bot-squad-operator-p1"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None)
+    row = _row(sid, role="operator", cwd_repo=data.parent / "repo", task_id=None)
+    assert GE.maybe_exit(cfg, "bot-squad", row, now=time.time(),
+                         user_home="/home/x") is True
+    assert seams["calls"]["suspend"] == [sid]
+    assert seams["calls"]["ctx_handoff"] == []
 
 
 # --- NO ROLE EXEMPT from recycle-on-timeout (DoD audit) ---------------------
@@ -488,6 +617,13 @@ def test_no_role_is_exempt_from_idle_recycle(tmp_path, monkeypatch):
     against a general/accidental role exemption without colliding with the
     now-deliberate operator carve-out. dev/TL stay non-exempt, which is what
     this test still asserts.
+
+    T-0945 (2026-08-31) narrows the claim once more and this test now pins the
+    NARROWED version: a TL is swept, but it only reaches the terminate path when
+    none of its tasks is alive. This row is bound to no task at all and to no
+    initiative, so it has no live work — which is exactly the shape that still
+    recycles. A TL with an open ticket is nudged instead; see
+    test_idle_timeout.py::test_teamlead_with_a_live_task_is_nudged_not_recycled.
     """
     compacted = []
     asked = []
@@ -500,10 +636,11 @@ def test_no_role_is_exempt_from_idle_recycle(tmp_path, monkeypatch):
     # asserts on whichever action the recycle took, and still fails if the
     # retired /compact comes back.
     monkeypatch.setattr(A, "_inject_handoff",
-                        lambda sid, art, role=None, *, relaunch=True:
+                        lambda sid, art, role=None, *, relaunch=True, resume=False:
                         asked.append(sid))
     monkeypatch.setattr(A, "_inject_context_handoff",
-                        lambda sid, task_id, *, relaunch=True: asked.append(sid))
+                        lambda sid, task_id, *, relaunch=True, resume=False:
+                        asked.append(sid))
     monkeypatch.setattr(IT, "_context_tokens", lambda cfg, slug, sid: 25000)
     monkeypatch.setattr(IT.recycle_gate, "is_attached", lambda target, **kw: False)
     monkeypatch.setattr(S, "_pane_activity_at",

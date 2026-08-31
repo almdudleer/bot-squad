@@ -239,11 +239,24 @@ def seams(monkeypatch):
     monkeypatch.setattr(A, "_capture_pane", lambda pane, **kw: state["buf"])
     monkeypatch.setattr(A, "_send_compact", lambda sid: calls["compact"].append(sid))
     monkeypatch.setattr(A, "_inject_context_handoff",
-                        lambda sid, task_id, *, relaunch=True:
+                        lambda sid, task_id, *, relaunch=True, resume=False:
                         calls["ctx_handoff"].append((sid, task_id, relaunch)))
     monkeypatch.setattr(A, "_inject_handoff",
-                        lambda sid, art, role=None, *, relaunch=True:
+                        lambda sid, art, role=None, *, relaunch=True, resume=False:
                         calls["handoff"].append((sid, art, role, relaunch)))
+    # T-0945: the resume flag is recorded separately so the tests that care
+    # which EXIT the session was told about can assert on it without every
+    # other test having to spell it out.
+    calls["handoff_resume"] = []
+    _real_ctx, _real_art = A._inject_context_handoff, A._inject_handoff
+    monkeypatch.setattr(A, "_inject_context_handoff",
+                        lambda sid, task_id, *, relaunch=True, resume=False: (
+                            calls["handoff_resume"].append(resume),
+                            _real_ctx(sid, task_id, relaunch=relaunch))[1])
+    monkeypatch.setattr(A, "_inject_handoff",
+                        lambda sid, art, role=None, *, relaunch=True, resume=False: (
+                            calls["handoff_resume"].append(resume),
+                            _real_art(sid, art, role, relaunch=relaunch))[1])
     monkeypatch.setattr(IT, "_context_tokens", lambda cfg, slug, sid: state["tokens"])
 
     def _fake_suspend(cfg, slug, sid, source=None, reason=None):
@@ -810,10 +823,11 @@ def test_hand_launched_user_session_compacts_but_never_terminates(tmp_path, seam
 
 
 def test_hand_launched_user_session_stale_terminate_phase_never_finalized(tmp_path, seams):
-    """Even a stale terminate-flow in-flight phase stamp (a pre-fix leftover,
-    or hand-edited md) must not route an exempt session into the
-    finalize→terminate half — the exempt branch ignores ``idle_recycle_phase``
-    entirely and drives its own ``compact_stay_phase`` machine instead."""
+    """Even a stale terminate-flow in-flight phase stamp (a pre-fix leftover, a
+    hand-edited md, or — T-0945 — a human attaching mid-recycle) must not route
+    an exempt session into the finalize→terminate half. T-0945 goes one step
+    further than "ignore it": the stale stamp is CLEARED, so the session is not
+    carrying a terminate arm the moment it stops being exempt."""
     sid = "S-almdudleer-user-session-p8"
     armed = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None,
@@ -824,7 +838,13 @@ def test_hand_launched_user_session_stale_terminate_phase_never_finalized(tmp_pa
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
     assert seams["calls"]["terminate"] == []
+    md = data / "bot-squad" / "sessions" / f"{sid}.md"
+    assert "idle_recycle_phase" not in S._read_session_metadata(md)
+    # and the NEXT tick behaves like any other exempt session: compact in place
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
     assert seams["calls"]["compact"] == [sid]
+    assert seams["calls"]["terminate"] == []
 
 
 def test_recycle_exempt_marker_blocks_terminate_but_allows_compact_stay(tmp_path, seams):
@@ -841,18 +861,38 @@ def test_recycle_exempt_marker_blocks_terminate_but_allows_compact_stay(tmp_path
     assert seams["calls"]["compact"] == [sid] and seams["calls"]["terminate"] == []
 
 
-def test_pinned_marker_blocks_compact_stay_too(tmp_path, seams):
-    """T-0926 follow-up: unlike ``recycle_exempt`` (blocks terminate only,
-    still permits compact-and-stay by design), an explicit ``pinned: true``
-    stamp blocks compact-and-stay as well — no automatic action at all."""
+def test_pinned_marker_blocks_terminate_but_now_allows_compact_stay(tmp_path, seams):
+    """T-0926 made ``pinned: true`` mean "no automatic action of any kind",
+    including no compact-and-stay. T-0945 REVERSES the compact half on the
+    stakeholder's own reading of what pinning was for: «Про пины и исчезновение
+    сессии у меня из под носа, кажется, это был симптом плохо настроенного вот
+    этого процесса, а не правильное решение», and, for a manual session, «нужно
+    до протухания кешей сделать компакт». So a pin now blocks the EXIT — the
+    part that cost him the session — and not the compact he asked for."""
     sid = "S-almdudleer-user-session-p8"
     cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None,
                           extra_md={"pinned": True})
     row = _row(sid, window="user-session", task_id=None,
                cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
-                            user_home="/home/x") is False
-    assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
+                            user_home="/home/x") is True
+    assert seams["calls"]["compact"] == [sid]
+    assert seams["calls"]["terminate"] == []
+
+
+def test_pinned_dev_session_is_never_terminated(tmp_path, seams):
+    """The half of T-0926 that T-0945 keeps, on the role where it bites: a
+    pinned WORKER session (not exempt by role or window) still never rides the
+    terminate path, whatever its task says."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="closed", extra_md={"pinned": True})
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["terminate"] == []
+    assert seams["calls"]["ctx_handoff"] == []
+    assert seams["calls"]["compact"] == [sid]
 
 
 # --- A3. T-0617: compact-and-stay — arm, finalize, anti-loop ----------------
@@ -1237,12 +1277,11 @@ def test_config_recycle_projects_fallback_allows_watchrobot(tmp_path, seams):
     assert _fired(seams)
 
 
-def test_user_conversation_role_never_terminated_but_gets_compact_stay(tmp_path, seams):
-    """T-0564: the human's own live chat is never auto-TERMINATED, even when
-    idle past the window and in an allowlisted project. T-0617: it DOES get
-    compact-and-stay — this is in fact the session the T-0566 soft ask
-    ("compact user sessions before cache expiry, in place") most concretely
-    describes, since it is the longest-lived session in the system."""
+def test_user_conversation_role_hands_off_before_it_compacts(tmp_path, seams):
+    """T-0945 replaces T-0617's compact-and-stay for THIS role: «с ролью
+    user-conversation всегда имеет смысл по таймауту 55 мин делать handoff +
+    compact + exit, и потом всегда resume». The handoff comes FIRST — the
+    compact is only spent once the forward-state is safe."""
     sid = "S-almdudleer-bot-squad-demo-p5"
     cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
                           extra_md={"role": "user-conversation"})
@@ -1250,19 +1289,52 @@ def test_user_conversation_role_never_terminated_but_gets_compact_stay(tmp_path,
     row["role"] = "user-conversation"
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
-    assert seams["calls"]["compact"] == [sid] and seams["calls"]["terminate"] == []
+    assert seams["calls"]["ctx_handoff"] == [(sid, "T-0042", False)]
+    assert seams["calls"]["compact"] == []      # not before the write lands
+    assert seams["calls"]["terminate"] == []
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert meta["idle_recycle_phase"] == "finalizing"
 
 
-def test_attached_session_never_recycled(tmp_path, seams, monkeypatch):
-    """T-0564: a human tmux client attached to the pane blocks the recycle even
-    in an allowlisted project with a non-exempt role."""
+def test_attached_session_never_terminated_but_is_compacted_in_place(tmp_path, seams,
+                                                                     monkeypatch):
+    """T-0564 blocked EVERY action while a human client was attached, so an
+    attended pane simply let its cache expire. T-0945 keeps the half that
+    matters — it is never terminated, never handed off, never relaunched — and
+    downgrades it to compact-in-place, which is what he asked for by name («к
+    ручной сессии актуальны те же правила, нужно до протухания кешей сделать
+    компакт») and what T-0930 already ruled for the ceiling trigger («это
+    разумная компакт логика даже когда я работаю с сессией»)."""
     monkeypatch.setattr(IT.recycle_gate, "is_attached", lambda target, **kw: True)
     sid = "S-almdudleer-bot-squad-demo-p5"
     cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
     row = _row(sid, cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
-                            user_home="/home/x") is False
-    assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
+                            user_home="/home/x") is True
+    assert seams["calls"]["compact"] == [sid]
+    assert seams["calls"]["terminate"] == []
+    assert seams["calls"]["ctx_handoff"] == []
+
+
+def test_attaching_mid_recycle_abandons_the_terminate_half(tmp_path, seams,
+                                                           monkeypatch):
+    """The pin-era pain, mechanically: a handoff was armed while the session
+    was unattended, then the human attached. Finishing that recycle is «исчезно-
+    вение сессии у меня из под носа» — so the arm is dropped instead."""
+    monkeypatch.setattr(IT.recycle_gate, "is_attached", lambda target, **kw: True)
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    armed = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          extra_md={"idle_recycle_phase": "finalizing",
+                                    "idle_recycle_armed_at": armed,
+                                    "idle_recycle_mark": "ctx:stale"})
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["terminate"] == []
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert "idle_recycle_phase" not in meta
+    assert "idle_recycle_mark" not in meta
 
 
 def _operator_row(sid: str, *, cwd_repo: Path, status="active"):
@@ -1582,10 +1654,10 @@ def test_dev_nudge_waits_for_composer_ready(tmp_path, dev_nudge_seams):
 def test_dev_drive_unmet_helper(tmp_path, seams):
     cfg, data = _make_cfg(tmp_path, sid="S-almdudleer-bot-squad-demo-p5",
                           window="demo", task_id="T-0042", task_status="open")
-    assert IT.dev_drive_unmet(cfg, "bot-squad", "T-0042") is True
-    assert IT.dev_drive_unmet(cfg, "bot-squad", None) is False
-    assert IT.dev_drive_unmet(cfg, "bot-squad", "") is False
-    assert IT.dev_drive_unmet(cfg, "bot-squad", "T-9999-missing") is False
+    assert IT.task_alive(cfg, "bot-squad", "T-0042") is True
+    assert IT.task_alive(cfg, "bot-squad", None) is False
+    assert IT.task_alive(cfg, "bot-squad", "") is False
+    assert IT.task_alive(cfg, "bot-squad", "T-9999-missing") is False
 
 
 def test_dev_drive_unmet_false_for_done_and_waiting(tmp_path):
@@ -1596,7 +1668,7 @@ def test_dev_drive_unmet_false_for_done_and_waiting(tmp_path):
         tp.mkdir()
         cfg, data = _make_cfg(tp, sid="S-almdudleer-bot-squad-demo-p5",
                               window="demo", task_id="T-0042", task_status=status)
-        assert IT.dev_drive_unmet(cfg, "bot-squad", "T-0042") is expected, status
+        assert IT.task_alive(cfg, "bot-squad", "T-0042") is expected, status
 
 
 # --- T-0655: drive=off is the ONLY thing that permits an operator to recycle -
@@ -1621,39 +1693,59 @@ def test_drive_off_operator_falls_through_to_normal_recycle(tmp_path, keepalive_
     assert meta["idle_recycle_phase"] == "finalizing"
 
 
-def test_drive_off_operator_below_threshold_self_terminates_without_resume_bait(tmp_path, keepalive_seams):
+def test_drive_off_operator_below_threshold_exits_resumable(tmp_path, keepalive_seams):
+    """T-0945 REVERSES T-0655's self_terminate. It exited a drive=off operator
+    with no ``resumable``/``resume_hint`` at all («лучше самозавершиться»); the
+    2026-08-31 ruling gives the operator the user-conversation contract — «С
+    ролью operator — то же самое» + «потом всегда resume». Below the context
+    threshold there is still nothing to compact, so this is a plain exit."""
     sid = "S-almdudleer-bot-squad-operator-p1"
     cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None,
                           extra_md={"drive": "off"})
-    keepalive_seams["state"]["tokens"] = 5000  # below threshold — terminate immediately
+    keepalive_seams["state"]["tokens"] = 5000  # below threshold
     row = _operator_row(sid, cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
     assert keepalive_seams["calls"]["terminate"] == [sid]
+    assert keepalive_seams["calls"]["compact"] == []   # «не на всякий случай»
     meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
     assert meta["status"] == "suspended"
     assert "recycled_at" in meta
-    # T-0655: self_terminate — no resume bait for a deliberate operator stop
-    assert "resumable" not in meta
-    assert "resume_hint" not in meta
+    assert meta["resumable"] is True
+    assert "resume_hint" in meta
 
 
-def test_drive_off_operator_finalize_compact_also_self_terminates(tmp_path, keepalive_seams):
-    """The finalize half of an in-flight compact must ALSO self-terminate for
-    an operator — role is threaded through, not just the arm half."""
+def test_drive_off_operator_compacts_before_the_resumable_exit(tmp_path, keepalive_seams):
+    """Over the threshold the operator rides the FULL compact_exit ladder, same
+    as the attendant: the finalize half spends one /compact, and the terminate
+    happens on the next tick — never in the same one, or the squeeze would be
+    typed over by the suspend sequence."""
     sid = "S-almdudleer-bot-squad-operator-p1"
     armed = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None,
                           extra_md={"drive": "off",
-                                    "idle_recycle_phase": "compacting",
-                                    "idle_recycle_armed_at": armed})
+                                    "idle_recycle_phase": "finalizing",
+                                    "idle_recycle_armed_at": armed,
+                                    # differs from the artifact's real mtime
+                                    # (0.0, it does not exist) → "it wrote"
+                                    "idle_recycle_mark": "mtime:1.0"})
     row = _operator_row(sid, cwd_repo=data.parent / "repo")
+    md = data / "bot-squad" / "sessions" / f"{sid}.md"
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert keepalive_seams["calls"]["compact"] == [sid]
+    assert keepalive_seams["calls"]["terminate"] == []
+    meta = S._read_session_metadata(md)
+    assert meta["idle_recycle_phase"] == IT.PHASE_COMPACT_EXIT
+    assert meta["idle_recycle_wrote_state"] == "true"
+
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
     assert keepalive_seams["calls"]["terminate"] == [sid]
-    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
-    assert "resumable" not in meta
-    assert "resume_hint" not in meta
+    meta = S._read_session_metadata(md)
+    assert meta["resumable"] is True
+    assert meta["recycled_compacted"] is True
+    assert "context compacted before exit" in meta["resume_hint"]
 
 
 # --- T-0655 regression: dev/TL terminate-and-remember flow is UNCHANGED -----
@@ -1673,8 +1765,15 @@ def test_dev_role_recycle_still_stamps_resumable_unaffected_by_drive(tmp_path, s
     assert "resume_hint" in meta
 
 
-def test_attached_check_failure_skips_recycle(tmp_path, seams, monkeypatch):
-    """T-0564: a tmux list-clients error fails CLOSED (treated as attached)."""
+def test_attached_check_failure_never_terminates(tmp_path, seams, monkeypatch):
+    """T-0564: a tmux list-clients error fails CLOSED (treated as attached).
+
+    T-0945 changes what "closed" costs, not which way it fails: an unreadable
+    client list still means "assume a human is there", and a session assumed
+    attended is never terminated, handed off or relaunched. It is now compacted
+    in place instead of left to expire — the same downgrade a genuinely
+    attached pane gets, and the destructive half is what the fail-closed
+    posture exists to guard."""
     # exercise the REAL is_attached (undoing the seams fixture's stub) to prove
     # the fail-closed subprocess-error path, routed through the gate.
     monkeypatch.setattr(IT.recycle_gate, "is_attached", _REAL_IS_ATTACHED)
@@ -1685,49 +1784,96 @@ def test_attached_check_failure_skips_recycle(tmp_path, seams, monkeypatch):
     cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
     row = _row(sid, cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
-                            user_home="/home/x") is False
-    assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
+                            user_home="/home/x") is True
+    assert seams["calls"]["terminate"] == []
+    assert seams["calls"]["ctx_handoff"] == []
+    assert seams["calls"]["compact"] == [sid]
 
 
-# --- T-0930: user-conversation ~3h idle exit (stakeholder 2026-08-31) --------
+# --- T-0945: user-conversation handoff + compact + exit at the 55min line ---
 #
-# «Yes, loosen ... I'd prefer it compacted, however, not exited I think,
-# exited in 3 hours maybe» — the direct answer that reversed T-0720. 55 min
-# idle keeps compact-and-stay; past uc_exit_sec() the attendant EXITS with
-# resume state, and ensure_user_conversation revives it via claude --resume.
+# «с ролью user-conversation всегда имеет смысл по таймауту 55 мин делать
+# handoff + compact + exit, и потом всегда resume, т.к. у нее всегда есть
+# продолжение». This REPLACES T-0930's ladder (compact-and-stay at 55 min, a
+# bare exit at ~3 h): the exit line IS the cache window now, and the compact is
+# spent because the resume is certain, not «на всякий случай».
 
-def _uc_cfg(tmp_path, seams, idle_age):
+def _uc_cfg(tmp_path, seams, idle_age, *, task_id=None):
     sid = "S-almdudleer-bot-squad-demo-p5"
-    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id=None,
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id=task_id,
                           extra_md={"role": "user-conversation"})
-    row = _row(sid, window="demo", task_id=None, cwd_repo=data.parent / "repo")
+    row = _row(sid, window="demo", task_id=task_id, cwd_repo=data.parent / "repo")
     row["role"] = "user-conversation"
     seams["state"]["idle_age"] = idle_age
     return sid, cfg, data, row
 
 
-def test_uc_past_three_hours_exits_resumable(tmp_path, seams):
+def test_uc_exit_line_is_the_cache_window_not_a_separate_number():
+    """T-0930 had its own DEFAULT_UC_EXIT_SEC = 10800. T-0945 folds it into the
+    one window, so there is no second constant to drift."""
+    assert IT.uc_exit_sec() == IT.idle_timeout_sec() == 3300
+
+
+def test_uc_full_ladder_handoff_then_compact_then_resumable_exit(tmp_path, seams):
+    """The whole T-0945 sequence for the attendant, tick by tick."""
     sid, cfg, data, row = _uc_cfg(tmp_path, seams, idle_age=IT.uc_exit_sec() + 60)
-    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+    md = data / "bot-squad" / "sessions" / f"{sid}.md"
+    now = time.time()
+
+    # tick 1 — ASK for the forward-state; no compact, no exit yet
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=now,
                             user_home="/home/x") is True
-    assert seams["calls"]["terminate"] == [sid]
-    assert seams["calls"]["compact"] == []  # exit, not another compact
-    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
-    assert meta["resumable"] is True  # the revive half depends on this stamp
+    assert len(seams["calls"]["handoff"]) == 1     # task-less → role artifact
+    assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
+    assert S._read_session_metadata(md)["idle_recycle_phase"] == "finalizing"
 
-
-def test_uc_under_three_hours_still_compacts_and_stays(tmp_path, seams):
-    """The 55-min rung is untouched: idle past the compact window but under
-    the exit line → compact-and-stay, никогда terminate."""
-    sid, cfg, data, row = _uc_cfg(tmp_path, seams, idle_age=5000.0)
-    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+    # tick 2 — the write landed → spend the ONE justified /compact
+    art = seams["calls"]["handoff"][0][1]
+    Path(art).parent.mkdir(parents=True, exist_ok=True)
+    Path(art).write_text("forward state\n")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=now + 1,
                             user_home="/home/x") is True
     assert seams["calls"]["compact"] == [sid]
     assert seams["calls"]["terminate"] == []
+    assert S._read_session_metadata(md)["idle_recycle_phase"] == IT.PHASE_COMPACT_EXIT
+
+    # tick 3 — the compact landed → EXIT, resumable (the revive half depends
+    # on this stamp: ensure_user_conversation resumes on the next message)
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=now + 2,
+                            user_home="/home/x") is True
+    assert seams["calls"]["terminate"] == [sid]
+    meta = S._read_session_metadata(md)
+    assert meta["resumable"] is True
+    assert meta["recycled_compacted"] is True
+
+
+def test_uc_below_the_context_threshold_exits_without_a_compact(tmp_path, seams):
+    """«Важно, чтобы она не начала делать компакт на всякий случай» — with
+    nothing worth squeezing there is no basis, so the exit is plain."""
+    sid, cfg, data, row = _uc_cfg(tmp_path, seams, idle_age=IT.uc_exit_sec() + 60)
+    seams["state"]["tokens"] = 5000
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["compact"] == []
+    assert seams["calls"]["terminate"] == [sid]
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert meta["resumable"] is True
+    assert "recycled_compacted" not in meta
+
+
+def test_uc_under_the_window_is_left_alone(tmp_path, seams):
+    """Under the line nothing fires at all — the pre-T-0945 rung here was a
+    compact-and-stay at 55 min, and there is no longer a rung below the exit."""
+    sid, cfg, data, row = _uc_cfg(tmp_path, seams, idle_age=100.0)
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
 
 
 def test_uc_exit_disabled_by_env_restores_never_terminate(tmp_path, seams,
                                                           monkeypatch):
+    """The kill switch for this ruling: with the exit disabled the attendant
+    falls back to T-0617 compact-and-stay rather than to nothing."""
     monkeypatch.setenv("BOT_SQUAD_UC_EXIT_SEC", "0")
     sid, cfg, data, row = _uc_cfg(tmp_path, seams, idle_age=999999.0)
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
@@ -1737,13 +1883,26 @@ def test_uc_exit_disabled_by_env_restores_never_terminate(tmp_path, seams,
 
 
 def test_uc_exit_defers_while_the_human_is_typing(tmp_path, seams):
-    """The suspend sequence types C-c/exit into the pane — never over a
+    """The handoff/suspend sequences both type into the pane — never over a
     half-typed draft. Composer busy → no action at all this tick."""
     sid, cfg, data, row = _uc_cfg(tmp_path, seams, idle_age=IT.uc_exit_sec() + 60)
     seams["state"]["buf"] = "❯ вот мой недописанный ответ\n"
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is False
     assert seams["calls"]["terminate"] == [] and seams["calls"]["compact"] == []
+
+
+def test_uc_attached_is_compacted_in_place_never_exited(tmp_path, seams,
+                                                        monkeypatch):
+    """«Но моя проблема была с тем, что он делал handoff + exit и у меня терялся
+    просто весь контекст беседы выше» — the exit is only ever taken behind his
+    back, never on a pane he is looking at."""
+    monkeypatch.setattr(IT.recycle_gate, "is_attached", lambda target, **kw: True)
+    sid, cfg, data, row = _uc_cfg(tmp_path, seams, idle_age=IT.uc_exit_sec() + 60)
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["compact"] == [sid]
+    assert seams["calls"]["terminate"] == []
 
 
 def test_uc_exit_scoped_to_the_role_not_all_exempt_sessions(tmp_path, seams):
@@ -1758,3 +1917,346 @@ def test_uc_exit_scoped_to_the_role_not_all_exempt_sessions(tmp_path, seams):
                             user_home="/home/x") is True
     assert seams["calls"]["terminate"] == []
     assert seams["calls"]["compact"] == [sid]
+
+
+# ============================================================================
+# T-0945 — recycle-by-role v2
+#
+# «в зависимости от того, какие роли держит сессия, мы ее по разному можем
+# ресайклить … компакт это дорогая операция, и если мы не собираемся продолжать
+# сессию через resume или в этом же окне вообще никогда, нужно только handoff …
+# Важно, чтобы она не начала делать компакт на всякий случай, надо только если
+# есть основание что будет продолжение.»
+#
+# The policy is a pure function (`recycle_plan`) so it can be read and pinned as
+# a TABLE rather than traced through the executor. The executor tests below then
+# prove each plan is actually what runs.
+# ============================================================================
+
+def _plan(role, *, window="demo", meta=None, attached=False, tasks_alive=False):
+    return IT.recycle_plan(role=role, window=window, meta=meta or {},
+                           attached=attached, tasks_alive=tasks_alive)
+
+
+def test_recycle_plan_table():
+    """Every row of the module docstring's table, in order."""
+    # the human's own panes — compact in place, never exit
+    assert _plan("dev", attached=True) == IT.PLAN_STAY
+    assert _plan("dev", meta={"pinned": True}) == IT.PLAN_STAY
+    assert _plan("dev", window="user-session") == IT.PLAN_STAY
+    assert _plan("dev", meta={"recycle_exempt": True}) == IT.PLAN_STAY
+    # the two roles whose continuation is certain
+    assert _plan("user-conversation") == IT.PLAN_COMPACT_EXIT
+    assert _plan("operator", meta={"drive": "off"}) == IT.PLAN_COMPACT_EXIT
+    # ...except while the operator is driving
+    assert _plan("operator") == IT.PLAN_NUDGE                    # drive defaults ON
+    assert _plan("operator", meta={"drive": "on"}) == IT.PLAN_NUDGE
+    # worker roles live exactly as long as their work does
+    assert _plan("dev", tasks_alive=True) == IT.PLAN_NUDGE
+    assert _plan("dev", tasks_alive=False) == IT.PLAN_HANDOFF_EXIT
+    assert _plan("teamlead", tasks_alive=True) == IT.PLAN_NUDGE
+    assert _plan("teamlead", tasks_alive=False) == IT.PLAN_HANDOFF_EXIT
+    # anything unrecognised keeps the pre-T-0945 default
+    assert _plan("", tasks_alive=True) == IT.PLAN_HANDOFF_EXIT
+    assert _plan("some-future-role") == IT.PLAN_HANDOFF_EXIT
+
+
+def test_recycle_plan_only_compact_exit_ever_spends_a_compact():
+    """The claim the whole ticket rests on, stated once as an invariant: a plan
+    that ends in a terminate spends a /compact ONLY when a resume is certain."""
+    exiting = {IT.PLAN_COMPACT_EXIT, IT.PLAN_HANDOFF_EXIT}
+    assert IT.PLAN_COMPACT_EXIT in exiting and IT.PLAN_HANDOFF_EXIT in exiting
+    # a dev/TL exit is the else-branch — no compact, by name
+    assert _plan("dev") == IT.PLAN_HANDOFF_EXIT
+    assert _plan("teamlead") == IT.PLAN_HANDOFF_EXIT
+
+
+def test_recycle_plan_pin_and_attach_beat_every_role():
+    """Precedence, and the negative control that proves it is precedence and
+    not an accident of which roles were tested: the SAME inputs that would
+    otherwise exit produce STAY once a human is there."""
+    for role, meta in (("user-conversation", {}),
+                       ("operator", {"drive": "off"}),
+                       ("dev", {}),
+                       ("teamlead", {})):
+        assert _plan(role, meta=meta) != IT.PLAN_STAY, role      # control
+        assert _plan(role, meta=meta, attached=True) == IT.PLAN_STAY, role
+        assert _plan(role, meta={**meta, "pinned": True}) == IT.PLAN_STAY, role
+
+
+def test_recycle_plan_uc_kill_switch_downgrades_to_stay(monkeypatch):
+    """BOT_SQUAD_UC_EXIT_SEC=0 restores the pre-T-0945 behaviour for the two
+    exit roles — compact-and-stay for the attendant, a plain handoff exit for
+    a drive=off operator (which is what it did before T-0945 too)."""
+    monkeypatch.setenv("BOT_SQUAD_UC_EXIT_SEC", "0")
+    assert _plan("user-conversation") == IT.PLAN_STAY
+    assert _plan("operator", meta={"drive": "off"}) == IT.PLAN_HANDOFF_EXIT
+
+
+def test_worker_nudge_cadence_is_role_dependent(monkeypatch):
+    """A dev gets T-0930's 5 min; a TL gets the operator's 40, because a TL
+    waits on its devs for the same reason the operator does."""
+    monkeypatch.delenv("BOT_SQUAD_DEV_NUDGE_SEC", raising=False)
+    monkeypatch.delenv("BOT_SQUAD_OPERATOR_NUDGE_SEC", raising=False)
+    assert IT.worker_nudge_sec("dev") == IT.DEFAULT_DEV_NUDGE_SEC == 300
+    assert IT.worker_nudge_sec("teamlead") == IT.DEFAULT_OPERATOR_NUDGE_SEC == 2400
+    assert IT.worker_nudge_sec("dev") != IT.worker_nudge_sec("teamlead")
+
+
+# --- bindings: «какая-то из их задач» is plural -----------------------------
+
+def test_bound_task_ids_reads_the_primary_and_the_bundle():
+    row = {"task_id": "T-0042"}
+    meta = {"task_id": "T-0042", "extra_task_ids": ["T-0043", "T-0044"]}
+    assert IT.bound_task_ids(row, meta) == ["T-0042", "T-0043", "T-0044"]
+    # unset sentinels and duplicates drop out; a task-less session reads empty
+    assert IT.bound_task_ids({"task_id": "~"}, {"extra_task_ids": []}) == []
+    assert IT.bound_task_ids(None, None) == []
+    # a bundle that survived as an inline string is still read (defensive: the
+    # md is parsed by pyyaml, but rows come from several producers)
+    assert IT.bound_task_ids({}, {"extra_task_ids": "[T-0043, T-0044]"}) == \
+        ["T-0043", "T-0044"]
+
+
+def _add_task(data, task_id: str, status: str, *, initiative: str = "") -> None:
+    backlog = data / "bot-squad" / "backlog"
+    backlog.mkdir(parents=True, exist_ok=True)
+    init = f"initiative: {initiative}\n" if initiative else ""
+    (backlog / f"{task_id}-extra.md").write_text(
+        f"---\nid: {task_id}\ntitle: Extra\nstatus: {status}\n{init}---\n\n"
+        "## Context\n\nstate\n")
+
+
+def test_worker_tasks_alive_any_binding_counts(tmp_path, seams):
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="closed")
+    _add_task(data, "T-0043", "in_progress")
+    assert IT.worker_tasks_alive(cfg, "bot-squad", ["T-0042"]) is False
+    assert IT.worker_tasks_alive(cfg, "bot-squad", ["T-0042", "T-0043"]) is True
+    assert IT.worker_tasks_alive(cfg, "bot-squad", []) is False
+
+
+def test_worker_tasks_alive_taskless_tl_reads_its_initiative(tmp_path, seams):
+    sid = "S-almdudleer-bot-squad-tl-p7"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="tl", task_id=None)
+    _add_task(data, "T-0043", "closed", initiative="I-0001")
+    assert IT.worker_tasks_alive(cfg, "bot-squad", [], role="teamlead",
+                                 initiative="I-0001") is False
+    _add_task(data, "T-0044", "in_progress", initiative="I-0001")
+    assert IT.worker_tasks_alive(cfg, "bot-squad", [], role="teamlead",
+                                 initiative="I-0001") is True
+    # scoped to the ROLE and to a real initiative — a dev never gets this branch
+    assert IT.worker_tasks_alive(cfg, "bot-squad", [], role="dev",
+                                 initiative="I-0001") is False
+    assert IT.worker_tasks_alive(cfg, "bot-squad", [], role="teamlead",
+                                 initiative="~") is False
+
+
+# --- the executor: each plan is what actually runs --------------------------
+
+def test_dev_with_a_live_BUNDLED_task_is_nudged_though_its_primary_is_done(
+        tmp_path, dev_nudge_seams):
+    """The concrete defect the plural fixes: a bundled dev whose primary hit
+    totest was recycled while its bundled ticket was still open."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="totest",
+                          extra_md={"extra_task_ids": ["T-0043"]})
+    _add_task(data, "T-0043", "in_progress")
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert len(dev_nudge_seams["calls"]["dev_nudge"]) == 1
+    assert dev_nudge_seams["calls"]["terminate"] == []
+
+
+def test_dev_with_every_binding_done_still_hands_off_and_exits(
+        tmp_path, dev_nudge_seams):
+    """Control for the test above — the bundle only keeps it alive while a
+    bundled ticket IS alive."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="totest",
+                          extra_md={"extra_task_ids": ["T-0043"]})
+    _add_task(data, "T-0043", "closed")
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert dev_nudge_seams["calls"]["dev_nudge"] == []
+    assert dev_nudge_seams["calls"]["ctx_handoff"] == [(sid, "T-0042", False)]
+    assert dev_nudge_seams["calls"]["compact"] == []   # handoff_exit spends none
+
+
+def test_teamlead_with_a_live_task_is_nudged_not_recycled(tmp_path, dev_nudge_seams):
+    """«Для ролей TL и dev … логично продолжать только пока какая-то из их
+    задач жива» — before T-0945 only the dev half of that sentence was built,
+    so a TL with live devs was recycled on the 55 min window."""
+    sid = "S-almdudleer-bot-squad-tl-p7"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="tl", task_id="T-0042",
+                          task_status="in_progress")
+    row = _row(sid, window="tl", cwd_repo=data.parent / "repo")
+    row["role"] = "teamlead"
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert len(dev_nudge_seams["calls"]["dev_nudge"]) == 1
+    # the text is the TL's, not the dev's — it points at the TL's own move
+    text = dev_nudge_seams["calls"]["dev_nudge"][0][1]
+    assert "bsq team status" in text
+    assert "Your bound task" not in text
+    assert dev_nudge_seams["calls"]["terminate"] == []
+
+
+def test_teamlead_with_nothing_open_hands_off_and_exits(tmp_path, dev_nudge_seams):
+    sid = "S-almdudleer-bot-squad-tl-p7"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="tl", task_id="T-0042",
+                          task_status="closed")
+    row = _row(sid, window="tl", cwd_repo=data.parent / "repo")
+    row["role"] = "teamlead"
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert dev_nudge_seams["calls"]["dev_nudge"] == []
+    assert dev_nudge_seams["calls"]["ctx_handoff"] == [(sid, "T-0042", False)]
+    assert dev_nudge_seams["calls"]["compact"] == []
+
+
+def test_taskless_teamlead_lives_while_its_initiative_has_open_work(
+        tmp_path, dev_nudge_seams):
+    sid = "S-almdudleer-bot-squad-tl-p7"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="tl", task_id=None)
+    _add_task(data, "T-0043", "in_progress", initiative="I-0001")
+    row = _row(sid, window="tl", task_id=None, cwd_repo=data.parent / "repo")
+    row["role"] = "teamlead"
+    row["initiative"] = "I-0001"
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert len(dev_nudge_seams["calls"]["dev_nudge"]) == 1
+    assert dev_nudge_seams["calls"]["terminate"] == []
+
+
+def test_teamlead_nudge_waits_the_operator_cadence_not_the_dev_one(
+        tmp_path, dev_nudge_seams):
+    """A TL idle for 6 minutes is NOT nudged (a dev would be); at 41 it is."""
+    sid = "S-almdudleer-bot-squad-tl-p7"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="tl", task_id="T-0042",
+                          task_status="in_progress")
+    row = _row(sid, window="tl", cwd_repo=data.parent / "repo")
+    row["role"] = "teamlead"
+    dev_nudge_seams["state"]["idle_age"] = 360.0        # 6 min
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert dev_nudge_seams["calls"]["dev_nudge"] == []
+    dev_nudge_seams["state"]["idle_age"] = 2460.0       # 41 min
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert len(dev_nudge_seams["calls"]["dev_nudge"]) == 1
+
+
+def test_compact_exit_with_a_busy_pane_at_timeout_exits_without_compacting(
+        tmp_path, seams):
+    """Never wedge, and never pay for a squeeze that cannot land: /compact needs
+    the same composer-ready pane this finalize does, so a pane still busy at the
+    deadline gets the exit without it."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    armed = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                          time.gmtime(time.time() - 100000))
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          extra_md={"role": "user-conversation",
+                                    "idle_recycle_phase": "finalizing",
+                                    "idle_recycle_armed_at": armed,
+                                    "idle_recycle_mark": "ctx:stale"})
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    row["role"] = "user-conversation"
+    seams["state"]["buf"] = "esc to interrupt"          # mid-turn, not ready
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["compact"] == []
+    assert seams["calls"]["terminate"] == [sid]
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert meta["resumable"] is True
+    assert "recycled_compacted" not in meta
+
+
+def test_compact_exit_without_a_handoff_destination_still_compacts(tmp_path, seams):
+    """A task-less attendant whose role artifact cannot be resolved has nothing
+    to hand off — but the resume is still certain and the context is still over
+    the threshold, so the compact is still justified. (The handoff_exit plan in
+    the same situation terminates bare — see
+    test_start_with_no_destination_terminates_without_a_compact.)"""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          extra_md={"role": "user-conversation"})
+    (data / "bot-squad" / "backlog" / "T-0042-demo.md").unlink()
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    row["role"] = "user-conversation"
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["compact"] == [sid]
+    assert seams["calls"]["terminate"] == []
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert meta["idle_recycle_phase"] == IT.PHASE_COMPACT_EXIT
+    assert meta["idle_recycle_wrote_state"] == "false"
+
+
+# --- T-0945: the system supplies the deadline and the criteria --------------
+#
+# «система должна ей ставить дедлайн и предоставлять четкие критерии, как
+# решить, нужно ли делать compact для последующего resume или только handoff +
+# exit … Это должна решать сама сессия, закончила она работу или нет.» The
+# session's half of that decision is the TICKET STATUS — which is exactly what
+# `recycle_plan` reads on the next tick, so the loop closes.
+
+def test_handoff_exit_prompt_carries_the_deadline_and_the_status_criterion():
+    text = A.context_handoff_prompt("T-0042", relaunch=False)
+    assert f"{A.handoff_timeout_sec() // 60} minutes" in text
+    assert "bsq ticket update T-0042 totest" in text
+    assert "blocked_on_user" in text
+    assert "YOU decide whether the work is finished" in text
+    # ...and it does NOT promise a resume it will not get
+    assert "claude --resume" not in text
+
+
+def test_compact_exit_prompt_tells_the_truth_about_the_resume():
+    """The docstring's own rule, applied a third time: «telling a session it is
+    about to be relaunched when it is about to be ended is the kind of small lie
+    that changes what it bothers to write down». A compact_exit session is
+    coming back — telling it NOTHING survives is that lie inverted."""
+    text = A.context_handoff_prompt("T-0042", relaunch=False, resume=True)
+    assert "claude --resume" in text
+    assert "NOTHING from this conversation survives" not in text
+    assert f"{A.handoff_timeout_sec() // 60} minutes" in text
+    # the artifact still matters — a summary is lossy and others read the ticket
+    assert "bsq ticket context T-0042" in text
+    # control: the non-resume variant DOES say it
+    assert "NOTHING from this conversation survives" in A.context_handoff_prompt(
+        "T-0042", relaunch=False)
+
+
+def test_taskless_compact_exit_prompt_also_states_the_resume():
+    text = A.handoff_prompt("/x/operator-state.md", "operator", relaunch=False,
+                            resume=True)
+    assert "claude --resume" in text
+    assert "NOTHING from this conversation survives" not in text
+    assert "NOTHING from this conversation survives" in A.handoff_prompt(
+        "/x/operator-state.md", "operator", relaunch=False)
+
+
+def test_only_the_compact_exit_plan_is_told_it_will_be_resumed(tmp_path, seams):
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="closed")          # dev, nothing alive
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["handoff_resume"] == [False]
+
+
+def test_the_uc_plan_is_told_it_will_be_resumed(tmp_path, seams):
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          extra_md={"role": "user-conversation"})
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    row["role"] = "user-conversation"
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["handoff_resume"] == [True]

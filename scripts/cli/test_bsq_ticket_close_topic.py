@@ -65,14 +65,14 @@ def test_closing_ticket_with_no_dedicated_topic_prints_nothing_extra(tmp_path, m
 
 def test_non_closing_transition_never_calls_close_for_ticket(tmp_path, monkeypatch):
     p = tmp_path / "T-0001-demo.md"
-    _write(p, status="planned")
+    _write(p, status="in_progress")
     posts: list = []
     monkeypatch.setattr(bsq, "backlog_dir", lambda slug: tmp_path)
     monkeypatch.setattr(bsq, "resolve_slug", lambda *a, **k: "demo")
     monkeypatch.setattr(bsq, "post", lambda action, params, **k: posts.append((action, params)))
 
     parser = bsq.build_parser()
-    args = parser.parse_args(["ticket", "update", "T-0001", "totest"])
+    args = parser.parse_args(["ticket", "update", "T-0001", "open"])
     args.func(args)
 
     assert posts == []

@@ -178,10 +178,13 @@ def test_slug_flag_is_equivalent_to_the_at_suffix(world):
 
 
 def test_unique_id_needs_no_ceremony(world):
-    r = run(world, "ticket", "update", "T-0999", "totest",
+    # T-0999 starts "open" — in_progress is a valid transition from there
+    # (T-0931's state machine); the point of this test is ID resolution
+    # ceremony, not which status is targeted.
+    r = run(world, "ticket", "update", "T-0999", "in_progress",
             cwd_slug="beta", sid="S-t-p2")
     assert r.returncode == 0, r.stderr
-    assert "status: totest" in world["unique"].read_text()
+    assert "status: in_progress" in world["unique"].read_text()
 
 
 # ---------------------------------------------------------------------------

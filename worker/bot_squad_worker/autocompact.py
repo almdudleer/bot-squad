@@ -277,7 +277,8 @@ def _log_not_composer_ready(sid: str | None, reason: str,
 # --- prompts (the "ask the session to write everything down" + the reload) --
 
 def handoff_prompt(artifact_path: str, role: str | None = None, *,
-                   relaunch: bool = True, stay: bool = False) -> str:
+                   relaunch: bool = True, stay: bool = False,
+                   resume: bool = False) -> str:
     """The COMPACT HANDOFF — ask a TASK-LESS session to dump its full
     forward-state into its role artifact, then signal done.
 
@@ -304,6 +305,15 @@ def handoff_prompt(artifact_path: str, role: str | None = None, *,
     checkpoint, and a checkpoint is what the trace is for (the stakeholder's
     2026-08-29 ruling: «наш компакт лучше встроенного, он оставляет след в
     системе» — the trace is audit + crash-net, not a successor's only memory).
+
+    ``resume=True`` (T-0945, only meaningful with ``relaunch=False``) is the
+    ``compact_exit`` plan: this session is ended AND resumed later with a
+    compacted transcript. Same truthfulness rule a third time — the
+    ``relaunch=False`` text says "NOTHING from this conversation survives",
+    which would be a lie here and would make the session over-write a will it
+    does not need. It is also where the stakeholder's *«система должна ей
+    ставить дедлайн и предоставлять четкие критерии»* is delivered: the prompt
+    states the bounded deadline and what happens on either side of it.
     """
     if stay:
         head = (
@@ -327,6 +337,20 @@ def handoff_prompt(artifact_path: str, role: str | None = None, *,
         tail = ("The system then relaunches you fresh." if relaunch else
                 "The system then ends this session; a later incarnation boots from "
                 "what you wrote.")
+        if resume and not relaunch:
+            head = (
+                "⏳ CACHE WINDOW EXPIRING — HANDOFF, COMPACT, EXIT, RESUME. Your "
+                "~1h prompt cache is about to go cold while idle. The system will "
+                "compact your context, end this session, and RESUME it "
+                "(`claude --resume`) the next time there is something for you — "
+                "so this conversation is not lost, it comes back summarized. "
+            )
+            tail = (
+                f"The system then compacts you, ends the session, and resumes it "
+                f"on the next message. You have about "
+                f"{handoff_timeout_sec() // 60} minutes; after that the exit "
+                f"happens with or without your write."
+            )
     if stay:
         base = (
             f"{head}\n\n"
@@ -340,10 +364,20 @@ def handoff_prompt(artifact_path: str, role: str | None = None, *,
             f"returns ok, reply: HANDOFF WRITTEN. {tail}"
         )
     else:
+        # T-0945: a resumed session's conversation is NOT lost, so the
+        # "nothing survives" sentence would be a lie for it — and one that
+        # changes what it writes. Its artifact still matters (a compact summary
+        # is lossy, and anyone OTHER than the resumed session reads the file).
+        stake = (
+            "The compact summary is LOSSY, and anyone other than the resumed you "
+            "reads your role artifact — so write it as if it were the only "
+            "record.\n\n" if resume else
+            "NOTHING from this conversation survives EXCEPT what you write to your "
+            "role artifact now.\n\n"
+        )
         base = (
             f"{head}"
-            "NOTHING from this conversation survives EXCEPT what you write to your role "
-            "artifact now.\n\n"
+            f"{stake}"
             "Write your COMPLETE forward-state so your successor continues seamlessly: "
             "the assignment/goal, what's DONE, what's IN PROGRESS, the EXACT next "
             "steps, key file paths + decisions + gotchas, and anything you'd need if "
@@ -358,7 +392,7 @@ def handoff_prompt(artifact_path: str, role: str | None = None, *,
 
 
 def context_handoff_prompt(task_id: str, *, relaunch: bool,
-                           stay: bool = False) -> str:
+                           stay: bool = False, resume: bool = False) -> str:
     """The FINALIZE handoff for a TASK-BOUND session — write the forward-state
     into the ticket's own ``## Context`` (T-0863).
 
@@ -393,6 +427,16 @@ def context_handoff_prompt(task_id: str, *, relaunch: bool,
     ``stay=True`` (T-0930, overrides ``relaunch``): compact-in-place — the
     session is told the truth that it CONTINUES after the compact, so it
     writes a checkpoint rather than a will (see :func:`handoff_prompt`).
+
+    ``resume=True`` (T-0945, with ``relaunch=False``): the ``compact_exit``
+    plan — ended AND resumed with a compacted transcript. Carries the DEADLINE
+    and the criteria the stakeholder asked the system to supply, rather than
+    leaving the session to guess: *«система должна ей ставить дедлайн и
+    предоставлять четкие критерии, как решить, нужно ли делать compact для
+    последующего resume или только handoff + exit … Это должна решать сама
+    сессия, закончила она работу или нет»*. The session's half of that decision
+    is the TICKET STATUS, which is exactly what the recycler reads next tick, so
+    the non-resume branch names it.
     """
     if stay:
         after = (
@@ -420,6 +464,36 @@ def context_handoff_prompt(task_id: str, *, relaunch: bool,
             "from this conversation survives EXCEPT what you write onto the "
             "ticket.\n\n"
         )
+        deadline = (
+            f"You have about {handoff_timeout_sec() // 60} minutes; after that "
+            "the exit happens with or without your write.\n\n"
+        )
+        if resume:
+            opening = (
+                f"⏳ FINALIZE — WRITE YOUR FORWARD-STATE ONTO {task_id}. Your "
+                "~1h prompt cache is about to go cold while idle, so the system "
+                "will compact your context, end this session, and RESUME it "
+                "(`claude --resume`) when there is next something for you. This "
+                "conversation comes back summarized — but a summary is lossy, "
+                "and anyone OTHER than the resumed you reads the ticket.\n\n"
+                + deadline
+            )
+            after = (
+                "The system then compacts your context, ends this session, and "
+                "resumes it on the next message."
+            )
+        else:
+            opening += (
+                deadline +
+                "YOU decide whether the work is finished; the system only sets "
+                "the deadline. Say it in the TICKET STATUS, which is what "
+                f"decides what happens next: `bsq ticket update {task_id} "
+                "totest` if it is delivered, `blocked_on_user` if you are "
+                "waiting on the stakeholder (the system then waits for him "
+                "rather than restarting work on a blocked ticket), otherwise "
+                "leave it as it is and a later session picks it up from the "
+                "Context you are about to write.\n\n"
+            )
     return (
         f"{opening}"
         "Run exactly:\n"
@@ -516,19 +590,21 @@ def _send_compact(sid: str) -> None:
 
 
 def _inject_handoff(sid: str, artifact_path: str, role: str | None = None, *,
-                    relaunch: bool = True, stay: bool = False) -> None:
+                    relaunch: bool = True, stay: bool = False,
+                    resume: bool = False) -> None:
     from bot_squad_worker.actions import _action_inject_input
     _action_inject_input({"sid": sid,
                           "text": handoff_prompt(artifact_path, role,
-                                                 relaunch=relaunch, stay=stay)})
+                                                 relaunch=relaunch, stay=stay,
+                                                 resume=resume)})
 
 
 def _inject_context_handoff(sid: str, task_id: str, *, relaunch: bool,
-                            stay: bool = False) -> None:
+                            stay: bool = False, resume: bool = False) -> None:
     from bot_squad_worker.actions import _action_inject_input
     _action_inject_input({"sid": sid,
                           "text": context_handoff_prompt(task_id, relaunch=relaunch,
-                                                         stay=stay)})
+                                                         stay=stay, resume=resume)})
 
 
 def _artifact_mtime(path: str | None) -> float:

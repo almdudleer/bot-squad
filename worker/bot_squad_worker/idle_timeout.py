@@ -130,21 +130,86 @@ remember machinery below on a plain idle-window fire. Instead
 per cache window — ``operator_keepalive_last_at`` is the anti-loop guard,
 mirroring ``compact_stay_last_at``) and leaves the session running. Only once
 the OPERATOR ITSELF stamps ``drive: off`` (via ``bsq drive off`` — see
-``sessions.set_drive``) does it fall through to the SAME terminate-and-
-remember path every other role already rides — at which point
-:func:`_terminate_and_remember` skips stamping ``resumable``/``resume_hint``
-for it (``self_terminate=True``): a drive=off operator's exit is a deliberate,
-considered stop, not a stale-cache artifact worth resuming, and leaving no
-resume bait is what the stakeholder's "лучше самозавершиться" ("better to just
-self-terminate") preference asks for — it forecloses any future
-resurrect-then-immediately-recycle churn (operator_redrive spawns a FRESH
-operator if/when new backlog work actually appears, never a resume of this
-one). Addendum 1's quota-utilization steering (when a hard weekly quota
+``sessions.set_drive``) does it fall through to the terminate-and-remember
+path. **T-0945 SUPERSEDES THE REST OF THIS PARAGRAPH.** It used to skip
+stamping ``resumable``/``resume_hint`` for such an operator
+(``self_terminate=True``, «лучше самозавершиться» — a deliberate stop leaves no
+resume bait, so nothing can resurrect it into a resume-then-immediately-recycle
+churn). The 2026-08-31 ruling gives the operator the user-conversation contract
+instead — «С ролью operator — то же самое» + «и потом всегда resume» — so a
+drive=off operator now runs handoff + ``/compact`` + a RESUMABLE exit like the
+attendant and the flag is gone. (``operator_redrive`` still spawns a FRESH
+operator when backlog work appears, and nothing auto-resumes the stamp, so the
+churn it guarded against does not follow from it.) Addendum 1's quota-utilization steering (when a hard weekly quota
 target is live, the operator should NOT set drive=off just because
 primary-track work ran dry — it should pull from maintenance backlog
 instead) is carried entirely in the NUDGE TEXT itself
 (:func:`_keepalive_nudge_text`): it is prompt-level framing for the
 operator's own judgement call, not something this module can force.
+
+T-0945 RECYCLE-BY-ROLE v2 (2026-08-31) collapses every branch above into ONE
+pure decision, :func:`recycle_plan`. Stakeholder verbatim, which supersedes the
+T-0930 ladder wherever the two disagree: *«в зависимости от того, какие роли
+держит сессия, мы ее по разному можем ресайклить … компакт это дорогая
+операция, и если мы не собираемся продолжать сессию через resume или в этом же
+окне вообще никогда, нужно только handoff … Важно, чтобы она не начала делать
+компакт на всякий случай, надо только если есть основание что будет
+продолжение»*. The system supplies the DEADLINE (55 min, unchanged) and the
+CRITERIA; what the session writes into the handoff stays the session's own
+done-or-not judgement — *«Это должна решать сама сессия … но система должна ей
+ставить дедлайн и предоставлять четкие критерии»*.
+
+  role / state                      plan           at the deadline
+  --------------------------------  -------------  --------------------------
+  human attached, or ``pinned``,    stay           compact IN PLACE, no exit
+  or a hand-launched user-session
+  / ``recycle_exempt`` pane
+  user-conversation                 compact_exit   handoff → /compact → exit
+                                                   resumable, always resumed
+                                                   («у нее всегда есть
+                                                   продолжение»)
+  operator, drive ON                nudge          keeps driving; never dies
+                                                   on the timeout
+  operator, drive OFF               compact_exit   «С ролью operator — то же
+                                                   самое»
+  dev / TL, a bound task alive      nudge          «продолжать только пока
+                                                   какая-то из их задач жива»
+  dev / TL, no bound task alive     handoff_exit   handoff → exit, NO compact
+  anything else                     handoff_exit
+
+THE COMPACT IS THE PART THAT NEEDS A REASON, and only ``compact_exit`` has
+one: a resume is structurally certain for those two roles (the attendant is
+resumed by ``ensure_user_conversation`` on the next inbound message, and the
+operator seat travels with it — T-0943), so the compacted transcript is what
+that resume loads and the spend buys something. ``handoff_exit`` spends
+nothing: *«если что, можно будет начать новую из тикета, компакты делать не
+надо»*. A below-threshold context skips the compact under EVERY plan — there
+is nothing to squeeze — which is the mechanical form of "never на всякий
+случай".
+
+WHAT CHANGED vs T-0930, named explicitly because both rulings are days old and
+they conflict:
+
+* the user-conversation exit line moves from ~3 h to the 55 min window and now
+  compacts before it exits. ``BOT_SQUAD_UC_EXIT_SEC`` survives as the knob
+  (0 restores plain compact-and-stay), but its default is no longer a separate
+  number — it is :func:`idle_timeout_sec`.
+* a drive=off operator now exits RESUMABLE. T-0655's ``self_terminate`` (leave
+  no resume bait, *«лучше самозавершиться»*) is withdrawn by *«С ролью
+  operator — то же самое»* + *«потом всегда resume»*: the two roles flow into
+  one another and cannot hold opposite exit contracts.
+* the drive-unmet nudge covers TEAM-LEAD as well as dev, and reads ALL of a
+  session's bindings (``task_id`` + ``extra_task_ids``, plus a task-less TL's
+  initiative) rather than the primary alone — *«какая-то из их задач»*.
+* an ATTACHED or PINNED pane no longer means "take no action at all"; it means
+  compact-in-place. His pain was the EXIT, not the compact — *«моя проблема
+  была с тем, что он делал handoff + exit и у меня терялся просто весь
+  контекст беседы»*, *«исчезновение сессии у меня из под носа»* — and he asked
+  for the compact by name: *«к ручной сессии актуальны те же правила, нужно до
+  протухания кешей сделать компакт»*. T-0930 already made this exact call for
+  the ceiling trigger (*«это разумная компакт логика даже когда я работаю с
+  сессией»*, ``autocompact.maybe_compact``); this is the idle trigger catching
+  up with it.
 """
 from __future__ import annotations
 
@@ -339,6 +404,151 @@ def dev_nudge_sec() -> int:
     return DEFAULT_DEV_NUDGE_SEC
 
 
+# --- T-0945: the per-role recycle PLAN (the "четкие критерии") --------------
+#
+# Four plans, and the only one that spends a native /compact is the one where a
+# resume is structurally certain. See the module docstring's table for the
+# mapping and the verbatim each row comes from.
+PLAN_STAY = "stay"                  # compact IN PLACE; never terminate
+PLAN_NUDGE = "nudge"                # keep it alive; never terminate
+PLAN_COMPACT_EXIT = "compact_exit"  # handoff -> /compact -> exit resumable
+PLAN_HANDOFF_EXIT = "handoff_exit"  # handoff -> exit, no compact
+
+# Roles whose continuation is conditional on their WORK rather than on a human
+# ("логично продолжать только пока какая-то из их задач жива"). `teamlead` is
+# the spelling `sessions._derive_role` / `graceful_exit` already use.
+WORKER_ROLES = ("dev", "teamlead")
+
+# The in-flight phase stamped between the /compact a compact_exit sends and the
+# terminate that follows it. Deliberately NOT the legacy "compacting" value:
+# that one is the pre-T-0863 stamp for a handoff wait and is still accepted by
+# :func:`_finalize_compact`, so reusing it would route a T-0945 compact-exit
+# into the wrong half of the machine after a worker restart.
+PHASE_COMPACT_EXIT = "compacting_exit"
+
+
+def worker_nudge_sec(role: str | None) -> int:
+    """The keep-alive cadence for a :data:`WORKER_ROLES` session with live work.
+
+    A dev gets T-0930's 5 min. A team-lead gets the OPERATOR's 40 min: a TL sits
+    waiting on its devs for exactly the reason the operator does («оператор
+    может ждать девов и долго»), so the dev cadence would nudge it every 5
+    minutes while it is legitimately waiting for someone else's build."""
+    return dev_nudge_sec() if (role or "") == "dev" else operator_nudge_sec()
+
+
+def bound_task_ids(row: dict | None, meta: dict | None) -> list[str]:
+    """Every task this session is bound to — primary + ``extra_task_ids``.
+
+    T-0945: «какая-то из их задач» is plural, and a bundled dev (``bsq spawn
+    <ticket> --bundle …``) carries its extra bindings ONLY in
+    ``extra_task_ids``. Reading the primary alone would recycle a session whose
+    bundled tickets are all still open. Order-preserving and de-duplicated; the
+    ``~`` unset sentinel is dropped."""
+    out: list[str] = []
+    def _add(v) -> None:
+        t = str(v or "").strip()
+        if t and t != "~" and t not in out:
+            out.append(t)
+    for src in (row or {}, meta or {}):
+        _add(src.get("task_id"))
+        extra = src.get("extra_task_ids")
+        if isinstance(extra, (list, tuple)):
+            for v in extra:
+                _add(v)
+        elif extra:
+            for v in str(extra).strip("[]").split(","):
+                _add(v)
+    return out
+
+
+def task_alive(cfg: Any, slug: str, task_id: str | None) -> bool:
+    """True when ``task_id`` is neither DONE nor WAITING — the "стоит, а задача
+    не выполнена" condition that keeps its session alive.
+
+    An unreadable/absent task is NOT alive: there is nothing for a "продолжай"
+    nudge to point at. Reads :func:`recovery.read_task_status` and
+    ``recovery.DONE_STATUSES``/``WAITING_STATUSES`` — the same reader and the
+    same sets :mod:`graceful_exit` uses — rather than a third local copy.
+    A WAITING (``blocked_on_user``) task is deliberately NOT alive here: that
+    is what lets its session fall through to the terminate path and be revived
+    by ``wait_resume.tick`` when the block lifts, instead of being nudged at a
+    stakeholder who has not answered yet (T-0930)."""
+    if not task_id:
+        return False
+    status = recovery.read_task_status(cfg, slug, task_id)
+    if not status:
+        return False
+    return status not in recovery.DONE_STATUSES and status not in recovery.WAITING_STATUSES
+
+
+def worker_tasks_alive(cfg: Any, slug: str, task_ids: list[str], *,
+                       role: str | None = None, initiative: Any = None) -> bool:
+    """True when ANY of a dev/TL session's bindings is still live work.
+
+    The task-less TL is the one shape with no binding to read: it is bound to an
+    INITIATIVE, and its work is alive while that initiative still has an
+    unclosed task — the same signal ``graceful_exit`` already computes for its
+    done-check (:func:`graceful_exit.count_pending_initiative_tasks`), imported
+    rather than re-derived so the "alive" and "done" halves cannot drift apart."""
+    for tid in task_ids:
+        if task_alive(cfg, slug, tid):
+            return True
+    if task_ids or (role or "") != "teamlead":
+        return False
+    init = str(initiative or "").strip()
+    if not init or init == "~":
+        return False
+    from bot_squad_worker import graceful_exit
+    try:
+        return graceful_exit.count_pending_initiative_tasks(cfg, slug, init) > 0
+    except Exception:
+        log.exception("idle_timeout: initiative pending-count failed for %s", init)
+        return False
+
+
+def recycle_plan(*, role: str | None, window: str | None, meta: dict | None,
+                 attached: bool, tasks_alive: bool) -> str:
+    """THE per-role criterion (T-0945). Pure — no I/O, no clock — so the policy
+    can be read and tested as a table rather than traced through the executor.
+
+    Precedence, and why each step sits where it does:
+
+    1. **attached / pinned → stay.** A human is looking at this pane. The only
+       action that is ever safe here is the compact he asked for; the exit is
+       what cost him «весь контекст беседы».
+    2. **a hand-launched user-session / ``recycle_exempt`` pane → stay.** Same
+       reason, without needing a client attached this second: these are his own
+       panes and they are never terminated, only compacted in place (T-0616/
+       T-0617, unchanged).
+    3. **user-conversation → compact_exit** (or ``stay`` when the exit is
+       disabled by ``BOT_SQUAD_UC_EXIT_SEC=0``).
+    4. **operator** — drive on ⇒ ``nudge`` (T-0655's rule, and the ONE exception
+       the stakeholder named: «Только если drive какой-либо стоит, сессия с
+       ролью оператор должна драйвиться дальше, а не умирать по таймауту»);
+       drive off ⇒ the user-conversation plan, «то же самое».
+    5. **dev / team-lead** — alive work ⇒ ``nudge``; nothing alive ⇒
+       ``handoff_exit``.
+    6. anything else ⇒ ``handoff_exit`` (the pre-T-0945 default for every
+       non-exempt session, unchanged).
+    """
+    r = (role or "").strip()
+    if attached or recycle_gate.session_pinned(meta):
+        return PLAN_STAY
+    if not recycle_gate.role_exempt(r) and recycle_gate.user_session_exempt(
+            role=r, window=window, meta=meta):
+        return PLAN_STAY
+    if recycle_gate.role_exempt(r):                       # user-conversation
+        return PLAN_COMPACT_EXIT if uc_exit_sec() > 0 else PLAN_STAY
+    if r == "operator":
+        if recycle_gate.operator_drive_on(role=r, meta=meta):
+            return PLAN_NUDGE
+        return PLAN_COMPACT_EXIT if uc_exit_sec() > 0 else PLAN_HANDOFF_EXIT
+    if r in WORKER_ROLES:
+        return PLAN_NUDGE if tasks_alive else PLAN_HANDOFF_EXIT
+    return PLAN_HANDOFF_EXIT
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -424,6 +634,15 @@ _RECYCLE_FIELDS = (
     # tell "the session wrote its forward-state" from "the wait timed out"
     # without a nested mapping the hook reader cannot parse.
     "idle_recycle_mark",
+    # T-0945: `wrote_state` carried ACROSS the pre-exit /compact of a
+    # `compact_exit` plan. The mark it was derived from is stale the moment the
+    # session writes, so the fact has to be persisted rather than recomputed —
+    # otherwise the terminate that follows the compact would report "no
+    # forward-state written" about a write it watched land. Flat scalar
+    # ("true"/"false") for the same hook-reader reason as its siblings, and in
+    # `session_start.sh`'s `_INFLIGHT_RECYCLE` set for the same reason too: it
+    # must survive the source=compact fire and be cleared on every other.
+    "idle_recycle_wrote_state",
 )
 
 
@@ -492,18 +711,27 @@ def _context_tokens(cfg: Any, slug: str, sid: str) -> int:
 
 
 def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) -> bool:
-    """Recycle ``row``'s session if it has been idle/waiting past the window AND
-    safe AND not postponed AND not gated by T-0563/T-0564. Returns True iff an
-    action was taken this tick (compact sent, or terminate+record finalized).
-    Every gate fails closed.
+    """Act on ``row``'s session per its T-0945 :func:`recycle_plan`, once it is
+    idle past the window AND safe AND not postponed AND not gated by T-0563.
+    Returns True iff an action was taken this tick (nudge sent, compact sent, or
+    terminate+record finalized). Every gate fails closed.
 
-    Drives a tiny 2-phase machine on the session md only when there is
-    forward-state worth recording (context over threshold) — START asks the
-    session to write it and stamps ``idle_recycle_phase: finalizing``; FINALIZE
-    waits for that write to land, then terminates + records resume state. A
-    below-threshold session skips the wait entirely: START terminates + records
-    in the same tick. (T-0566 shape, T-0863 content: the ask used to be
-    Claude's native ``/compact``, whose output this path then discarded.)
+    T-0945: the ROLE decides which of four things "recycle" means here —
+    compact-in-place and stay, a keep-alive nudge, handoff+compact+exit, or
+    handoff+exit. :func:`recycle_plan` is that decision and it is pure; this
+    function is only its executor.
+
+    The two exiting plans drive a small phase machine on the session md, and
+    only when there is forward-state worth recording (context over threshold):
+    START asks the session to write it and stamps ``idle_recycle_phase:
+    finalizing``; FINALIZE waits for that write to land, then either terminates
+    (``handoff_exit``) or stamps ``compacting_exit`` and terminates a tick later
+    (``compact_exit``, which spends one ``/compact`` in between). A
+    below-threshold session skips both waits: START terminates + records in the
+    same tick, with no compact under either plan. (T-0566 shape, T-0863 content:
+    the ask used to be Claude's native ``/compact``, whose output this path then
+    discarded; T-0945 brings a compact back on ONE plan, where it is loaded by a
+    resume rather than thrown away.)
     """
     if not idle_timeout_enabled():
         return False
@@ -527,69 +755,73 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
     # T-0563: never recycle a non-allowlisted project.
     if not recycle_gate.project_allowed(cfg, slug, now):
         return False
-    # T-0926 follow-up: an explicit human pin beats every other signal here —
-    # not just terminate, but compact-and-stay too. Checked before is_attached
-    # so a pinned session takes no action even through a real (not just
-    # flickered) attachment gap.
-    if recycle_gate.session_pinned(meta):
-        return False
-    # T-0564: never touch a pane a human is currently attached to — applies
-    # to every session, exempt or not.
-    if recycle_gate.is_attached(pane, sid=sid, now=now):
-        return False
 
-    # T-0564/T-0616: the human's own sessions (user-conversation role,
-    # hand-launched user-session window, recycle_exempt md marker) never ride
-    # the terminate-and-remember flow below — T-0617 gives them a separate
-    # compact-in-place-only path instead of the old full no-op exemption.
-    #
-    # T-0930 (stakeholder, 2026-08-31, answering the held-back question
-    # directly — this REVERSES the T-0720 ruling on his own authority): «Yes,
-    # loosen ... I'd prefer it compacted, however, not exited I think, exited
-    # in 3 hours maybe». So the user-conversation ladder is now: 55 min idle →
-    # compact-and-stay (unchanged, below); ~3 h idle → EXIT with resume state
-    # (the conversation store + the claude transcript are this role's durable
-    # memory, and ensure_user_conversation now RESUMES the suspended attendant
-    # via `claude --resume` when the dialog picks back up). Scoped to the
-    # user-conversation ROLE only — a hand-launched user-session/
-    # recycle_exempt scratch pane was not part of the ruling and keeps the
-    # never-exit behaviour.
-    if recycle_gate.user_session_exempt(role=role, window=window, meta=meta):
-        if recycle_gate.role_exempt(role) and _uc_exit_due(
-                cfg, slug, sid, row, meta, now, pane, user_home):
-            return _terminate_and_remember(cfg, slug, sid, meta, md_path, now,
-                                           wrote_state=False)
-        return _maybe_compact_and_stay(cfg, slug, sid, row, meta, md_path, now, pane, user_home)
+    # T-0945: ONE per-role decision, taken before any action (see
+    # :func:`recycle_plan` and the module docstring's table). The gates that
+    # used to short-circuit here — pinned (T-0926) and attached (T-0564) — are
+    # now INPUTS to that decision rather than blanket no-ops: they downgrade the
+    # session to compact-in-place instead of letting its cache expire untouched.
+    attached = recycle_gate.is_attached(pane, sid=sid, now=now)
+    tasks_alive = False
+    if (role or "") in WORKER_ROLES:
+        tasks_alive = worker_tasks_alive(
+            cfg, slug, bound_task_ids(row, meta), role=role,
+            initiative=(row.get("initiative") or meta.get("initiative")))
+    plan = recycle_plan(role=role, window=window, meta=meta, attached=attached,
+                        tasks_alive=tasks_alive)
 
-    # T-0655: a drive=on operator gets a keep-alive nudge instead of the
-    # terminate-and-remember machinery below — only the operator's own
-    # drive=off decision (bsq drive off) permits it to fall through to the
-    # normal recycle path a few lines down.
-    if recycle_gate.operator_drive_on(role=role, meta=meta):
-        return _maybe_keepalive_nudge(cfg, slug, sid, row, meta, md_path, now, pane, user_home)
+    # An in-flight compact-and-stay finalizes first whatever the plan says now:
+    # a `/compact` has already been sent and abandoning the wait would let the
+    # next tick arm a second one. autocompact's CEILING trigger arms this same
+    # pair (T-0649), so the in-flight state here is not always ours.
+    if meta.get("compact_stay_phase") == "compacting":
+        return _finalize_compact_stay(sid, meta, md_path, now, pane)
+
+    if plan == PLAN_STAY:
+        # T-0945: a human attached (or pinned the pane) while a terminate
+        # handoff was in flight. Abandon the terminate half rather than finish
+        # killing a session he is now looking at — «исчезновение сессии у меня
+        # из под носа». What he already wrote stays written; only the exit is
+        # dropped.
+        if meta.get("idle_recycle_phase"):
+            _clear_recycle_state(meta)
+            sessions._write_session_metadata(md_path, meta, atomic=True)
+            log.info("idle_timeout: %s became attached/pinned mid-recycle — "
+                     "terminate half abandoned (compact-in-place only)", sid)
+            return True
+        return _maybe_compact_and_stay(cfg, slug, sid, row, meta, md_path, now,
+                                       pane, user_home)
 
     # A handoff already in flight → drive its finalize half (independent of the
     # idle window; the phase field is its own guard). `compacting` is the
     # pre-T-0863 stamp — still accepted so a worker restart mid-recycle
     # converges rather than leaving the session armed forever.
-    if meta.get("idle_recycle_phase") in ("finalizing", "compacting"):
-        return _finalize_compact(cfg, slug, sid, meta, md_path, now, pane, role=role)
+    phase = meta.get("idle_recycle_phase")
+    if phase == PHASE_COMPACT_EXIT:
+        # T-0945: the /compact a compact_exit sent has been issued; all that is
+        # left is to terminate once the pane comes back.
+        return _finalize_compact_exit(cfg, slug, sid, meta, md_path, now, pane)
+    if phase in ("finalizing", "compacting"):
+        return _finalize_compact(cfg, slug, sid, meta, md_path, now, pane,
+                                 role=role, plan=plan)
 
-    # T-0930: a dev whose bound task is neither done nor blocked_on_user is a
-    # DRIVE-CONDITION-UNMET session — same posture as the drive=on operator
-    # above (no exit while the condition holds), but on its own 5min cadence.
-    # A dev in DONE state is normally already gone via graceful_exit's faster
-    # tick by the time this runs; a dev in blocked_on_user (WAITING) is
-    # deliberately excluded here — that is what lets it fall through to the
-    # terminate-and-remember path below instead of being nudged forever.
-    if role == "dev":
-        task_id = row.get("task_id") or meta.get("task_id")
-        if dev_drive_unmet(cfg, slug, task_id):
-            return _maybe_dev_nudge(cfg, slug, sid, row, meta, md_path, now, pane, user_home)
+    if plan == PLAN_NUDGE:
+        # Never dies on the timeout while its drive condition holds: the
+        # operator's own `drive: on` (T-0655), or a dev/TL still holding live
+        # work (T-0930, widened to TL + all bindings by T-0945).
+        if (role or "") == "operator":
+            return _maybe_keepalive_nudge(cfg, slug, sid, row, meta, md_path,
+                                          now, pane, user_home)
+        return _maybe_worker_nudge(cfg, slug, sid, row, meta, md_path, now,
+                                   pane, user_home, role=role)
 
-    # Otherwise decide whether to START a recycle this tick.
+    # PLAN_COMPACT_EXIT / PLAN_HANDOFF_EXIT — decide whether to START this tick.
+    # The deadline differs only by name: `uc_exit_sec()` defaults to
+    # `idle_timeout_sec()` and exists so a live install can retune the exit
+    # roles without moving everyone's window.
     idle_age = _idle_age(row, meta, user_home, now)
-    if not idle_due(idle_age, idle_timeout_sec()):
+    deadline = uc_exit_sec() if plan == PLAN_COMPACT_EXIT else idle_timeout_sec()
+    if not idle_due(idle_age, deadline):
         return False
     if postpone_active(meta.get("idle_postpone_until"), now):
         return False
@@ -598,7 +830,8 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
         # stamp) so the moment the job clears the normal window applies again.
         log.info("idle_timeout: auto-postpone %s — waiting on a tracked long job", sid)
         return False
-    return _start_recycle(cfg, slug, sid, row, meta, md_path, now, pane, role=role)
+    return _start_recycle(cfg, slug, sid, row, meta, md_path, now, pane,
+                          role=role, plan=plan)
 
 
 def _idle_age(row: dict, meta: dict, user_home: str, now: float) -> float | None:
@@ -628,7 +861,8 @@ def _idle_age(row: dict, meta: dict, user_home: str, now: float) -> float | None
 
 
 def _start_recycle(cfg: Any, slug: str, sid: str, row: dict, meta: dict, md_path,
-                   now: float, pane: str | None, *, role: str | None = None) -> bool:
+                   now: float, pane: str | None, *, role: str | None = None,
+                   plan: str = PLAN_HANDOFF_EXIT) -> bool:
     """START the cache-window recycle. Only ever acts on an idle,
     composer-ready pane — never cut mid-turn.
 
@@ -647,9 +881,18 @@ def _start_recycle(cfg: Any, slug: str, sid: str, row: dict, meta: dict, md_path
     could read — which is the same gap from the other side, and what T-0858
     measured.
 
-    T-0655: ``role`` is threaded through to :func:`_terminate_and_remember` so
-    a drive=off operator (the only way an operator reaches this function at
-    all — see :func:`maybe_recycle`) self-terminates without resume bait."""
+    T-0945: ``plan`` selects what happens AFTER the forward-state lands —
+    :data:`PLAN_HANDOFF_EXIT` terminates directly (no compact, ever), while
+    :data:`PLAN_COMPACT_EXIT` spends one native ``/compact`` first because that
+    session is going to be resumed and the squeezed transcript is what the
+    resume loads. Both share this one arm; only :func:`_finalize_compact`
+    diverges. Below the context threshold neither compacts: there is nothing to
+    squeeze, so "compact only when there is a basis" and "compact only when
+    there is something to compact" agree.
+
+    T-0655's ``self_terminate`` (a drive=off operator leaving no resume bait) is
+    NOT passed any more — T-0945 gives the operator the user-conversation
+    contract, «то же самое», so its exit is resumable like the attendant's."""
     if not pane or not autocompact.composer_free(
             autocompact._capture_pane(pane), sid=sid, now=now):
         return False
@@ -662,10 +905,10 @@ def _start_recycle(cfg: Any, slug: str, sid: str, row: dict, meta: dict, md_path
     tokens = _context_tokens(cfg, slug, sid)
     threshold = compact_min_context_tokens(cfg)
     if tokens <= threshold:
-        # Below threshold — no forward-state worth writing down; terminate now.
+        # Below threshold — no forward-state worth writing down, and nothing
+        # worth a /compact under either plan; terminate now.
         return _terminate_and_remember(cfg, slug, sid, meta, md_path, now,
-                                       wrote_state=False,
-                                       self_terminate=(role == "operator"))
+                                       wrote_state=False)
 
     target = autocompact._resolve_compact_target(cfg, slug, {
         "sid": sid, "role": role or meta.get("role") or "",
@@ -677,19 +920,33 @@ def _start_recycle(cfg: Any, slug: str, sid: str, row: dict, meta: dict, md_path
         # here and then suspended the pane a tick later, so the compacted
         # context was discarded seconds after being paid for — «нативный
         # компакт через 55 минут — кринж, пустая трата токенов».
+        if plan == PLAN_COMPACT_EXIT:
+            # T-0945: nowhere to hand off to, but this role IS coming back via
+            # resume and its context is over the threshold — so the compact
+            # still buys something the exit alone would throw away. Skip
+            # straight to the pre-exit compact phase.
+            log.info("idle_timeout: no handoff destination for %s — compacting "
+                     "before the resumable exit anyway (T-0945)", sid)
+            return _arm_compact_exit(sid, meta, md_path, now, pane,
+                                     wrote_state=False)
         log.info("idle_timeout: no handoff destination for %s — terminating "
                  "without a compact", sid)
         return _terminate_and_remember(cfg, slug, sid, meta, md_path, now,
-                                       wrote_state=False,
-                                       self_terminate=(role == "operator"))
+                                       wrote_state=False)
 
+    # T-0945: tell the session which exit it is in — it changes what is worth
+    # writing, and carrying the deadline + the "you decide done-or-not, say it
+    # in the ticket status" criteria is the system's half of «система должна ей
+    # ставить дедлайн и предоставлять четкие критерии».
+    resume = (plan == PLAN_COMPACT_EXIT)
     try:
         if target["kind"] == "context":
             autocompact._inject_context_handoff(sid, target["task_id"],
-                                                relaunch=False)
+                                                relaunch=False, resume=resume)
         else:
             autocompact._inject_handoff(sid, target["artifact_path"],
-                                        target["role"], relaunch=False)
+                                        target["role"], relaunch=False,
+                                        resume=resume)
     except Exception:
         log.exception("idle_timeout: finalize inject failed for %s (will retry)",
                       sid)
@@ -706,7 +963,8 @@ def _start_recycle(cfg: Any, slug: str, sid: str, row: dict, meta: dict, md_path
 
 
 def _finalize_compact(cfg: Any, slug: str, sid: str, meta: dict, md_path, now: float,
-                      pane: str | None, *, role: str | None = None) -> bool:
+                      pane: str | None, *, role: str | None = None,
+                      plan: str = PLAN_HANDOFF_EXIT) -> bool:
     """FINALIZE an in-flight handoff wait: once the session has written its
     forward-state and the pane is composer-ready again (or the bounded wait
     times out — never wedge), terminate + record.
@@ -753,13 +1011,95 @@ def _finalize_compact(cfg: Any, slug: str, sid: str, meta: dict, md_path, now: f
         log.warning("idle_timeout: %s never wrote its forward-state within the "
                     "handoff window — terminating anyway (never wedge)", sid)
 
+    if plan == PLAN_COMPACT_EXIT:
+        if ready:
+            # T-0945: the ONE justified compact on this path. The session is
+            # about to be terminated AND resumed (`ensure_user_conversation`
+            # resumes the attendant on the next inbound message), so the
+            # squeeze is what that resume loads rather than something discarded
+            # a tick later — the distinction T-0863 drew when it removed the
+            # unconditional /compact from here.
+            return _arm_compact_exit(sid, meta, md_path, now, pane,
+                                     wrote_state=wrote_state)
+        # Timed out against a busy pane. `/compact` needs the same idle,
+        # composer-ready pane this finalize does, so there is no way to spend it
+        # here — terminate without it rather than wedge. The resume still gets
+        # the full transcript, just uncompacted.
+        log.warning("idle_timeout: %s never went composer-ready within the "
+                    "handoff window — exiting WITHOUT the pre-exit compact "
+                    "(never wedge)", sid)
+
     return _terminate_and_remember(cfg, slug, sid, meta, md_path, now,
-                                   wrote_state=wrote_state,
-                                   self_terminate=(role == "operator"))
+                                   wrote_state=wrote_state)
+
+
+def _arm_compact_exit(sid: str, meta: dict, md_path, now: float,
+                      pane: str | None, *, wrote_state: bool) -> bool:
+    """T-0945 PHASE 2 of a ``compact_exit``: send the native ``/compact``, then
+    hand the terminate to :func:`_finalize_compact_exit` on a later tick.
+
+    Split into its own phase rather than compacting-and-suspending in one tick
+    because ``/compact`` is asynchronous — suspending immediately would type the
+    C-c/exit sequence into a pane that is still summarizing, i.e. pay for the
+    squeeze and then destroy it, which is precisely the waste T-0863 removed
+    from the old code. ``wrote_state`` is persisted here because the mark it was
+    derived from is stale the moment the session wrote.
+    """
+    if not pane or not autocompact.composer_free(
+            autocompact._capture_pane(pane), sid=sid, now=now):
+        return False
+    try:
+        autocompact._send_compact(sid)
+    except Exception:
+        log.exception("idle_timeout: pre-exit /compact send failed for %s "
+                      "(will retry)", sid)
+        return False
+    meta["idle_recycle_phase"] = PHASE_COMPACT_EXIT
+    meta["idle_recycle_armed_at"] = _now_iso()
+    meta["idle_recycle_wrote_state"] = "true" if wrote_state else "false"
+    meta.pop("idle_recycle_mark", None)
+    sessions._write_session_metadata(md_path, meta, atomic=True)
+    log.info("idle_timeout: sent the pre-exit /compact to %s (wrote_state=%s) "
+             "— terminating resumable once it lands (T-0945)", sid, wrote_state)
+    return True
+
+
+def _finalize_compact_exit(cfg: Any, slug: str, sid: str, meta: dict, md_path,
+                           now: float, pane: str | None) -> bool:
+    """T-0945 PHASE 3: the pre-exit ``/compact`` has been sent; terminate once
+    the pane comes back composer-ready (or the bounded wait lapses — never
+    wedge, same posture as every other finalize in this module).
+
+    Terminating on the timeout path is safe in a way the compact-and-stay
+    timeout is not: this session is ENDING either way, so a compact that never
+    finished costs the squeeze, not the session — and the forward-state was
+    already written in phase 1."""
+    armed_at = sessions._parse_ts_epoch(meta.get("idle_recycle_armed_at")) or now
+    timed_out = (now - armed_at) > autocompact.handoff_timeout_sec()
+
+    if not pane:
+        # Session already gone — nothing left to finalize; drop the stamp.
+        _clear_recycle_state(meta)
+        sessions._write_session_metadata(md_path, meta, atomic=True)
+        return False
+
+    ready = autocompact.composer_ready(autocompact._capture_pane(pane),
+                                       sid=sid, now=now)
+    if not ready and not timed_out:
+        return False  # still compacting — retry next tick
+    if not ready:
+        log.warning("idle_timeout: pre-exit /compact for %s never came back "
+                    "composer-ready within the window — terminating anyway "
+                    "(never wedge)", sid)
+
+    wrote_state = str(meta.get("idle_recycle_wrote_state", "")).strip().lower() \
+        in ("true", "1", "yes")
+    return _terminate_and_remember(cfg, slug, sid, meta, md_path, now,
+                                   wrote_state=wrote_state, compacted=ready)
 
 
 def _terminate_and_remember(cfg: Any, slug: str, sid: str, meta: dict, md_path, now: float,
-                            *, wrote_state: bool, self_terminate: bool = False) -> bool:
+                            *, wrote_state: bool, compacted: bool = False) -> bool:
     """T-0566: terminate the session (``sessions.suspend`` — same graceful
     C-c/exit/kill-pane sequence autocompact uses) and stamp the resume state on
     its md: ``resumable: true``, ``recycled_at``, ``resume_hint``.
@@ -777,16 +1117,23 @@ def _terminate_and_remember(cfg: Any, slug: str, sid: str, meta: dict, md_path, 
     the record; T-0858 was opened because 20 consecutive recycles read as
     successes while writing nothing.
 
-    T-0655 ``self_terminate``: True only for an operator that reached here
-    with ``drive: off`` already stamped (the only way an operator role gets
-    this far — see :func:`maybe_recycle`'s drive=on gate). That is a
-    deliberate, considered stop the operator made about ITS OWN continuity,
-    not a stale-cache artifact — per the stakeholder's explicit preference
-    ("лучше самозавершиться" / better to just self-terminate), it leaves NO
-    resumable/resume_hint bait behind, so nothing can ever resurrect this
-    exact incarnation into a resume-then-immediately-exit churn loop.
-    ``operator_redrive`` still spawns a FRESH operator later if/when new
-    backlog work actually appears — that is a distinct, deliberate act."""
+    T-0945 WITHDRAWS T-0655's ``self_terminate``. That flag made a drive=off
+    operator exit with NO ``resumable``/``resume_hint`` — a deliberate stop
+    («лучше самозавершиться»), no resume bait, ``operator_redrive`` spawning a
+    fresh operator instead. The stakeholder's 2026-08-31 ruling gives the
+    operator the user-conversation contract instead — *«С ролью operator — то
+    же самое»*, whose second half is *«и потом всегда resume»* — because the
+    two roles now flow into one another (T-0943) and cannot hold opposite exit
+    contracts. Every exit from this module is therefore resumable again. The
+    churn it was guarding against does not follow: nothing auto-resumes an
+    operator, and ``operator_redrive`` still spawns fresh when backlog work
+    lands; the stamp is a marker for whoever looks, not a trigger.
+
+    T-0945 ``compacted``: True when the pre-exit ``/compact`` actually landed
+    (:func:`_finalize_compact_exit`). It says what a resume will FIND — a
+    squeezed transcript or the full one — which is a different fact from
+    ``wrote_state`` (what a fresh reader will find on the ticket), and both
+    are things a later reader has no other way to recover."""
     _clear_recycle_state(meta)
     role = meta.get("role") or ""
     task_id = meta.get("task_id")
@@ -802,53 +1149,59 @@ def _terminate_and_remember(cfg: Any, slug: str, sid: str, meta: dict, md_path, 
     # resume-state fields on top (it doesn't know about them).
     fresh = sessions._read_session_metadata(md_path) or meta
     fresh["recycled_at"] = _now_iso()
-    if not self_terminate:
-        where = (f"{task_id}'s ## Context" if task_id and task_id != "~"
-                 else "its role artifact")
-        fresh["resumable"] = True
-        fresh["resume_hint"] = (
-            f"idle cache-window recycle "
-            f"({'forward-state written to ' + where if wrote_state else 'no forward-state written'})"
-            f" — resume via sessions.resume to continue {task_id or role or sid}.")
-        # T-0930: a WAITING recycle — the bound task is blocked_on_user, so
-        # this is not a generic "somebody should look at this eventually"
-        # resumable, it is a specific condition the system itself can watch
-        # for and act on (wait_resume.tick). Stamped in ADDITION to the
-        # generic resumable/resume_hint above (for a human glancing at the
-        # board), not instead of them.
-        if task_id and task_id != "~":
-            task_status = recovery.read_task_status(cfg, slug, task_id)
-            if task_status in recovery.WAITING_STATUSES:
-                fresh["wait_reason"] = task_status
-                fresh["wait_task_id"] = task_id
-                fresh["resume_hint"] = (
-                    f"WAITING on {task_id} ({task_status}) — auto-resumes via "
-                    f"wait_resume.tick when the block lifts; do not resume "
-                    f"manually unless it has actually cleared.")
+    where = (f"{task_id}'s ## Context" if task_id and task_id != "~"
+             else "its role artifact")
+    fresh["resumable"] = True
+    fresh["resume_hint"] = (
+        f"idle cache-window recycle "
+        f"({'forward-state written to ' + where if wrote_state else 'no forward-state written'}"
+        f"{'; context compacted before exit' if compacted else ''})"
+        f" — resume via sessions.resume to continue {task_id or role or sid}.")
+    if compacted:
+        fresh["recycled_compacted"] = True
+    # T-0930: a WAITING recycle — the bound task is blocked_on_user, so
+    # this is not a generic "somebody should look at this eventually"
+    # resumable, it is a specific condition the system itself can watch
+    # for and act on (wait_resume.tick). Stamped in ADDITION to the
+    # generic resumable/resume_hint above (for a human glancing at the
+    # board), not instead of them.
+    if task_id and task_id != "~":
+        task_status = recovery.read_task_status(cfg, slug, task_id)
+        if task_status in recovery.WAITING_STATUSES:
+            fresh["wait_reason"] = task_status
+            fresh["wait_task_id"] = task_id
+            fresh["resume_hint"] = (
+                f"WAITING on {task_id} ({task_status}) — auto-resumes via "
+                f"wait_resume.tick when the block lifts; do not resume "
+                f"manually unless it has actually cleared.")
     sessions._write_session_metadata(md_path, fresh, atomic=True)
 
     # T-0470: a cache-window recycle finalized → record it on the unified surface.
     lifecycle_events.emit(cfg, slug, sid, lifecycle_events.SESSION_RECYCLED,
                           now=now, cause="idle_timeout", wrote_state=wrote_state,
-                          self_terminate=self_terminate)
-    log.info("idle_timeout: recycled %s (wrote_state=%s, self_terminate=%s) — %s",
-             sid, wrote_state, self_terminate,
-             "no resume state (deliberate stop)" if self_terminate
-             else "recorded resumable state")
+                          compacted=compacted)
+    log.info("idle_timeout: recycled %s (wrote_state=%s, compacted=%s) — "
+             "recorded resumable state", sid, wrote_state, compacted)
     return True
 
 
-# --- T-0930: user-conversation 3-hour idle exit ------------------------------
-
-# Default per the stakeholder's own number («exited in 3 hours maybe»,
-# 2026-08-31). 0 disables the exit entirely (restores the pre-ruling
-# never-terminate behaviour).
-DEFAULT_UC_EXIT_SEC = 10800
+# --- T-0945: the user-conversation / operator EXIT line ----------------------
+#
+# T-0930 put this at a separate ~3 h number («exited in 3 hours maybe»). T-0945
+# withdraws that: *«с ролью user-conversation всегда имеет смысл по таймауту 55
+# мин делать handoff + compact + exit, и потом всегда resume»*. So the exit line
+# IS the ordinary cache window and there is no second constant to keep in sync —
+# the env knob survives only as a live-install override / kill switch.
 
 
 def uc_exit_sec() -> int:
-    """Idle seconds after which a user-conversation session EXITS (resumable).
-    Overridable via ``BOT_SQUAD_UC_EXIT_SEC``; 0 disables; garbage → default."""
+    """Idle seconds after which a ``compact_exit`` role (user-conversation, or
+    a drive=off operator) terminates — :func:`idle_timeout_sec` by default, i.e.
+    the same 55 min window every other plan fires on.
+
+    ``BOT_SQUAD_UC_EXIT_SEC=0`` disables the exit, which downgrades those roles
+    to plain compact-and-stay (:data:`PLAN_STAY`, the pre-T-0945 behaviour) —
+    the kill switch for this ruling. Garbage falls back to the default."""
     raw = os.environ.get("BOT_SQUAD_UC_EXIT_SEC")
     if raw is not None and raw.strip() != "":
         try:
@@ -857,45 +1210,7 @@ def uc_exit_sec() -> int:
                 return v
         except (TypeError, ValueError):
             pass
-    return DEFAULT_UC_EXIT_SEC
-
-
-def _uc_exit_due(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
-                 now: float, pane: str | None, user_home: str) -> bool:
-    """True when a user-conversation session has been idle past the ~3 h exit
-    line AND it is safe to end it this tick.
-
-    Reuses the compact-and-stay guards one-for-one (postpone, tracked long
-    job, composer readiness) plus two of its own: never cut a compact that is
-    mid-flight (``compact_stay_phase``), and never exit over the human's
-    half-typed draft (``composer_free``, T-0930's typing gate — the suspend
-    sequence types C-c/exit into the pane). The pinned/attached gates were
-    already passed by the caller. Continuity after the exit is the
-    conversation store + the transcript: ``_terminate_and_remember`` stamps
-    ``resumable`` + ``claude_uuid``, and ``ensure_user_conversation`` resumes
-    via ``claude --resume`` on the next inbound message.
-    """
-    limit = uc_exit_sec()
-    if limit <= 0:
-        return False
-    idle_age = _idle_age(row, meta, user_home, now)
-    if idle_age is None or idle_age < limit:
-        return False
-    if meta.get("compact_stay_phase") == "compacting":
-        return False  # let the in-flight compact finalize first
-    if postpone_active(meta.get("idle_postpone_until"), now):
-        return False
-    if tracking_long_job(cfg, slug, sid):
-        log.info("idle_timeout: uc-exit auto-postpone %s — waiting on a "
-                 "tracked long job", sid)
-        return False
-    if not pane or not autocompact.composer_free(
-            autocompact._capture_pane(pane), sid=sid, now=now):
-        return False
-    log.info("idle_timeout: user-conversation %s idle %ds >= %ds — exiting "
-             "resumable (T-0930: compact at 55min, exit at ~3h, resume on "
-             "dialog)", sid, int(idle_age), limit)
-    return True
+    return idle_timeout_sec()
 
 
 # --- T-0617: compact-and-stay (exempt user sessions) ------------------------
@@ -1073,36 +1388,32 @@ def _maybe_keepalive_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
     return True
 
 
-# --- T-0930: dev drive-unmet nudge (5min, decoupled from the 55min window) --
-
-def dev_drive_unmet(cfg: Any, slug: str, task_id: str | None) -> bool:
-    """True when a dev's bound task is neither DONE nor WAITING — the
-    "стоит, а задача не выполнена" condition the 5min nudge exists for.
-
-    No task bound at all (``task_id`` empty/None) is NOT drive-unmet here —
-    there is nothing for a "продолжай" nudge to point at, and a task-less dev
-    is not a shape this system expects to persist (falls through to the
-    normal recycle path instead). Reads :func:`recovery.read_task_status` —
-    the same reader :mod:`graceful_exit` already uses — and
-    ``recovery.DONE_STATUSES``/``recovery.WAITING_STATUSES`` rather than a
-    third local copy of either set.
-    """
-    if not task_id:
-        return False
-    status = recovery.read_task_status(cfg, slug, task_id)
-    if not status:
-        return False
-    return status not in recovery.DONE_STATUSES and status not in recovery.WAITING_STATUSES
+# --- T-0930/T-0945: worker drive-unmet nudge (dev 5min, TL 40min) ----------
+#
+# T-0945 widened this from dev-only to every :data:`WORKER_ROLES` session, and
+# from the primary binding to ALL of them — «Для ролей TL и dev, если они не
+# совмещены с какой-то из других, логично продолжать только пока какая-то из их
+# задач жива». The alive-check itself lives in :func:`worker_tasks_alive` /
+# :func:`task_alive` (pure-ish, called from :func:`recycle_plan`'s caller); what
+# is left here is only the cadence and the injection.
 
 
-def _dev_nudge_text() -> str:
-    return ("continue — продолжай. Your bound task is not yet in totest/"
-            "closed and your ~1h cache window is idling toward expiry; the "
-            "system is nudging you instead of recycling you while the task "
-            "remains open. If you are genuinely blocked on the stakeholder, "
-            "set the task to blocked_on_user instead of sitting idle "
-            "(`bsq ticket update <id> blocked_on_user`) — that stops this "
-            "nudge and lets the system handle the wait properly.")
+def _worker_nudge_text(role: str | None) -> str:
+    base = ("continue — продолжай. Your ~1h cache window is idling toward "
+            "expiry and the system is nudging you instead of recycling you, "
+            "because you still hold live work.")
+    if (role or "") == "teamlead":
+        return base + (
+            " At least one task in your scope is still open (not totest/"
+            "closed/blocked_on_user). If you are waiting on a dev, check its "
+            "state (`bsq team status`) rather than sitting; if the wait is on "
+            "the stakeholder, move the ticket to blocked_on_user — that stops "
+            "this nudge and lets the system handle the wait properly.")
+    return base + (
+        " Your bound task is not yet in totest/closed. If you are genuinely "
+        "blocked on the stakeholder, set the task to blocked_on_user instead "
+        "of sitting idle (`bsq ticket update <id> blocked_on_user`) — that "
+        "stops this nudge and lets the system handle the wait properly.")
 
 
 def _send_dev_nudge(sid: str, text: str) -> None:
@@ -1110,25 +1421,28 @@ def _send_dev_nudge(sid: str, text: str) -> None:
     _action_inject_input({"sid": sid, "text": text})
 
 
-def _maybe_dev_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
-                     md_path, now: float, pane: str | None,
-                     user_home: str) -> bool:
-    """T-0930: the dev counterpart to :func:`_maybe_keepalive_nudge` — same
-    shape (postpone/tracked-job/composer-ready gates, once-per-cadence
-    anti-loop guard) but on its own :func:`dev_nudge_sec` cadence (5 min
-    default) and never terminates. ``dev_nudge_last_at`` bounds it to at most
-    once per cadence window, mirroring :func:`keepalive_due`."""
+def _maybe_worker_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
+                        md_path, now: float, pane: str | None,
+                        user_home: str, *, role: str | None = None) -> bool:
+    """The dev/TL counterpart to :func:`_maybe_keepalive_nudge` — same shape
+    (postpone/tracked-job/composer-ready gates, once-per-cadence anti-loop
+    guard) but on :func:`worker_nudge_sec`'s role-dependent cadence, and it
+    never terminates. ``dev_nudge_last_at`` bounds it to at most once per
+    cadence window, mirroring :func:`keepalive_due`; the field keeps its
+    T-0930 name (it is a per-session stamp, and renaming it would strand the
+    guard on every live session md mid-flight)."""
+    cadence = worker_nudge_sec(role)
     idle_age = _idle_age(row, meta, user_home, now)
-    if not idle_due(idle_age, dev_nudge_sec()):
+    if not idle_due(idle_age, cadence):
         return False
-    if not keepalive_due(meta.get("dev_nudge_last_at"), now, dev_nudge_sec()):
+    if not keepalive_due(meta.get("dev_nudge_last_at"), now, cadence):
         return False  # already nudged once this cadence window
     if postpone_active(meta.get("idle_postpone_until"), now):
         return False
     if tracking_long_job(cfg, slug, sid):
         # "если он не ждет build или что-то еще может его разбудить" — the
         # SAME tracked-job auto-postpone the terminate path already uses.
-        log.info("idle_timeout: dev nudge auto-postpone %s — waiting on a "
+        log.info("idle_timeout: worker nudge auto-postpone %s — waiting on a "
                  "tracked long job", sid)
         return False
     if not pane or not autocompact.composer_free(
@@ -1136,17 +1450,17 @@ def _maybe_dev_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
         return False
 
     try:
-        _send_dev_nudge(sid, _dev_nudge_text())
+        _send_dev_nudge(sid, _worker_nudge_text(role))
     except Exception:
-        log.exception("idle_timeout: dev nudge send failed for %s "
+        log.exception("idle_timeout: worker nudge send failed for %s "
                       "(will retry)", sid)
         return False
     meta["dev_nudge_last_at"] = _now_iso()
     sessions._write_session_metadata(md_path, meta, atomic=True)
     lifecycle_events.emit(cfg, slug, sid, lifecycle_events.SESSION_TIMEOUT,
                           now=now, reason="idle_window_dev_nudge")
-    log.info("idle_timeout: sent drive-unmet nudge to dev %s — session "
-             "stays, no recycle", sid)
+    log.info("idle_timeout: sent drive-unmet nudge to %s %s (cadence %ds) — "
+             "session stays, no recycle", role or "worker", sid, cadence)
     return True
 
 

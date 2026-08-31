@@ -2419,13 +2419,23 @@ the product/protocol. Your mandate, in short:
 # the premise itself, answering the narrowing question directly: «Yes, loosen,
 # because my session becomes out of cache if it got 55 min stale, and I'd
 # prefer it compacted, however, not exited I think, exited in 3 hours maybe».
-# So ``idle_timeout`` now DOES exit an attendant idle past ~3 h (resumable,
-# with its claude_uuid intact — see ``idle_timeout._uc_exit_due``), and this
-# is the matching revive half T-0575 originally shipped: on the next inbound
+# So ``idle_timeout`` now DOES exit an attendant that has gone idle (resumable,
+# with its claude_uuid intact), and this is the matching revive half T-0575
+# originally shipped: on the next inbound
 # message, prefer ``sessions.resume`` (``claude --resume`` — full in-session
 # history) over a memory-less fresh spawn. A resume failure still falls
 # through to the fresh spawn: the message is durable in the store and inbound
 # routing must never break on a revive hiccup.
+#
+# T-0945 (same day, later ruling) moved that exit from ~3 h to the 55 min cache
+# window and put a ``/compact`` in front of it — «с ролью user-conversation
+# всегда имеет смысл по таймауту 55 мин делать handoff + compact + exit, и потом
+# всегда resume, т.к. у нее всегда есть продолжение». So this finder now runs
+# far more often, and what it resumes is a COMPACTED transcript. Nothing here
+# needed changing for that (it keys on suspended + a real claude_uuid + not
+# archived, and ``archive_dead_teammates`` only ever archives role ``dev``), but
+# the frequency is the reason it is now load-bearing rather than a rare path:
+# see ``idle_timeout.recycle_plan`` / ``PLAN_COMPACT_EXIT``.
 
 
 def _find_suspended_user_conversation(cfg: Any, slug: str, window: str) -> str | None:

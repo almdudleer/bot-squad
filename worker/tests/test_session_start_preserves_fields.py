@@ -196,10 +196,10 @@ def seams(monkeypatch):
     # /compact. `compact` stays wired so a regression that brings it back on
     # this path fails loudly rather than passing unnoticed.
     monkeypatch.setattr(A, "_inject_handoff",
-                        lambda sid, art, role=None, *, relaunch=True:
+                        lambda sid, art, role=None, *, relaunch=True, resume=False:
                         calls["handoff"].append((sid, art, relaunch)))
     monkeypatch.setattr(A, "_inject_context_handoff",
-                        lambda sid, task_id, *, relaunch=True:
+                        lambda sid, task_id, *, relaunch=True, resume=False:
                         calls["handoff"].append((sid, task_id, relaunch)))
     monkeypatch.setattr(IT, "_context_tokens", lambda cfg, slug, sid: state["tokens"])
     monkeypatch.setattr(G, "is_attached", lambda target, **kw: False)

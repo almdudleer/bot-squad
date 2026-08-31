@@ -256,7 +256,17 @@ _MANAGED = {
 }
 _INFLIGHT_RECYCLE = {
     "idle_recycle_phase", "idle_recycle_armed_at", "idle_recycle_mark",
+    # T-0945: the compact_exit plan sends a /compact BETWEEN the handoff and
+    # the terminate, so its "did the session write its forward-state" fact has
+    # to survive the source=compact fire that /compact triggers — same hazard,
+    # same rule, as the three fields above it.
+    "idle_recycle_wrote_state",
     "compact_stay_phase", "compact_stay_armed_at",
+    # T-0945: graceful_exit's pre-exit handoff wait. It never sends a /compact,
+    # so in practice this only ever CLEARS — which is the point: a stale
+    # "writing" phase surviving into a fresh life would hand the next tick a
+    # timed-out finalize and exit the new session.
+    "exit_handoff_phase", "exit_handoff_armed_at", "exit_handoff_mark",
 }
 hook_source = os.environ.get("HOOK_SOURCE") or ""
 existing = {}

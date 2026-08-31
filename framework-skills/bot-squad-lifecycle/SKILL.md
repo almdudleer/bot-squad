@@ -12,8 +12,20 @@ description: Use when you need to understand what the bot-squad system does FOR 
 Every session — operator, TL, dev — shares ONE lifecycle. Sessions are transient work-execution processes, not persistent conversations (see `bot-squad-session-lifecycle-roles` for the paradigm). What that means operationally:
 
 - **Finish → exit.** If the work the session was created to do is done, the session exits. Don't idle indefinitely.
-- **Stale-wait → recycle on timeout.** A session blocked waiting past the **~1h cache-invalidation timeout** is asked to record its results and exit. You may **postpone** to the next timeout (repeatably) if you're actively waiting on a long, known-bounded process (e.g. a build).
-- **Compact = write-to-artifact → terminate → relaunch.** "This compact just takes all the context, writes it, and starts a new session with this summary" (voice-03). On exit, state whether/when resuming this session beats starting fresh from the documented progress; full `--resume` reread is discouraged.
+- **Stale-wait → recycle at 55 min idle** (strictly *before* the 1h prompt-cache TTL, T-0856). You may **postpone** to the next window (repeatably) if you're actively waiting on a long, known-bounded process (e.g. a build) — a tracked deploy auto-postpones with no action from you.
+- **What that recycle DOES depends on the ROLES you hold** (T-0945, stakeholder 2026-08-31: «в зависимости от того, какие роли держит сессия, мы ее по разному можем ресайклить»). The system decides this for you and tells you which one you are in when it asks for the handoff — you don't choose it, and you never need to compact defensively:
+
+  | you are | at 55 min idle |
+  |---|---|
+  | a pane a human is attached to, or `pinned`, or a hand-launched `user-session` | compacted IN PLACE. Never terminated. |
+  | user-conversation | handoff → compact → exit, then **resumed** (`claude --resume`) on the next message |
+  | operator with `drive: on` | nudged, kept alive — you only recycle after `bsq drive off` |
+  | operator with `drive: off` | same as user-conversation |
+  | dev / TL with ANY bound task still alive | nudged, kept alive (dev at 5 min, TL at 40) |
+  | dev / TL with nothing alive | handoff → exit, **no compact** |
+
+- **The compact is only spent when a resume is certain**, and the SESSION's half of the decision is the **ticket status**: `totest` when delivered, `blocked_on_user` when you are waiting on the stakeholder (the system then waits for him instead of restarting work), otherwise leave it and a later session picks the ticket up. That status is literally what the recycler reads next tick — «Это должна решать сама сессия, закончила она работу или нет, но система должна ей ставить дедлайн».
+- **Compact = write-the-handoff first, always.** "This compact just takes all the context, writes it, and starts a new session with this summary" (voice-03). On exit, state whether/when resuming this session beats starting fresh from the documented progress; full `--resume` reread is discouraged.
 - **The handoff has a DEFINED home, and which one turns on whether you own a TASK** (T-0567, T-0863).
   - **Task-bound (a dev, a TL on a subtask) → that ticket's `## Context`.** `bsq ticket context <id> --file <f>` REPLACES the section; it is the WHOLE handoff. **One task, one artifact** — no `artifacts/<task_id>.md`, no `bsq compact-save` (the worker refuses it for you), no progress note about compacting. It is also what the board already renders, so your successor and the stakeholder read the same thing. Because it replaces rather than appends, write what is TRUE NOW: goal, done, in progress, exact next steps, key paths, decisions, gotchas — carry forward what still holds and drop what doesn't. **Finalize is TWO writes** (T-0863): also `bsq ticket summary <id> "<one paragraph>"`, which REPLACES `## Executive summary` — progress made + what remains, for the STAKEHOLDER to read, not your successor. Only the Context write releases the wait, so a summary alone does not count as having handed off.
   - **Task-less (the operator, any other role with no assignment) → the role artifact**, system-resolved via `bsq compact-save`: operator → `artifacts/operator-state.md`; other roles → `artifacts/role-<role>-<sid>.md`. Overwrite in place, don't mint variants. These sessions have no ticket to write a Context onto, which is the only reason the artifact seam still exists.

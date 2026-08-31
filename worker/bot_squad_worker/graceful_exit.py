@@ -40,6 +40,26 @@ commits then pings READY; we only exit it once it has actually gone quiet. The
 pane must also be idle + composer-ready (never cut mid-turn). Every gate fails
 closed.
 
+T-0945 (2026-08-31) adds two things to this path, both from the same
+stakeholder ruling:
+
+* **A HANDOFF BEFORE THE EXIT.** *«когда to test для меня, не имеет смысла
+  держать сессию уже, если что, можно будет начать новую из тикета, компакты
+  делать не надо»* — starting a new session FROM THE TICKET presumes the ticket
+  is current, so a task-bound session is asked to write its ``## Context``
+  before it goes (:func:`_maybe_arm_exit_handoff`, bounded, never wedges).
+  Still **no compact, ever**, on this path: nothing resumes a done session, so
+  a squeeze would be paid for and discarded — the exact waste T-0863 removed
+  from ``idle_timeout``. That asymmetry ("compact only when a resume is
+  expected") is the whole of the T-0945 policy, and this is its else-branch.
+  ``BOT_SQUAD_EXIT_HANDOFF=0`` restores the record-free exit.
+* **PINNED / ATTACHED PANES ARE NEVER EXITED.** This path had no
+  :mod:`recycle_gate` check at all, so a done session the human had attached to
+  (or pinned) was suspended out from under him — *«исчезновение сессии у меня
+  из под носа»*, which he reads as a symptom of a badly configured process
+  rather than a correct decision. A pin or a live client now defers the exit
+  for as long as it lasts.
+
 Kill switch: ``BOT_SQUAD_GRACEFUL_EXIT=0`` disables the path entirely.
 """
 from __future__ import annotations
@@ -49,7 +69,7 @@ import os
 import time
 from typing import Any
 
-from bot_squad_worker import autocompact, sessions
+from bot_squad_worker import autocompact, recycle_gate, sessions
 
 log = logging.getLogger(__name__)
 
@@ -292,6 +312,82 @@ def _idle_age(row: dict, user_home: str, now: float) -> float | None:
     return max(0.0, now - at)
 
 
+# --- T-0945: handoff before the exit ----------------------------------------
+
+# In-flight state for the pre-exit handoff. Flat scalars on the session md, the
+# same storage and the same hook contract as idle_timeout's ``idle_recycle_*``
+# (they are in ``session_start.sh``'s ``_INFLIGHT_RECYCLE`` set, so a hook fire
+# on a NEW life clears them rather than handing this tick a stale finalize).
+_EXIT_HANDOFF_FIELDS = ("exit_handoff_phase", "exit_handoff_armed_at",
+                        "exit_handoff_mark")
+
+
+def exit_handoff_enabled() -> bool:
+    """T-0945: ask a task-bound session to write its ``## Context`` before the
+    work-done exit. ``BOT_SQUAD_EXIT_HANDOFF=0`` restores the pre-T-0945
+    record-free exit."""
+    return os.environ.get("BOT_SQUAD_EXIT_HANDOFF", "1") != "0"
+
+
+def _clear_exit_handoff(meta: dict) -> None:
+    for k in _EXIT_HANDOFF_FIELDS:
+        meta.pop(k, None)
+
+
+def _maybe_arm_exit_handoff(cfg: Any, slug: str, sid: str, meta: dict, md_path,
+                            task_id: Any, now: float, pane: str) -> bool | None:
+    """Drive the pre-exit handoff. Returns:
+
+    * ``True``  — an action was taken this tick (the handoff was just armed);
+      the caller must NOT exit yet.
+    * ``False`` — still waiting for the write; the caller must not exit either.
+    * ``None``  — nothing to wait for (written, timed out, disabled, or no
+      destination); the caller proceeds to the exit.
+
+    The wait is bounded by ``autocompact.handoff_timeout_sec`` and NEVER
+    wedges: a session that ignores the ask is exited anyway. NO ``/compact`` is
+    ever sent from here — see the module docstring.
+    """
+    if not exit_handoff_enabled():
+        return None
+    task_md = autocompact.task_md_path(cfg, slug, str(task_id))
+    if not task_md:
+        return None  # no ticket to write onto — nothing to hand off to
+
+    phase = meta.get("exit_handoff_phase")
+    if phase == "writing":
+        armed_at = sessions._parse_ts_epoch(meta.get("exit_handoff_armed_at")) or now
+        mark = autocompact.context_digest(task_md)
+        wrote = bool(mark) and mark != meta.get("exit_handoff_mark")
+        if not wrote and (now - armed_at) <= autocompact.handoff_timeout_sec():
+            return False  # still writing — retry next tick
+        if not wrote:
+            log.warning("graceful_exit: %s never updated %s's ## Context within "
+                        "the handoff window — exiting anyway (never wedge)",
+                        sid, task_id)
+        _clear_exit_handoff(meta)
+        sessions._write_session_metadata(md_path, meta, atomic=True)
+        return None
+
+    if not autocompact.composer_free(autocompact._capture_pane(pane), sid=sid,
+                                     now=now):
+        return False  # half-typed draft — never inject over it
+    try:
+        autocompact._inject_context_handoff(sid, str(task_id), relaunch=False)
+    except Exception:
+        log.exception("graceful_exit: exit handoff inject failed for %s "
+                      "(will retry)", sid)
+        return False
+    meta["exit_handoff_phase"] = "writing"
+    meta["exit_handoff_armed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                  time.gmtime(now))
+    meta["exit_handoff_mark"] = autocompact.context_digest(task_md)
+    sessions._write_session_metadata(md_path, meta, atomic=True)
+    log.info("graceful_exit: asked %s to bring %s's ## Context up to date "
+             "before exiting (T-0945: handoff, no compact)", sid, task_id)
+    return True
+
+
 # --- per-session executor ---------------------------------------------------
 
 def maybe_exit(cfg: Any, slug: str, row: dict, now: float, user_home: str) -> bool:
@@ -339,6 +435,32 @@ def maybe_exit(cfg: Any, slug: str, row: dict, now: float, user_home: str) -> bo
     if not autocompact.composer_ready(autocompact._capture_pane(pane),
                                       sid=sid, now=now):
         return False
+
+    # T-0945: this path had NO recycle_gate check — a done session the human had
+    # attached to (or explicitly pinned) was suspended out from under him. Both
+    # signals now defer the exit for as long as they last; nothing is lost by
+    # waiting, since the work is already done and the deliverable already
+    # exists.
+    md_path = sessions._session_file(cfg.data_dir, slug, sid)
+    meta = sessions._read_session_metadata(md_path) or {}
+    if recycle_gate.session_pinned(meta):
+        if recycle_gate.should_log_skip(f"exit-pinned:{sid}", now):
+            log.info("graceful_exit: %s is done but PINNED — holding the exit "
+                     "(T-0945)", sid)
+        return False
+    if recycle_gate.is_attached(pane, sid=sid, now=now):
+        if recycle_gate.should_log_skip(f"exit-attached:{sid}", now):
+            log.info("graceful_exit: %s is done but a human client is attached "
+                     "— holding the exit (T-0945)", sid)
+        return False
+
+    # T-0945: «можно будет начать новую из тикета» — so bring the ticket up to
+    # date first. Bounded, never wedges, and never spends a /compact.
+    if task_id and task_id != "~":
+        handoff = _maybe_arm_exit_handoff(cfg, slug, sid, meta, md_path,
+                                          task_id, now, pane)
+        if handoff is not None:
+            return handoff
 
     try:
         _suspend(cfg, slug, sid)

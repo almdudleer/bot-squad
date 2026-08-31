@@ -2260,3 +2260,33 @@ def test_the_uc_plan_is_told_it_will_be_resumed(tmp_path, seams):
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
     assert seams["calls"]["handoff_resume"] == [True]
+
+
+def test_worker_roles_cover_every_task_bound_role_derive_can_return():
+    """T-0945, enumerated by BEHAVIOUR rather than by the two names the ruling
+    happened to say. `sessions._derive_role` can return operator / prod-teamlead
+    / qa / user-conversation / teamlead / dev; the first and fourth have their
+    own branches, and the other four are all "alive while their work is". Zero
+    live sessions hold prod-teamlead or qa today — which is exactly why a
+    name-shaped reading would have dropped them without anything going red."""
+    assert set(IT.WORKER_ROLES) == {"dev", "teamlead", "prod-teamlead", "qa"}
+    for role in IT.WORKER_ROLES:
+        assert _plan(role, tasks_alive=True) == IT.PLAN_NUDGE, role
+        assert _plan(role, tasks_alive=False) == IT.PLAN_HANDOFF_EXIT, role
+    # the two coordinator flavours wait on other sessions → the patient cadence
+    assert IT.worker_nudge_sec("prod-teamlead") == IT.worker_nudge_sec("teamlead")
+    assert IT.worker_nudge_sec("qa") == IT.worker_nudge_sec("dev")
+    assert IT.worker_nudge_sec("dev") != IT.worker_nudge_sec("teamlead")
+
+
+def test_prod_teamlead_initiative_branch_matches_the_plain_teamlead(tmp_path, seams):
+    sid = "S-almdudleer-bot-squad-prodtl-p7"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="prod-TL", task_id=None)
+    _add_task(data, "T-0043", "in_progress", initiative="I-0001")
+    for role in ("teamlead", "prod-teamlead"):
+        assert IT.worker_tasks_alive(cfg, "bot-squad", [], role=role,
+                                     initiative="I-0001") is True, role
+    # a qa/dev session is NOT given the initiative branch — it is task-bound
+    for role in ("dev", "qa"):
+        assert IT.worker_tasks_alive(cfg, "bot-squad", [], role=role,
+                                     initiative="I-0001") is False, role

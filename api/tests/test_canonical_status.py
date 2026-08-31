@@ -42,6 +42,7 @@ def test_decided_mapping_is_stable():
         "in_progress": "in-progress",
         "paused": "in-progress",
         "blocked_on_user": "in-progress",
+        "to_accept": "in-progress",
         "totest": "validating",
         "closed": "done",
     }

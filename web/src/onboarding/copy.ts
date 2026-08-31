@@ -55,8 +55,8 @@ export const PROJECT_ROLE_BLURBS: ReadonlyArray<RoleBlurb> = [
     source: "api/app/resources/roles/dev.md",
     blurb:
       "Owns one task end-to-end. Builds, tests, commits on the shared dev " +
-      "tree (no worktrees). Flips the task to totest when DoD is green and " +
-      "peer_sends READY to its TL.",
+      "tree (no worktrees). Flips the task to to_accept when DoD is green " +
+      "and peer_sends READY to its TL.",
   },
   {
     key: "prod-teamlead",

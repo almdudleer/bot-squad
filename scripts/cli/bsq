@@ -2540,7 +2540,9 @@ anchor, printed above; `## Verbatim request` on older tickets). If you defer or 
 `bsq ticket note` — don't silently drift.
 
 REPORT READY: when a ticket's DoD (incl. manual walkthrough) is green,
-`bsq ticket update <id> totest`, `bsq ticket note <id> '<summary>'`, then
+`bsq ticket update <id> to_accept` (T-0944: `totest` is the human's queue —
+delivery now lands in `to_accept`, the operator's queue, one step before
+that), `bsq ticket note <id> '<summary>'`, then
 `bsq peer send {report_to} 'READY <id> — <summary>'`.
 
 Run `bsq --help` for the full verb reference."""
@@ -5985,19 +5987,23 @@ def cmd_cluster_launch(args) -> None:
 # Canonical backlog statuses. Source of truth: api/app/routes_backlog.py
 # ::_VALID_STATUSES (enforced on every PATCH). Mirrored here so `bsq ticket
 # update` can validate offline without an API round-trip. Keep in sync.
-TICKET_STATUSES = ("planned", "open", "in_progress", "paused", "blocked_on_user", "totest", "reopened", "closed")
+TICKET_STATUSES = ("planned", "open", "in_progress", "to_accept", "paused", "blocked_on_user", "totest", "reopened", "closed")
 
 # T-0931: the transition graph — SSOT in worker/bot_squad_worker/task_states.py
 # (mirrored byte-for-byte into api/app/task_states.py; bsq can't import either
 # package, so this copy is a manual mirror like TICKET_STATUSES itself — keep
 # in sync). See T-0931 ## Context for the rationale behind each edge.
+# T-0944 inserted `to_accept` between `in_progress` and `totest` — `totest` is
+# the HUMAN's queue, `to_accept` is the operator's; a dev's delivery lands in
+# `to_accept`, not `totest` directly (that edge is gone).
 TICKET_TRANSITIONS = {
     # T-0591 (F3.3) already names "planned/open -> in_progress" as one
     # transition — real build work starting from either "not yet queued" or
     # "queued" — so both go straight to in_progress, not just through open.
     "planned": frozenset({"open", "in_progress", "closed"}),
     "open": frozenset({"in_progress", "planned", "closed"}),
-    "in_progress": frozenset({"paused", "blocked_on_user", "totest", "open", "closed"}),
+    "in_progress": frozenset({"paused", "blocked_on_user", "to_accept", "open", "closed"}),
+    "to_accept": frozenset({"totest", "reopened", "closed"}),
     "paused": frozenset({"in_progress", "open", "closed"}),
     "blocked_on_user": frozenset({"in_progress", "closed"}),
     "totest": frozenset({"closed", "reopened"}),

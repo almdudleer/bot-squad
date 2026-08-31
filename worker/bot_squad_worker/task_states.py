@@ -26,6 +26,7 @@ TICKET_STATUSES: tuple[str, ...] = (
     "planned",
     "open",
     "in_progress",
+    "to_accept",
     "paused",
     "blocked_on_user",
     "totest",
@@ -46,13 +47,21 @@ TICKET_STATUSES: tuple[str, ...] = (
 # This is a first cut, not yet stakeholder/TL sign-off on the exact edges —
 # the DoD is the MECHANISM (enforced, data-driven graph), not these specific
 # edges being final.
+#
+# T-0944: `totest` is the HUMAN's queue ("to test это для меня уже,
+# человека" — stakeholder). `to_accept` is the operator's queue in between —
+# a dev's delivery now lands there, not in `totest` directly, so a ticket
+# only reaches the human's queue once an operator has accepted it. Hence
+# `in_progress` no longer has a direct edge to `totest` (that WAS the bug:
+# nothing gated what a human saw); the only way in is via `to_accept`.
 TRANSITIONS: dict[str, frozenset[str]] = {
     # T-0591 (F3.3) already names "planned/open -> in_progress" as one
     # transition — real build work starting from either "not yet queued" or
     # "queued" — so both go straight to in_progress, not just through open.
     "planned": frozenset({"open", "in_progress", "closed"}),
     "open": frozenset({"in_progress", "planned", "closed"}),
-    "in_progress": frozenset({"paused", "blocked_on_user", "totest", "open", "closed"}),
+    "in_progress": frozenset({"paused", "blocked_on_user", "to_accept", "open", "closed"}),
+    "to_accept": frozenset({"totest", "reopened", "closed"}),
     "paused": frozenset({"in_progress", "open", "closed"}),
     "blocked_on_user": frozenset({"in_progress", "closed"}),
     "totest": frozenset({"closed", "reopened"}),
@@ -97,6 +106,12 @@ def invalid_transition_detail(from_status: str, to_status: str) -> str:
 # `blocked_on_user` (stuck on the stakeholder, no session can move it), and
 # `closed` (done) are parked — none of them should count toward "how much
 # work is waiting for a session".
+# T-0944: `to_accept` is left OUT of PARKED_STATES (so it falls into
+# ACTIVE_STATES below) — it is a live demand signal, just aimed at the
+# operator rather than a dev. Whether a session should actually be kept
+# alive/spawned for it is the session-lifecycle question T-0945 owns; this
+# predicate only answers "is this orchestration load", and undelivered
+# operator review is.
 PARKED_STATES: frozenset[str] = frozenset({"planned", "paused", "blocked_on_user", "closed"})
 ACTIVE_STATES: frozenset[str] = frozenset(TICKET_STATUSES) - PARKED_STATES
 

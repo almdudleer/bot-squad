@@ -22,6 +22,10 @@ export const CANONICAL_STATE: Record<Task["status"], CanonicalState> = {
   // T-0931 — same bucket as paused: started, bound work, stalled on a
   // dependency (there a session, here an answer).
   blocked_on_user: "in-progress",
+  // T-0944 — delivered by dev, awaiting OPERATOR acceptance. Not yet
+  // "validating": his own words draw that line at `totest` specifically
+  // ("to test это для меня уже, человека").
+  to_accept: "in-progress",
   totest: "validating",
   closed: "done",
 };
@@ -50,6 +54,7 @@ export const INTERNAL_LABELS: Record<Task["status"], string> = {
   planned: "Planned",
   open: "Open",
   in_progress: "In progress",
+  to_accept: "To Accept",
   paused: "Paused",
   blocked_on_user: "Blocked on user",
   totest: "To Test",

@@ -17,11 +17,13 @@ import {
 import { BOARD_COLUMNS } from "./pages/Project";
 
 // The internal statuses, kept in sync with Task["status"] in api.ts.
-// T-0889 added `paused`. T-0931 added `blocked_on_user`.
+// T-0889 added `paused`. T-0931 added `blocked_on_user`. T-0944 added
+// `to_accept`.
 const INTERNAL_STATUSES = [
   "planned",
   "open",
   "in_progress",
+  "to_accept",
   "paused",
   "blocked_on_user",
   "totest",
@@ -65,6 +67,7 @@ describe("canonical 4-state mapping", () => {
       in_progress: "in-progress",
       paused: "in-progress",
       blocked_on_user: "in-progress",
+      to_accept: "in-progress",
       totest: "validating",
       closed: "done",
     });
@@ -189,6 +192,14 @@ describe("internal-status badge only shows where it refines the column", () => {
   // T-0931: blocked_on_user joined the same column as paused/in_progress —
   // same derived-rule guarantee, no edit needed anywhere but the mapping.
   test("adding blocked_on_user keeps all three in-progress statuses badged", () => {
+    expect(statusRefinesItsColumn("blocked_on_user")).toBe(true);
+    expect(statusRefinesItsColumn("in_progress")).toBe(true);
+    expect(statusRefinesItsColumn("paused")).toBe(true);
+  });
+
+  // T-0944: to_accept joined the same column — same guarantee again.
+  test("adding to_accept keeps all four in-progress statuses badged", () => {
+    expect(statusRefinesItsColumn("to_accept")).toBe(true);
     expect(statusRefinesItsColumn("blocked_on_user")).toBe(true);
     expect(statusRefinesItsColumn("in_progress")).toBe(true);
     expect(statusRefinesItsColumn("paused")).toBe(true);

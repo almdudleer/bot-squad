@@ -72,6 +72,11 @@ def test_blocked_on_user_is_in_the_ssot():
     assert "blocked_on_user" in _VALID_STATUSES
 
 
+def test_to_accept_is_in_the_ssot():
+    # T-0944: the whole point of that ticket — this status must actually exist.
+    assert "to_accept" in _VALID_STATUSES
+
+
 def test_every_status_has_an_entry_in_transitions_or_is_terminal_only():
     # Every status must be reachable from SOME edge, and every status that
     # appears as a source key's target must itself be a real status.
@@ -92,7 +97,10 @@ def test_every_status_has_an_entry_in_transitions_or_is_terminal_only():
     ("open", "planned"),
     ("in_progress", "blocked_on_user"),
     ("blocked_on_user", "in_progress"),
-    ("in_progress", "totest"),
+    ("in_progress", "to_accept"),  # T-0944: dev delivers here, not to totest
+    ("to_accept", "totest"),       # operator accepted -> human's queue
+    ("to_accept", "reopened"),     # operator bounces
+    ("to_accept", "closed"),
     ("totest", "closed"),
     ("totest", "reopened"),
     ("reopened", "in_progress"),
@@ -110,6 +118,9 @@ def test_valid_transitions_accepted(frm, to):
     ("closed", "totest"),
     ("blocked_on_user", "totest"),  # can't skip the unblock step
     ("planned", "totest"),
+    ("in_progress", "totest"),  # T-0944: must go via to_accept now
+    ("to_accept", "open"),      # only totest/reopened/closed are real exits
+    ("to_accept", "in_progress"),
 ])
 def test_invalid_transitions_rejected(frm, to):
     assert not is_valid_transition(frm, to)
@@ -146,6 +157,12 @@ def test_blocked_on_user_and_paused_and_planned_and_closed_are_parked():
 def test_open_in_progress_totest_reopened_are_active():
     for s in ("open", "in_progress", "totest", "reopened"):
         assert not is_parked(s), f"{s} should be active"
+
+
+def test_to_accept_is_active():
+    # T-0944: delivered-but-unaccepted work is still orchestration load, just
+    # aimed at the operator rather than a dev.
+    assert not is_parked("to_accept")
 
 
 def test_parked_and_active_partition_the_whole_enum():
@@ -199,6 +216,44 @@ def test_patch_accepts_blocked_on_user_resolving_back_to_in_progress(tmp_bot_squ
         )
     assert r.status_code == 200
     assert r.json()["status"] == "in_progress"
+
+
+def test_patch_rejects_dev_skipping_operator_acceptance(tmp_bot_squad: Path, monkeypatch):
+    # T-0944: `in_progress -> totest` is gone — delivery must go via `to_accept`.
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    (backlog / "T-0001-foo.md").write_text(
+        "---\nid: T-0001\ntitle: Foo\nstatus: in_progress\n---\n\nbody\n"
+    )
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.patch(
+            "/api/projects/test-project/backlog/T-0001",
+            json={"status": "totest"},
+        )
+    assert r.status_code == 400
+    assert "in_progress" in r.json()["detail"] and "totest" in r.json()["detail"]
+    assert "status: in_progress" in (backlog / "T-0001-foo.md").read_text()
+
+
+def test_patch_accepts_delivery_to_to_accept_then_operator_acceptance(
+    tmp_bot_squad: Path, monkeypatch
+):
+    backlog = tmp_bot_squad / "data" / "test-project" / "backlog"
+    (backlog / "T-0001-foo.md").write_text(
+        "---\nid: T-0001\ntitle: Foo\nstatus: in_progress\n---\n\nbody\n"
+    )
+    with _client_logged_in(tmp_bot_squad, monkeypatch) as client:
+        r = client.patch(
+            "/api/projects/test-project/backlog/T-0001",
+            json={"status": "to_accept"},
+        )
+        assert r.status_code == 200
+        assert r.json()["status"] == "to_accept"
+        r = client.patch(
+            "/api/projects/test-project/backlog/T-0001",
+            json={"status": "totest"},
+        )
+        assert r.status_code == 200
+        assert r.json()["status"] == "totest"
 
 
 def test_patch_noop_status_is_never_rejected(tmp_bot_squad: Path, monkeypatch):

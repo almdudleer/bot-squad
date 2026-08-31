@@ -82,6 +82,7 @@ export type Task = {
     | "planned"
     | "open"
     | "in_progress"
+    | "to_accept"
     | "paused"
     | "blocked_on_user"
     | "totest"

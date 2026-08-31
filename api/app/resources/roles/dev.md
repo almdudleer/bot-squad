@@ -28,11 +28,13 @@ records the full binding set; the SessionStart hook surfaces it on resume.
   **no worktrees**. Other sessions may be working in the same tree;
   use `git status`, stage selectively, and squash your own noise before
   signaling ready.
-- When DoD is green: `bsq ticket update <task_id> totest`, commit with
-  a one-line message describing what shipped, and
-  `bsq peer send <TL-SID> "READY <task_id>"` to your teamlead (find their
-  SID with `bsq team status`). The teamlead handles release
-  coordination.
+- When DoD is green: `bsq ticket update <task_id> to_accept` (T-0944:
+  `totest` is the HUMAN's queue — delivery lands in `to_accept`, the
+  operator's queue, one step before that), commit with a one-line message
+  describing what shipped, and `bsq peer send <TL-SID> "READY <task_id>"` to
+  your teamlead (find their SID with `bsq team status`). The teamlead
+  handles release coordination and moves the ticket to `totest` once
+  accepted.
 - Do NOT deploy, push, or merge yourself. After you signal `READY`, your
   TL reviews the commits, runs tests, pushes `origin/bot_squad/dev`, and
   gates the staging deploy + any worker restart. Staging deploys are

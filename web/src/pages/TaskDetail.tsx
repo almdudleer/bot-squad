@@ -23,6 +23,9 @@ const STATUS_OPTIONS: { value: Task["status"]; label: string }[] = [
   { value: "planned", label: "Planned" },
   { value: "open", label: "Open" },
   { value: "in_progress", label: "In progress" },
+  // T-0944: delivered by dev, awaiting operator acceptance (before `totest`,
+  // the human's queue).
+  { value: "to_accept", label: "To Accept" },
   // T-0931: was missing (predates paused too) — the `?? task.status` fallback
   // below meant a raw internal value rather than a crash, but a real label
   // costs one line.

@@ -43,9 +43,9 @@ router = APIRouter(
     dependencies=[Depends(require_auth)],
 )
 
-# The six internal statuses (mirrors routes_backlog._VALID_STATUSES) — the keys
+# The internal statuses (mirrors routes_backlog._VALID_STATUSES) — the keys
 # the backlog count map always carries, so the UI can render a stable set.
-_STATUSES = ("planned", "open", "in_progress", "paused", "blocked_on_user", "totest", "reopened", "closed")
+_STATUSES = ("planned", "open", "in_progress", "to_accept", "paused", "blocked_on_user", "totest", "reopened", "closed")
 
 
 def _data_dir(request: Request) -> Path:

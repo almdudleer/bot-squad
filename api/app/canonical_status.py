@@ -45,6 +45,11 @@ CANONICAL_STATE: dict[str, str] = {
     # into in-progress for the same reason paused does — started, bound work,
     # just stalled on a dependency (there, a session; here, an answer).
     "blocked_on_user": "in-progress",
+    # T-0944: delivered by dev, awaiting OPERATOR acceptance — not yet the
+    # human's queue. His own words draw the line: "to test это для меня уже,
+    # человека" (validating = for him specifically). Anything short of that
+    # acceptance stays in-progress, the same bucket as paused/blocked_on_user.
+    "to_accept": "in-progress",
     "totest": "validating",
     "closed": "done",
 }

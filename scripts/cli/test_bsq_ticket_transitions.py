@@ -45,6 +45,31 @@ def test_valid_transition_succeeds(tmp_path, monkeypatch):
     assert bsq.read_frontmatter(p)["status"] == "blocked_on_user"
 
 
+def test_in_progress_can_no_longer_jump_straight_to_totest(tmp_path, monkeypatch):
+    # T-0944: totest is the human's queue; delivery must go via to_accept.
+    p = tmp_path / "T-0001-demo.md"
+    _write(p, status="in_progress")
+    with pytest.raises(SystemExit):
+        _run_update(tmp_path, monkeypatch, "totest")
+    assert bsq.read_frontmatter(p)["status"] == "in_progress"
+
+
+def test_dev_delivery_then_operator_acceptance(tmp_path, monkeypatch):
+    p = tmp_path / "T-0001-demo.md"
+    _write(p, status="in_progress")
+    _run_update(tmp_path, monkeypatch, "to_accept")
+    assert bsq.read_frontmatter(p)["status"] == "to_accept"
+    _run_update(tmp_path, monkeypatch, "totest")
+    assert bsq.read_frontmatter(p)["status"] == "totest"
+
+
+def test_operator_can_bounce_to_accept_back_to_reopened(tmp_path, monkeypatch):
+    p = tmp_path / "T-0001-demo.md"
+    _write(p, status="to_accept")
+    _run_update(tmp_path, monkeypatch, "reopened")
+    assert bsq.read_frontmatter(p)["status"] == "reopened"
+
+
 def test_blocked_on_user_resolves_back_to_in_progress(tmp_path, monkeypatch):
     p = tmp_path / "T-0001-demo.md"
     _write(p, status="blocked_on_user")

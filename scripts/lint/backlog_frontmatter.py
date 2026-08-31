@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 VALID_STATUSES = frozenset(
-    {"planned", "open", "in_progress", "paused", "blocked_on_user", "totest", "reopened", "closed"}
+    {"planned", "open", "in_progress", "to_accept", "paused", "blocked_on_user", "totest", "reopened", "closed"}
 )
 
 _FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---", re.DOTALL)

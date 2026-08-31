@@ -415,9 +415,19 @@ PLAN_COMPACT_EXIT = "compact_exit"  # handoff -> /compact -> exit resumable
 PLAN_HANDOFF_EXIT = "handoff_exit"  # handoff -> exit, no compact
 
 # Roles whose continuation is conditional on their WORK rather than on a human
-# ("логично продолжать только пока какая-то из их задач жива"). `teamlead` is
-# the spelling `sessions._derive_role` / `graceful_exit` already use.
-WORKER_ROLES = ("dev", "teamlead")
+# ("логично продолжать только пока какая-то из их задач жива"). Enumerated from
+# what `sessions._derive_role` can actually RETURN, not from the two names the
+# stakeholder happened to say: `prod-teamlead` IS a team-lead and `qa` IS a
+# task-bound worker, so leaving either out would keep recycling it at 55 min
+# with live work in hand — the exact defect this ticket fixes for the TL. Zero
+# live sessions hold those two today, which is precisely why a name-shaped
+# reading of the rule would have missed them silently.
+WORKER_ROLES = ("dev", "teamlead", "prod-teamlead", "qa")
+
+# The subset that WAITS ON OTHER SESSIONS, and so gets the operator's patient
+# 40 min cadence instead of the dev's 5 («оператор может ждать девов и долго» —
+# a TL waits on its devs for the same reason).
+COORDINATOR_ROLES = ("teamlead", "prod-teamlead")
 
 # The in-flight phase stamped between the /compact a compact_exit sends and the
 # terminate that follows it. Deliberately NOT the legacy "compacting" value:
@@ -430,11 +440,14 @@ PHASE_COMPACT_EXIT = "compacting_exit"
 def worker_nudge_sec(role: str | None) -> int:
     """The keep-alive cadence for a :data:`WORKER_ROLES` session with live work.
 
-    A dev gets T-0930's 5 min. A team-lead gets the OPERATOR's 40 min: a TL sits
-    waiting on its devs for exactly the reason the operator does («оператор
-    может ждать девов и долго»), so the dev cadence would nudge it every 5
-    minutes while it is legitimately waiting for someone else's build."""
-    return dev_nudge_sec() if (role or "") == "dev" else operator_nudge_sec()
+    A dev — and a qa session, task-bound the same way — gets T-0930's 5 min. A
+    team-lead of either flavour (:data:`COORDINATOR_ROLES`) gets the OPERATOR's
+    40 min: a TL sits waiting on its devs for exactly the reason the operator
+    does («оператор может ждать девов и долго»), so the dev cadence would nudge
+    it every 5 minutes while it is legitimately waiting for someone else's
+    build."""
+    return (operator_nudge_sec() if (role or "") in COORDINATOR_ROLES
+            else dev_nudge_sec())
 
 
 def bound_task_ids(row: dict | None, meta: dict | None) -> list[str]:
@@ -494,7 +507,7 @@ def worker_tasks_alive(cfg: Any, slug: str, task_ids: list[str], *,
     for tid in task_ids:
         if task_alive(cfg, slug, tid):
             return True
-    if task_ids or (role or "") != "teamlead":
+    if task_ids or (role or "") not in COORDINATOR_ROLES:
         return False
     init = str(initiative or "").strip()
     if not init or init == "~":

@@ -2219,8 +2219,26 @@ def _write_task_initiative_if_absent(backlog_dir: Path, task_id: str, initiative
 # that the composer accepts keystrokes. Total budget = 15s; interval 0.3s
 # keeps the polling pressure on tmux well under one request per claude
 # render frame on a loaded host.
+#
+# T-0897 correction: `❯` is NOT unique to the input box after all — measured
+# live on a directory claude had never run in, the first-run "trust this
+# folder" dialog reuses the same rune as its list-selector ("❯ No, exit" /
+# "  Yes, I trust this folder"). See `_TRUST_DIALOG_MARKER` below for how
+# that screen is told apart from the real composer.
 _COMPOSER_READY_TIMEOUT_SEC = 15.0
 _COMPOSER_READY_POLL_INTERVAL_SEC = 0.3
+
+# T-0897: claude's first-ever launch in a directory blocks on a "Quick safety
+# check … trust this folder?" dialog before the real composer exists. Measured
+# live (fresh tmux pane, v2.1.251, `claude --dangerously-skip-permissions`):
+# --dangerously-skip-permissions does NOT skip this screen (it only skips
+# per-action tool permission prompts); a bracketed paste sent to it is
+# silently swallowed (composer content unchanged); and a bare Enter sent to it
+# confirms the DEFAULT-selected row, "No, exit" — which kills the whole claude
+# process (`pane_current_command` measured flipping from "claude" to "bash").
+# bot-squad already runs every spawn unattended, so this is answered the same
+# way a human operator would: select "Yes, I trust this folder" and confirm.
+_TRUST_DIALOG_MARKER = "trust this folder"
 
 # T-0201: confirm-then-Enter knobs for _deliver_prompt. The old blind
 # `time.sleep(0.4)` was too short for a large (~140-line) bracketed paste —
@@ -2253,6 +2271,33 @@ def _wait_for_claude_composer_ready(pane_id: str) -> bool:
     return _wait_for_agent_composer_ready(pane_id, "claude")
 
 
+def _dismiss_trust_dialog(pane_id: str, cap_stdout: str) -> bool:
+    """If claude's first-run-in-this-directory trust dialog is on screen
+    (``cap_stdout`` from a plain ``capture-pane -p``), answer it and report
+    whether it fired. See ``_TRUST_DIALOG_MARKER`` for why this can't be left
+    to the normal composer-ready / paste-then-Enter path.
+
+    Selects "Yes, I trust this folder" rather than assuming its position:
+    only sends Down when that row is not already the one carrying the ``❯``
+    selector, so a reordered or single-row dialog in some other version still
+    lands on the right choice instead of blindly hitting the default.
+    """
+    lines = cap_stdout.splitlines()
+    trust_idx = next(
+        (i for i, line in enumerate(lines) if _TRUST_DIALOG_MARKER in line.lower()),
+        None,
+    )
+    if trust_idx is None:
+        return False
+    from bot_squad_worker import input_mux
+
+    if "❯" not in lines[trust_idx]:
+        input_mux.raw_keys(pane_id, "Down")
+        time.sleep(0.1)
+    input_mux.raw_keys(pane_id, "Enter")
+    return True
+
+
 def _wait_for_agent_composer_ready(pane_id: str, provider_name: str) -> bool:
     """Poll until the selected provider's interactive composer is visible."""
     timeout_sec = _COMPOSER_READY_TIMEOUT_SEC
@@ -2261,10 +2306,20 @@ def _wait_for_agent_composer_ready(pane_id: str, provider_name: str) -> bool:
     iterations = max(1, int(timeout_sec / interval_sec))
     for _ in range(iterations):
         cap = _run(["tmux", "capture-pane", "-t", pane_id, "-p"])
-        if cap.returncode == 0 and any(marker in cap.stdout for marker in markers):
-            return True
+        if cap.returncode == 0:
+            if provider_name == _agent_provider.CLAUDE and _dismiss_trust_dialog(
+                pane_id, cap.stdout
+            ):
+                time.sleep(interval_sec)
+                continue
+            if any(marker in cap.stdout for marker in markers):
+                return True
         time.sleep(interval_sec)
     return False
+
+
+#: Matches a `tmux capture-pane -e` SGR escape, e.g. ``\x1b[2m`` or ``\x1b[0m``.
+_ANSI_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _composer_content(pane_id: str) -> str | None:
@@ -2272,15 +2327,33 @@ def _composer_content(pane_id: str) -> str | None:
     can't be captured / has no composer line.
 
     The composer prompt line is ``❯ <content>``. ``""`` means an empty composer
-    (``❯`` with nothing after it); a non-empty string means the composer holds
-    pasted/typed content — the literal text for a short paste, or a
-    ``[Pasted text #N +M lines]`` placeholder for a large bracketed paste
+    (nothing the caller pasted/typed is in it); a non-empty string means the
+    composer holds pasted/typed content — the literal text for a short paste,
+    or a ``[Pasted text #N +M lines]`` placeholder for a large bracketed paste
     (verified live, T-0201). The composer is always rendered at the BOTTOM of
     the TUI, so we take the last ``❯`` line: even if the conversation
     scrollback (or the pasted brief itself) contains a ``❯`` above, the input
     box is the bottom-most one.
+
+    T-0897: an EMPTY composer is not blank — claude fills it with a dim,
+    rotating placeholder hint (e.g. ``Try "how does <filepath> work?"``), and
+    a plain ``capture-pane -p`` renders that hint as ordinary text
+    indistinguishable from something actually pasted there. Measured live
+    (fresh tmux pane, v2.1.251): the hint is wrapped in SGR 2 (dim/faint,
+    ``\x1b[2m…\x1b[0m``) immediately after the marker, while real typed or
+    pasted content — including the ``[Pasted text #N +M lines]`` placeholder —
+    renders with NO styling there at all. We capture with ``-e`` and treat
+    ANY styling landing directly after the marker (before the first visible
+    character) as decorative UI rather than the caller's own input — this
+    also protects against a different screen that happens to share the ``❯``
+    rune (T-0897's other finding, the first-run trust dialog; see
+    ``_dismiss_trust_dialog``), whose selected row is styled in a highlight
+    color rather than being genuinely blank. The hint's own wording is
+    intentionally NOT part of this check: it rotates between several example
+    prompts and changes across claude versions, so pinning it would be a
+    literal from memory the DoD explicitly rules out.
     """
-    cap = _run(["tmux", "capture-pane", "-t", pane_id, "-p"])
+    cap = _run(["tmux", "capture-pane", "-t", pane_id, "-p", "-e"])
     if cap.returncode != 0:
         return None
     content: str | None = None
@@ -2294,8 +2367,18 @@ def _composer_content(pane_id: str) -> str | None:
     for line in cap.stdout.splitlines():
         for marker in markers:
             idx = line.find(marker)
-            if idx != -1:
-                content = line[idx + len(marker):].strip()
+            if idx == -1:
+                continue
+            tail = line[idx + len(marker):]
+            # T-0897: the separator claude renders right after `❯` is U+00A0
+            # (non-breaking space), not an ASCII space — measured live on both
+            # the placeholder and real-content captures below. Plain
+            # `.lstrip(" ")` leaves it in place and the dim-escape check below
+            # never matches, so this must be a real (default) `.lstrip()`.
+            if tail.lstrip().startswith("\x1b["):
+                content = ""
+            else:
+                content = _ANSI_SGR_RE.sub("", tail).strip()
     return content
 
 

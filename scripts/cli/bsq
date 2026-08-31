@@ -215,6 +215,17 @@ def require_sid(explicit: str | None) -> str:
     return sid
 
 
+def _sid_or_blank(explicit: str | None = None) -> str:
+    """This session's SID, or "" when it can't be resolved (T-0938).
+
+    The soft sibling of `require_sid`. Used where the SID is ATTRIBUTION rather
+    than identity — the ticket writers pass it so the ticket-update fan-out
+    doesn't nudge you about your own write. A write from outside tmux must still
+    land; it is simply unattributed, and its author gets one redundant nudge.
+    """
+    return explicit or my_sid() or ""
+
+
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
@@ -6215,6 +6226,20 @@ def cmd_ticket_update(args) -> None:
     new_text = text[:m.start(1)] + new_fm + text[m.end(1):]
     _write_atomic(path, new_text)
     print(f"{tid}: status {old} -> {status}")
+    # T-0938: this write happens HERE, in the CLI, and never reaches a worker
+    # action — which is why the ticket-update fan-out polls the md. Report the
+    # authorship so the session that moved the status isn't nudged about its own
+    # move; best-effort, because a failed report costs one redundant nudge and
+    # the status change has already landed.
+    if old != status:
+        _sid = _sid_or_blank(getattr(args, "sid", None))
+        if _sid:
+            try:
+                post("ticket_author_note", {
+                    "slug": slug, "task_id": tid, "sid": _sid, "keys": ["status"],
+                }, fatal=False)
+            except WorkerError:
+                pass
     # No tree-wide lint here: the status value was validated against
     # TICKET_STATUSES before the write, so the file we just wrote is
     # canonical by construction. (scripts/lint/backlog_frontmatter.py scans
@@ -6235,6 +6260,24 @@ def cmd_ticket_update(args) -> None:
                   f"thread_id={res.get('thread_id')})")
 
 
+def _print_fanout(res: dict, tid: str) -> None:
+    """T-0938: say who the ticket-update fan-out will nudge about this write.
+
+    The relay habit grew because a ticket write felt like writing into a void
+    while a peer_send visibly reached somebody. This line is the answer to the
+    question that drove it — and when nobody is bound and no operator is live,
+    it says THAT, which is the one case where relaying is still the right call.
+    """
+    if not isinstance(res, dict) or "will_notify" not in res:
+        return
+    targets = res.get("will_notify") or []
+    if targets:
+        print(f"  → fan-out will nudge: {', '.join(targets)}")
+    else:
+        print(f"  → nobody is bound to {tid} and no live operator — this write "
+              f"nudges no one (relay it only if it fits no ticket)")
+
+
 def cmd_ticket_note(args) -> None:
     slug, tid, _path = resolve_ticket_ref(
         args.id, getattr(args, "slug", None), verb="ticket note")
@@ -6243,6 +6286,7 @@ def cmd_ticket_note(args) -> None:
         "slug": slug, "sid": sid, "task_id": tid, "text": args.body,
     })
     print(f"noted on {tid}: {res.get('line_appended', '(ok)')}")
+    _print_fanout(res, tid)
 
 
 def cmd_ticket_context(args) -> None:
@@ -6268,8 +6312,14 @@ def cmd_ticket_context(args) -> None:
             "(use --clear to empty the section)")
     if args.clear:
         text = ""
-    res = post("task_context_set", {"slug": slug, "task_id": tid, "text": text})
+    # T-0938: pass the SID so the ticket-update fan-out knows who wrote this and
+    # doesn't nudge you about your own Context write. `require_sid` is
+    # non-fatal here on purpose — a write from outside tmux still lands, it is
+    # just unattributed (and its author gets one redundant nudge).
+    res = post("task_context_set", {"slug": slug, "task_id": tid, "text": text,
+                                    "sid": _sid_or_blank(args.sid)})
     print(f"context set on {slug}/{tid} ({res.get('bytes_written', 0)} bytes of body)")
+    _print_fanout(res, tid)
     _print_rollback(res)
 
 
@@ -6301,9 +6351,11 @@ def cmd_ticket_summary(args) -> None:
     else:
         die("no text: pass the paragraph as an argument, use --file <path>, "
             "pipe it on stdin, or --clear to empty the section")
-    res = post("task_summary_set", {"slug": slug, "task_id": tid, "text": text})
+    res = post("task_summary_set", {"slug": slug, "task_id": tid, "text": text,
+                                    "sid": _sid_or_blank(args.sid)})  # T-0938
     print(f"executive summary set on {slug}/{tid} "
           f"({res.get('bytes_written', 0)} bytes of body)")
+    _print_fanout(res, tid)
     _print_rollback(res)
 
 
@@ -6326,8 +6378,10 @@ def cmd_ticket_quote(args) -> None:
     res = post("task_stakeholder_note_add", {
         "slug": slug, "task_id": tid, "text": text,
         "source": args.source or "stakeholder",
+        "sid": _sid_or_blank(args.sid),  # T-0938: authorship, see cmd_ticket_context
     })
     print(f"stakeholder quote recorded on {tid}: {res.get('line_appended', '(ok)')}")
+    _print_fanout(res, tid)
 
 
 # --------------------------------------------------------------------------
@@ -7274,6 +7328,7 @@ def build_parser() -> argparse.ArgumentParser:
     tku = tk_sub.add_parser("update", help="set a ticket's status (canonical schema)")
     tku.add_argument("id", help="ticket id, e.g. T-0149 or T-0149@watchrobot")
     tku.add_argument("status", help="new status: " + "/".join(TICKET_STATUSES))
+    tku.add_argument("--sid", help="override this session's SID")
     _tk_project_flag(tku)
     tku.set_defaults(func=cmd_ticket_update)
     tkn = tk_sub.add_parser("note", help="append a progress note to a ticket")
@@ -7287,6 +7342,7 @@ def build_parser() -> argparse.ArgumentParser:
     tkc.add_argument("id", help="ticket id, e.g. T-0123 or T-0123@watchrobot")
     tkc.add_argument("--file", help="read the new Context from this file (else stdin)")
     tkc.add_argument("--clear", action="store_true", help="empty the section")
+    tkc.add_argument("--sid", help="override this session's SID")
     _tk_project_flag(tkc)
     tkc.set_defaults(func=cmd_ticket_context)
     tksm = tk_sub.add_parser(
@@ -7298,6 +7354,7 @@ def build_parser() -> argparse.ArgumentParser:
                       help="the one-paragraph status (else --file or stdin)")
     tksm.add_argument("--file", help="read the summary from this file instead")
     tksm.add_argument("--clear", action="store_true", help="empty the section")
+    tksm.add_argument("--sid", help="override this session's SID")
     _tk_project_flag(tksm)
     tksm.set_defaults(func=cmd_ticket_summary)
     tkq = tk_sub.add_parser(
@@ -7306,6 +7363,7 @@ def build_parser() -> argparse.ArgumentParser:
     tkq.add_argument("text", nargs="?", default="", help="his verbatim words")
     tkq.add_argument("--file", help="read the quote from this file instead")
     tkq.add_argument("--source", help="where the words came from (default: stakeholder)")
+    tkq.add_argument("--sid", help="override this session's SID")
     _tk_project_flag(tkq)
     tkq.set_defaults(func=cmd_ticket_quote)
 

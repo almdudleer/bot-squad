@@ -3223,8 +3223,103 @@ def _action_peer_inbox_read(params: dict[str, Any]) -> dict[str, Any]:
     return _is.inbox_read(cfg, params["slug"], params["sid"])
 
 
+_TICKET_AUTHOR_NOTE_REQUIRED = {"slug", "task_id", "sid", "keys"}
+_TICKET_AUTHOR_NOTE_ALLOWED = _TICKET_AUTHOR_NOTE_REQUIRED
+
+
+def _action_ticket_author_note(params: dict[str, Any]) -> dict[str, Any]:
+    """T-0938: record who authored a ticket change made OUTSIDE a worker action.
+
+    Required params: slug, task_id, sid, keys (a list from
+    ``ticket_watch.WATCHED_KEYS``)
+    Returns: {ok: true, task_id, keys}
+
+    `bsq ticket update` patches a ticket's `status:` line in the CLI process and
+    never reaches the worker — which is exactly why the fan-out polls the md
+    rather than hooking writers. But an unattributed status move means the
+    session that MADE it gets nudged about its own change, and status curation
+    is the operator's highest-volume ticket write. So the CLI reports the
+    authorship it knows, best-effort (`fatal=False` at the call site): a failed
+    report costs one redundant nudge, never the status update.
+
+    This carries NO ticket write of its own — it is attribution only, so a
+    caller cannot use it to fake a change.
+    """
+    extra = set(params) - _TICKET_AUTHOR_NOTE_ALLOWED
+    if extra:
+        raise ActionError(f"ticket_author_note got unexpected params: {sorted(extra)}")
+    missing = _TICKET_AUTHOR_NOTE_REQUIRED - set(params)
+    if missing:
+        raise ActionError(
+            f"ticket_author_note missing required params: {sorted(missing)}")
+    from bot_squad_worker import ticket_watch as _tw
+
+    keys = params["keys"]
+    if isinstance(keys, str):
+        keys = [keys]
+    if not isinstance(keys, list) or not keys:
+        raise ActionError("ticket_author_note: keys must be a non-empty list")
+    unknown = [k for k in keys if k not in _tw.WATCHED_KEYS]
+    if unknown:
+        raise ActionError(
+            f"ticket_author_note: unknown keys {unknown} — "
+            f"known: {list(_tw.WATCHED_KEYS)}")
+    _tw.note_author(_get_config(), params["slug"], params["task_id"],
+                    str(params["sid"] or "") or None, tuple(keys))
+    return {"ok": True, "task_id": params["task_id"], "keys": keys}
+
+
 _TASK_PROGRESS_REQUIRED = {"slug", "task_id", "sid", "text"}
 _TASK_PROGRESS_ALLOWED = _TASK_PROGRESS_REQUIRED
+
+
+def _note_ticket_author(cfg: Any, slug: str, task_id: str, sid: Any,
+                        keys: tuple[str, ...]) -> None:
+    """T-0938: tell the ticket-update fan-out who just wrote which section.
+
+    The fan-out DETECTS changes by polling the md — it has to, since `bsq ticket
+    update` and the api's PATCH never reach a worker action — so it cannot know
+    an author from the file alone. These four writers can, and passing it here
+    is what stops a session being nudged about its own edit while still nudging
+    it about anyone else's edit landing in the same 60s window.
+
+    Best-effort in both directions: the import is local (the fan-out must never
+    be a load-time dependency of the writers), and a failure is swallowed by
+    `ticket_watch.note_author` itself — attribution is worth one redundant
+    notification, never a failed ticket write.
+    """
+    try:
+        from bot_squad_worker import ticket_watch as _tw
+        _tw.note_author(cfg, slug, task_id, str(sid) if sid else None, keys)
+    except Exception:  # noqa: BLE001
+        log.debug("could not record ticket author for %s/%s", slug, task_id,
+                  exc_info=True)
+
+
+def _ticket_fanout_preview(cfg: Any, slug: str, task_id: str, sid: Any) -> list[str]:
+    """T-0938: who the ticket-update fan-out will nudge about this write.
+
+    Returned by every ticket writer so the CLI can SAY it. That line is the
+    contract half's real enforcement: the relay habit («глухой телефон») grew
+    because writing onto a ticket felt like writing into a void — no
+    confirmation that anyone would ever see it — while pasting into an inbox
+    visibly reached somebody. Naming the recipients at write time removes the
+    reason to relay instead of the permission.
+
+    A PREVIEW, not a promise: the tick resolves recipients again when it fires,
+    so a session that dies or binds in between changes the real set. The author
+    is excluded, mirroring the fan-out's own per-section suppression.
+    """
+    try:
+        from bot_squad_worker import ticket_watch as _tw
+        if not _tw.ticket_watch_enabled():
+            return []
+        sids, _why = _tw.recipients_for(cfg, slug, task_id)
+        return [s for s in sids if s != (str(sid) if sid else None)]
+    except Exception:  # noqa: BLE001
+        log.debug("could not preview ticket fan-out for %s/%s", slug, task_id,
+                  exc_info=True)
+        return []
 
 
 def _action_task_progress_add(params: dict[str, Any]) -> dict[str, Any]:
@@ -3303,8 +3398,14 @@ def _action_task_progress_add(params: dict[str, Any]) -> dict[str, Any]:
 
         atomic_write(path, f"---\n{new_fm}\n---\n\n{new_body}")
 
+    # T-0938: attribute the write so the ticket-update fan-out does not nudge
+    # this session about its own note. Per-SECTION, so a note landing in the
+    # same window as somebody else's context write still reaches it.
+    _note_ticket_author(cfg, slug, task_id, sid, ("progress",))
+
     line = f"- {ts} · {sid} · {_sanitize_progress_text(text)}"
-    return {"ok": True, "task_id": task_id, "line_appended": line}
+    return {"ok": True, "task_id": task_id, "line_appended": line,
+            "will_notify": _ticket_fanout_preview(cfg, slug, task_id, sid)}
 
 
 # ---------------------------------------------------------------------------
@@ -3462,9 +3563,13 @@ def _action_task_context_set(params: dict[str, Any]) -> dict[str, Any]:
     path, new_body, backup = _rewrite_task_body(
         "task_context_set", params["slug"], params["task_id"], ts,
         lambda body: set_context(body, text), snapshot=True)
+    _note_ticket_author(_get_config(), params["slug"], params["task_id"],
+                        params.get("sid"), ("context",))
     return {"ok": True, "task_id": params["task_id"],
             "bytes_written": len(new_body), "path": str(path),
-            "backup_path": str(backup) if backup else None}
+            "backup_path": str(backup) if backup else None,
+            "will_notify": _ticket_fanout_preview(
+                _get_config(), params["slug"], params["task_id"], params.get("sid"))}
 
 
 _TASK_SUMMARY_SET_REQUIRED = {"slug", "task_id", "text"}
@@ -3505,9 +3610,13 @@ def _action_task_summary_set(params: dict[str, Any]) -> dict[str, Any]:
     path, new_body, backup = _rewrite_task_body(
         "task_summary_set", params["slug"], params["task_id"], ts,
         lambda body: set_summary(body, text), snapshot=True)
+    _note_ticket_author(_get_config(), params["slug"], params["task_id"],
+                        params.get("sid"), ("summary",))
     return {"ok": True, "task_id": params["task_id"],
             "bytes_written": len(new_body), "path": str(path),
-            "backup_path": str(backup) if backup else None}
+            "backup_path": str(backup) if backup else None,
+            "will_notify": _ticket_fanout_preview(
+                _get_config(), params["slug"], params["task_id"], params.get("sid"))}
 
 
 _TASK_STAKEHOLDER_NOTE_REQUIRED = {"slug", "task_id", "text"}
@@ -3549,8 +3658,12 @@ def _action_task_stakeholder_note_add(params: dict[str, Any]) -> dict[str, Any]:
     _rewrite_task_body(
         "task_stakeholder_note_add", params["slug"], params["task_id"], ts,
         lambda body: append_stakeholder_quote(body, ts, source, text))
+    _note_ticket_author(_get_config(), params["slug"], params["task_id"],
+                        params.get("sid"), ("verbatim",))
     return {"ok": True, "task_id": params["task_id"],
-            "line_appended": f"- {ts} · {source} · {text[:80]}"}
+            "line_appended": f"- {ts} · {source} · {text[:80]}",
+            "will_notify": _ticket_fanout_preview(
+                _get_config(), params["slug"], params["task_id"], params.get("sid"))}
 
 
 _TASK_DIGEST_ALLOWED = {"slug"}
@@ -5992,6 +6105,9 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "task_context_set": _action_task_context_set,
     "task_summary_set": _action_task_summary_set,
     "task_stakeholder_note_add": _action_task_stakeholder_note_add,
+    # T-0938: attribution-only, for a ticket change made outside a worker action
+    # (`bsq ticket update`'s client-side status patch). Never writes a ticket.
+    "ticket_author_note": _action_ticket_author_note,
     # T-0589: on-demand short backlog digest for the TG conversation surface.
     "task_digest": _action_task_digest,
     # T-0463: assignment-interface write-result primitive (F1.1-d).
@@ -6194,6 +6310,10 @@ ACTION_MODES: dict[str, str] = {
     "task_context_set": "coordinator_only",
     "task_summary_set": "coordinator_only",
     "task_stakeholder_note_add": "coordinator_only",
+    # T-0938: attribution for the fan-out. Same coordinator-only tag as the
+    # writers it partners — it mutates the coordinator's own ticket_watch state
+    # file, which nothing else may write concurrently.
+    "ticket_author_note": "coordinator_only",
     # T-0589: read-only scan of the shared install data dir (backlog/) — a
     # single coordinator read, like telemetry_get. Sessions reach it via
     # `bsq task digest` (the coordinator socket).

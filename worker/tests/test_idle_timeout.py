@@ -346,6 +346,40 @@ def test_start_terminates_immediately_below_threshold(tmp_path, seams):
     assert "no forward-state written" in meta["resume_hint"]
 
 
+def test_blocked_on_user_recycle_stamps_the_durable_wait_state(tmp_path, seams):
+    """T-0930: a WAITING recycle (bound task is blocked_on_user) stamps
+    wait_reason/wait_task_id on TOP of the generic resumable/resume_hint —
+    the SSOT wait_resume.tick reads to auto-resume with no human involved."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="blocked_on_user")
+    seams["state"]["tokens"] = 5000  # below threshold — terminate immediately
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert seams["calls"]["terminate"] == [sid]
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert meta["resumable"] is True  # the generic human-facing hint too
+    assert meta["wait_reason"] == "blocked_on_user"
+    assert meta["wait_task_id"] == "T-0042"
+    assert "auto-resumes" in meta["resume_hint"]
+
+
+def test_non_blocked_recycle_does_not_stamp_a_wait_state(tmp_path, seams):
+    """Control: a DONE (totest/closed) recycle must NOT carry wait_reason —
+    only blocked_on_user does."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="closed")
+    seams["state"]["tokens"] = 5000
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert "wait_reason" not in meta
+    assert "wait_task_id" not in meta
+
+
 def test_start_with_no_destination_terminates_without_a_compact(tmp_path, seams):
     """The correction's core: the old code sent Claude's native `/compact` and
     then suspended the pane a tick later, paying for a squeeze nothing would

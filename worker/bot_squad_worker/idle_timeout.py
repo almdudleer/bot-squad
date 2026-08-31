@@ -794,6 +794,21 @@ def _terminate_and_remember(cfg: Any, slug: str, sid: str, meta: dict, md_path, 
             f"idle cache-window recycle "
             f"({'forward-state written to ' + where if wrote_state else 'no forward-state written'})"
             f" — resume via sessions.resume to continue {task_id or role or sid}.")
+        # T-0930: a WAITING recycle — the bound task is blocked_on_user, so
+        # this is not a generic "somebody should look at this eventually"
+        # resumable, it is a specific condition the system itself can watch
+        # for and act on (wait_resume.tick). Stamped in ADDITION to the
+        # generic resumable/resume_hint above (for a human glancing at the
+        # board), not instead of them.
+        if task_id and task_id != "~":
+            task_status = recovery.read_task_status(cfg, slug, task_id)
+            if task_status in recovery.WAITING_STATUSES:
+                fresh["wait_reason"] = task_status
+                fresh["wait_task_id"] = task_id
+                fresh["resume_hint"] = (
+                    f"WAITING on {task_id} ({task_status}) — auto-resumes via "
+                    f"wait_resume.tick when the block lifts; do not resume "
+                    f"manually unless it has actually cleared.")
     sessions._write_session_metadata(md_path, fresh, atomic=True)
 
     # T-0470: a cache-window recycle finalized → record it on the unified surface.

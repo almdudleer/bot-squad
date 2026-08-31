@@ -40,7 +40,7 @@ router = APIRouter(
 # refinement of the stakeholder's canonical 4-state model (backlog/in-progress/
 # validating/done) — see app.canonical_status for the non-destructive mapping
 # layer (T-0479) and docs/design/status-canonical-mapping.md.
-_VALID_STATUSES = {"planned", "open", "in_progress", "paused", "totest", "reopened", "closed"}
+_VALID_STATUSES = {"planned", "open", "in_progress", "paused", "blocked_on_user", "totest", "reopened", "closed"}
 
 
 def _invalid_status_detail(value: object) -> str:
@@ -476,6 +476,19 @@ def patch_task(
 
     backlog_dir = _backlog_dir(request, slug)
     path = _find_task_file(backlog_dir, task_id)
+
+    # T-0931: the state machine is enforced at the write boundary, not prose —
+    # an invalid transition (not just an invalid status VALUE) is refused
+    # loudly. A no-op (status echoed back unchanged) is always allowed.
+    if "status" in payload:
+        from app.task_states import is_valid_transition, invalid_transition_detail
+        current_status = str(parse_task(path).get("status") or "")
+        new_status = payload["status"]
+        if current_status and not is_valid_transition(current_status, new_status):
+            raise HTTPException(
+                status_code=400,
+                detail=invalid_transition_detail(current_status, new_status),
+            )
 
     allowed = {"title", "status", "kind"} | _LINKAGE_PATCH_KEYS
     updates = {k: v for k, v in payload.items() if k in allowed}

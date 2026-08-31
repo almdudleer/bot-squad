@@ -41,6 +41,10 @@ CANONICAL_STATE: dict[str, str] = {
     # Rolls up into in-progress because it is started work, and because his own
     # working-set sentence pairs them: «только in-progress/paused, without open».
     "paused": "in-progress",
+    # T-0931: dev asked the stakeholder something and cannot proceed. Rolls up
+    # into in-progress for the same reason paused does — started, bound work,
+    # just stalled on a dependency (there, a session; here, an answer).
+    "blocked_on_user": "in-progress",
     "totest": "validating",
     "closed": "done",
 }

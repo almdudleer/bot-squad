@@ -2256,6 +2256,29 @@ def _action_spawn_session(params: dict[str, Any]) -> dict[str, Any]:
                 f"operator already running for {params['slug']!r}: {existing[0]} "
                 "— exactly one operator per project (T-0472)"
             )
+        # T-0937: the THIRD seam that can mint a dispatcher, and it asked the
+        # same too-narrow question as the other two — "is there a session whose
+        # ROLE is operator". A live ROOT holding the operator SEAT is driving
+        # this board just as exclusively, so an operator spawned past it is the
+        # second dispatcher T-0472 exists to prevent, arriving through the one
+        # door the re-drive gate does not cover: the API's auto-spawn-on-create
+        # and a hand-run `bsq spawn --window operator`.
+        #
+        # The deliberate HANDOVER (`bsq bud operator`) does not come through
+        # here — it calls sessions.spawn directly via operator_redrive, where it
+        # releases the seat itself — so refusing outright costs no legitimate
+        # path, and it names the verb that unblocks it rather than leaving the
+        # caller to guess.
+        from bot_squad_worker import operator_seat as _seat
+        seat = _seat.seat_holder(cfg, params["slug"])
+        if seat is not None:
+            raise ActionError(
+                f"{seat['sid']} holds the operator SEAT for {params['slug']!r} "
+                f"(via {seat['kind']}) and is driving this board itself — one "
+                "dispatcher per project (T-0472/T-0937). Route through it, or "
+                "have it hand over with `bsq bud operator` / release with "
+                "`bsq operator seat release`"
+            )
 
     return _sessions.spawn(
         cfg,

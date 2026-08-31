@@ -483,3 +483,51 @@ def test_an_empty_backlog_is_still_idle_with_a_seat_held(env):
     seat.claim(cfg, slug, ROOT)
 
     assert ord_.tick(cfg, slug)["action"] == "idle-empty-backlog"
+
+
+# ---------------------------------------------------------------------------
+# The third spawn seam: `spawn_session` (API auto-spawn-on-create and a
+# hand-run `bsq spawn --window operator`). The re-drive gate does not cover it.
+# ---------------------------------------------------------------------------
+
+def test_spawn_session_refuses_an_operator_while_the_seat_is_held(env, monkeypatch):
+    """An operator spawned past a held seat is the second dispatcher T-0472
+    exists to prevent, arriving through the one door the re-drive gate does not
+    watch. The refusal names the holder AND the verb that unblocks it."""
+    cfg, slug, spawns = env
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    seat.claim(cfg, slug, ROOT)
+
+    with pytest.raises(ActionError) as exc:
+        A._action_spawn_session({"slug": slug, "window": "operator"})
+
+    assert ROOT in str(exc.value)
+    assert "bsq operator seat release" in str(exc.value)
+    assert spawns == []
+
+
+def test_spawn_session_allows_an_operator_when_the_seat_is_vacant(env, monkeypatch):
+    """CONTROL: the same call on the same fixture with nothing claimed. Without
+    it, a guard that refused every operator spawn would pass the test above."""
+    cfg, slug, spawns = env
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    assert seat.seat_holder(cfg, slug) is None
+
+    A._action_spawn_session({"slug": slug, "window": "operator"})
+
+    assert len(spawns) == 1
+    assert spawns[0]["window"] == "operator"
+
+
+def test_spawn_session_still_allows_a_dev_while_the_seat_is_held(env, monkeypatch):
+    """The seat suppresses a rival DISPATCHER, never the work. A root holding
+    the board must be able to spawn the devs it is steering — that is the whole
+    point of holding it."""
+    cfg, slug, spawns = env
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    seat.claim(cfg, slug, ROOT)
+
+    A._action_spawn_session({"slug": slug, "window": "d9-dev", "task_id": "T-0004"})
+
+    assert len(spawns) == 1
+    assert spawns[0]["window"] == "d9-dev"

@@ -37,10 +37,20 @@ def test_closing_ticket_calls_close_for_ticket_action(tmp_path, monkeypatch, cap
 
     monkeypatch.setattr(bsq, "post", _fake_post)
     parser = bsq.build_parser()
-    args = parser.parse_args(["ticket", "update", "T-0001", "closed"])
+    args = parser.parse_args(["ticket", "update", "T-0001", "closed", "--sid", "S-t-p1"])
     args.func(args)
 
-    assert posts == [("tg_topic_close_for_ticket", {"ticket_id": "T-0001"})]
+    # T-0938 added a second, attribution-only post on every status MOVE — it
+    # tells the ticket-update fan-out who made a change that never reaches a
+    # worker action, so the mover isn't nudged about its own move. Asserted
+    # alongside rather than loosened away: both posts are required behaviour.
+    assert [action for action, _ in posts] == [
+        "ticket_author_note", "tg_topic_close_for_ticket"]
+    author = posts[0][1]
+    assert author["task_id"] == "T-0001"
+    assert author["sid"] == "S-t-p1"
+    assert author["keys"] == ["status"]
+    assert posts[1][1] == {"ticket_id": "T-0001"}
     assert bsq.read_frontmatter(p)["status"] == "closed"
     out = capsys.readouterr().out
     assert "closed its forum topic" in out
@@ -72,10 +82,16 @@ def test_non_closing_transition_never_calls_close_for_ticket(tmp_path, monkeypat
     monkeypatch.setattr(bsq, "post", lambda action, params, **k: posts.append((action, params)))
 
     parser = bsq.build_parser()
-    args = parser.parse_args(["ticket", "update", "T-0001", "open"])
+    args = parser.parse_args(["ticket", "update", "T-0001", "open", "--sid", "S-t-p1"])
     args.func(args)
 
-    assert posts == []
+    # The topic close is what must NOT fire here. T-0938's attribution post
+    # fires on EVERY status move by design, so this asserts the ABSENCE of the
+    # one action the test is about rather than an empty list — an empty-list
+    # assertion would have to be relaxed by every future side effect, and would
+    # stop meaning "no topic was closed".
+    assert [a for a, _ in posts] == ["ticket_author_note"]
+    assert "tg_topic_close_for_ticket" not in [a for a, _ in posts]
 
 
 def test_close_for_ticket_worker_error_does_not_block_status_write(tmp_path, monkeypatch, capsys):

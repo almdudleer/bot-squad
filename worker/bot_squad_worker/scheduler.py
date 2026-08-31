@@ -32,6 +32,7 @@ from bot_squad_worker.jobs import (
     heartbeat,
     idle_timeout_tick,
     wait_resume_tick,
+    ticket_watch_tick,
     input_flush_tick,
     oauth_refresh,
     outbound_drain_tick,
@@ -249,6 +250,28 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="wait_resume",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+    # ticket_watch_tick: T-0938 — the ticket-update fan-out. When a ticket's md
+    # changes (status move, stakeholder note, context/summary rewrite), every
+    # session bound to it — the live operator when nobody holds it — gets a
+    # nudge naming the ticket and what moved. Fourth 60s sibling, and the only
+    # one that watches the BOARD rather than the fleet: idle_timeout /
+    # graceful_exit / wait_resume all read session state, this one reads tickets
+    # and pushes. Deliberately POLLS the md instead of hooking the writers —
+    # `bsq ticket update` patches frontmatter client-side and the api PATCHes
+    # from the web UI, so a writer-side hook would notify for some changes and
+    # stay silent for others. No-op under BOT_SQUAD_TICKET_WATCH=0.
+    # max_instances=1 + coalesce; idempotent (an unchanged ticket is skipped on
+    # its mtime, and a change is diffed once).
+    sched.add_job(
+        ticket_watch_tick,
+        "interval",
+        seconds=60,
+        args=[cfg],
+        id="ticket_watch",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

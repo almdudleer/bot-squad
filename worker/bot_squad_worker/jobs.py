@@ -1195,6 +1195,22 @@ def wait_resume_tick(cfg: Config) -> None:
         log.exception("wait_resume_tick error")
 
 
+def ticket_watch_tick(cfg: Config) -> None:
+    """T-0938: fan a ticket's change out to the sessions bound to it — the push
+    channel whose absence made "paste it into the operator's inbox" the only way
+    to make a request visible («глухой телефон»). Detection is by polling the md
+    (writer-agnostic on purpose: `bsq ticket update` and the api's PATCH never
+    reach a worker action). Sibling of wait_resume_tick's 60s job. No-op under
+    ``BOT_SQUAD_TICKET_WATCH=0``. The sweep swallows per-project errors so one
+    bad project never kills it.
+    """
+    from bot_squad_worker import ticket_watch as _ticket_watch
+    try:
+        _ticket_watch.tick(cfg)
+    except Exception:
+        log.exception("ticket_watch_tick error")
+
+
 def input_flush_tick(cfg: Config) -> None:
     """T-0469 / M1-F1.6: deferred-delivery pass for the input multiplexer.
 

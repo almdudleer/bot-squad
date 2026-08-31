@@ -5749,7 +5749,25 @@ def cmd_cluster_launch(args) -> None:
 # Canonical backlog statuses. Source of truth: api/app/routes_backlog.py
 # ::_VALID_STATUSES (enforced on every PATCH). Mirrored here so `bsq ticket
 # update` can validate offline without an API round-trip. Keep in sync.
-TICKET_STATUSES = ("planned", "open", "in_progress", "paused", "totest", "reopened", "closed")
+TICKET_STATUSES = ("planned", "open", "in_progress", "paused", "blocked_on_user", "totest", "reopened", "closed")
+
+# T-0931: the transition graph — SSOT in worker/bot_squad_worker/task_states.py
+# (mirrored byte-for-byte into api/app/task_states.py; bsq can't import either
+# package, so this copy is a manual mirror like TICKET_STATUSES itself — keep
+# in sync). See T-0931 ## Context for the rationale behind each edge.
+TICKET_TRANSITIONS = {
+    # T-0591 (F3.3) already names "planned/open -> in_progress" as one
+    # transition — real build work starting from either "not yet queued" or
+    # "queued" — so both go straight to in_progress, not just through open.
+    "planned": frozenset({"open", "in_progress", "closed"}),
+    "open": frozenset({"in_progress", "planned", "closed"}),
+    "in_progress": frozenset({"paused", "blocked_on_user", "totest", "open", "closed"}),
+    "paused": frozenset({"in_progress", "open", "closed"}),
+    "blocked_on_user": frozenset({"in_progress", "closed"}),
+    "totest": frozenset({"closed", "reopened"}),
+    "reopened": frozenset({"in_progress", "open", "closed"}),
+    "closed": frozenset({"reopened"}),
+}
 
 
 def _write_atomic(path: Path, content: str) -> None:
@@ -5830,6 +5848,17 @@ def cmd_ticket_update(args) -> None:
             break
     if not found:
         lines.append(f"status: {status}")
+    # T-0931: enforce the transition graph at this write boundary too (not
+    # just the api PATCH) — invalid transitions refused loudly, not prose.
+    # A no-op (re-setting the same status) is always allowed; a ticket with
+    # no status line yet (found=False) has nothing to validate against.
+    if found and old != status and old in TICKET_TRANSITIONS:
+        if status not in TICKET_TRANSITIONS[old]:
+            allowed = ", ".join(sorted(TICKET_TRANSITIONS[old]))
+            die(
+                f"{tid}: invalid transition {old!r} -> {status!r} — "
+                f"from {old!r} may go to {{{allowed}}}"
+            )
     new_fm = "\n".join(lines)
     new_text = text[:m.start(1)] + new_fm + text[m.end(1):]
     _write_atomic(path, new_text)

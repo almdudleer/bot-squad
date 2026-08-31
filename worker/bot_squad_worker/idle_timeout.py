@@ -542,7 +542,23 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
     # hand-launched user-session window, recycle_exempt md marker) never ride
     # the terminate-and-remember flow below — T-0617 gives them a separate
     # compact-in-place-only path instead of the old full no-op exemption.
+    #
+    # T-0930 (stakeholder, 2026-08-31, answering the held-back question
+    # directly — this REVERSES the T-0720 ruling on his own authority): «Yes,
+    # loosen ... I'd prefer it compacted, however, not exited I think, exited
+    # in 3 hours maybe». So the user-conversation ladder is now: 55 min idle →
+    # compact-and-stay (unchanged, below); ~3 h idle → EXIT with resume state
+    # (the conversation store + the claude transcript are this role's durable
+    # memory, and ensure_user_conversation now RESUMES the suspended attendant
+    # via `claude --resume` when the dialog picks back up). Scoped to the
+    # user-conversation ROLE only — a hand-launched user-session/
+    # recycle_exempt scratch pane was not part of the ruling and keeps the
+    # never-exit behaviour.
     if recycle_gate.user_session_exempt(role=role, window=window, meta=meta):
+        if recycle_gate.role_exempt(role) and _uc_exit_due(
+                cfg, slug, sid, row, meta, now, pane, user_home):
+            return _terminate_and_remember(cfg, slug, sid, meta, md_path, now,
+                                           wrote_state=False)
         return _maybe_compact_and_stay(cfg, slug, sid, row, meta, md_path, now, pane, user_home)
 
     # T-0655: a drive=on operator gets a keep-alive nudge instead of the
@@ -819,6 +835,66 @@ def _terminate_and_remember(cfg: Any, slug: str, sid: str, meta: dict, md_path, 
              sid, wrote_state, self_terminate,
              "no resume state (deliberate stop)" if self_terminate
              else "recorded resumable state")
+    return True
+
+
+# --- T-0930: user-conversation 3-hour idle exit ------------------------------
+
+# Default per the stakeholder's own number («exited in 3 hours maybe»,
+# 2026-08-31). 0 disables the exit entirely (restores the pre-ruling
+# never-terminate behaviour).
+DEFAULT_UC_EXIT_SEC = 10800
+
+
+def uc_exit_sec() -> int:
+    """Idle seconds after which a user-conversation session EXITS (resumable).
+    Overridable via ``BOT_SQUAD_UC_EXIT_SEC``; 0 disables; garbage → default."""
+    raw = os.environ.get("BOT_SQUAD_UC_EXIT_SEC")
+    if raw is not None and raw.strip() != "":
+        try:
+            v = int(raw)
+            if v >= 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_UC_EXIT_SEC
+
+
+def _uc_exit_due(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
+                 now: float, pane: str | None, user_home: str) -> bool:
+    """True when a user-conversation session has been idle past the ~3 h exit
+    line AND it is safe to end it this tick.
+
+    Reuses the compact-and-stay guards one-for-one (postpone, tracked long
+    job, composer readiness) plus two of its own: never cut a compact that is
+    mid-flight (``compact_stay_phase``), and never exit over the human's
+    half-typed draft (``composer_free``, T-0930's typing gate — the suspend
+    sequence types C-c/exit into the pane). The pinned/attached gates were
+    already passed by the caller. Continuity after the exit is the
+    conversation store + the transcript: ``_terminate_and_remember`` stamps
+    ``resumable`` + ``claude_uuid``, and ``ensure_user_conversation`` resumes
+    via ``claude --resume`` on the next inbound message.
+    """
+    limit = uc_exit_sec()
+    if limit <= 0:
+        return False
+    idle_age = _idle_age(row, meta, user_home, now)
+    if idle_age is None or idle_age < limit:
+        return False
+    if meta.get("compact_stay_phase") == "compacting":
+        return False  # let the in-flight compact finalize first
+    if postpone_active(meta.get("idle_postpone_until"), now):
+        return False
+    if tracking_long_job(cfg, slug, sid):
+        log.info("idle_timeout: uc-exit auto-postpone %s — waiting on a "
+                 "tracked long job", sid)
+        return False
+    if not pane or not autocompact.composer_free(
+            autocompact._capture_pane(pane), sid=sid, now=now):
+        return False
+    log.info("idle_timeout: user-conversation %s idle %ds >= %ds — exiting "
+             "resumable (T-0930: compact at 55min, exit at ~3h, resume on "
+             "dialog)", sid, int(idle_age), limit)
     return True
 
 

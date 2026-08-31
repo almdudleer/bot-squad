@@ -5364,3 +5364,94 @@ def test_restoring_a_stripped_ticket_id_puts_the_sends_back_in_the_topic(
 
     assert fake.calls[-1]["topic_id"] == 77
     assert fake.calls[-1]["chat_id"] == "-1001234567890"
+
+
+# --- T-0930: resume a suspended attendant before spawning a fresh one --------
+#
+# The stakeholder's 2026-08-31 answer reversed T-0720: idle_timeout now EXITS
+# a user-conversation session past ~3h (resumable, claude_uuid kept), so the
+# once-unreachable state exists — and the revive half must prefer
+# `claude --resume` (full in-session history) over a memory-less fresh spawn.
+
+def _write_uc_md(cfg, window, sid, *, status="suspended", claude_uuid="u-77",
+                 suspended_at="2026-08-31T09:00:00Z", archived=None):
+    import bot_squad_worker.sessions as S
+    d = cfg.data_dir / "test-project" / "sessions"
+    d.mkdir(parents=True, exist_ok=True)
+    meta = {"sid": sid, "status": status, "window": window,
+            "cwd": "/x", "claude_uuid": claude_uuid,
+            "suspended_at": suspended_at, "role": "user-conversation"}
+    if archived is not None:
+        meta["archived"] = archived
+    S._write_session_metadata(d / f"{sid}.md", meta)
+
+
+def test_ensure_user_conversation_resumes_suspended_attendant(tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    cfg, _repo = _make_sessions_cfg(tmp_path, monkeypatch)
+    window = "gu_a1b2c3-user-conversation"
+    _write_uc_md(cfg, window, "S-u-gu_a1b2c3-user-conversation-p3")
+    resumed, spawned = [], []
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda c, s, g: None)
+    monkeypatch.setattr(S, "resume",
+                        lambda c, s, sid, initial_prompt=None, **kw:
+                        (resumed.append((sid, initial_prompt)) or
+                         {"ok": True, "sid": "S-u-gu_a1b2c3-user-conversation-p9"}))
+    monkeypatch.setattr(S, "spawn",
+                        lambda *a, **k: spawned.append(a) or {"ok": True, "sid": "S-fresh"})
+
+    result = A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_a1b2c3",
+        "message_ref": "are you there?",
+    })
+    assert result["ok"] is True and result.get("resumed") is True
+    assert result["spawned"] is False
+    assert result["sid"] == "S-u-gu_a1b2c3-user-conversation-p9"
+    assert spawned == [], "resume must preempt the fresh spawn"
+    assert resumed and "resumed" in (resumed[0][1] or "")
+
+
+def test_ensure_user_conversation_resume_failure_falls_back_to_spawn(tmp_path,
+                                                                     monkeypatch):
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    cfg, _repo = _make_sessions_cfg(tmp_path, monkeypatch)
+    window = "gu_a1b2c3-user-conversation"
+    _write_uc_md(cfg, window, "S-u-gu_a1b2c3-user-conversation-p3")
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda c, s, g: None)
+
+    def _boom(*a, **k):
+        raise RuntimeError("pane refused")
+
+    monkeypatch.setattr(S, "resume", _boom)
+    monkeypatch.setattr(S, "spawn",
+                        lambda *a, **k: {"ok": True, "sid": "S-fresh-p4"})
+
+    result = A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_a1b2c3",
+        "message_ref": "are you there?",
+    })
+    assert result["ok"] is True and result["spawned"] is True
+    assert result["sid"] == "S-fresh-p4"
+
+
+def test_find_suspended_uc_skips_archived_uuidless_and_other_windows(tmp_path,
+                                                                     monkeypatch):
+    import bot_squad_worker.actions as A
+
+    cfg, _repo = _make_sessions_cfg(tmp_path, monkeypatch)
+    window = "gu_a1b2c3-user-conversation"
+    # not eligible: archived / no uuid / wrong window / still active
+    _write_uc_md(cfg, window, "S-arch-p1", archived="true")
+    _write_uc_md(cfg, window, "S-nouuid-p2", claude_uuid="~")
+    _write_uc_md(cfg, "gu_OTHER-user-conversation", "S-other-p3")
+    _write_uc_md(cfg, window, "S-live-p4", status="active")
+    assert A._find_suspended_user_conversation(cfg, "test-project", window) is None
+    # eligible, and the LATEST suspended one wins
+    _write_uc_md(cfg, window, "S-old-p5", suspended_at="2026-08-30T01:00:00Z")
+    _write_uc_md(cfg, window, "S-new-p6", suspended_at="2026-08-31T02:00:00Z")
+    assert A._find_suspended_user_conversation(
+        cfg, "test-project", window) == "S-new-p6"

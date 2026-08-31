@@ -2410,27 +2410,53 @@ the product/protocol. Your mandate, in short:
 {new_msg}{thread_block}{group_block}"""
 
 
-# T-0720 (operator ruling 2026-07-26): there is deliberately NO
-# resume-a-recycled-attendant path here. T-0575 shipped one at 74eef0f
-# (``_resume_recycled_user_conversation`` + a resume wake prompt); it was
-# removed because it is STRUCTURALLY unreachable, not merely unused:
-#
-#   ``recycle_gate.role_exempt()`` returns True for every ``user-conversation``
-#   session (T-0564 — "the human's own live chat is never auto-recycled"), and
-#   ``idle_timeout``'s compact-terminate-remember flow is the ONLY writer of the
-#   ``resumable: true`` / ``recycled_at`` stamp this path searched for. So an
-#   attendant can never reach that state: the finder always came back empty.
-#   Confirmed by 12 days of production journal (T-0575 progress, 2026-07-18: 27
-#   recycles, zero user-conversation) and by an operator-approved staged live
-#   test (2026-07-26, synthetic attendant idle 85 min → compact-and-stay only).
-#
-# The ruling is that T-0564's exemption STANDS and this role loses nothing:
-# T-0617's compact-and-stay is the better strategy here — it compacts context
-# in place and never terminates, so the human's pane is never traded for a
-# resume that might fail. The stakeholder's T-0575 ask ("compact, terminate,
-# --resume") is served for RECYCLING roles instead, by T-0150 expert-resume and
-# by ``dispatch.decide_dispatch``'s resume hints (both live). Re-adding a resume
-# preference here requires narrowing ``recycle_gate`` first — do not.
+# T-0930 (stakeholder, 2026-08-31) SUPERSEDES the T-0720 operator ruling that
+# used to stand here ("there is deliberately NO resume-a-recycled-attendant
+# path ... re-adding a resume preference here requires narrowing recycle_gate
+# first — do not"). T-0720's reasoning was sound FOR ITS PREMISE: the
+# resumable state was structurally unreachable for this role because nothing
+# ever terminated a user-conversation session. The stakeholder has now changed
+# the premise itself, answering the narrowing question directly: «Yes, loosen,
+# because my session becomes out of cache if it got 55 min stale, and I'd
+# prefer it compacted, however, not exited I think, exited in 3 hours maybe».
+# So ``idle_timeout`` now DOES exit an attendant idle past ~3 h (resumable,
+# with its claude_uuid intact — see ``idle_timeout._uc_exit_due``), and this
+# is the matching revive half T-0575 originally shipped: on the next inbound
+# message, prefer ``sessions.resume`` (``claude --resume`` — full in-session
+# history) over a memory-less fresh spawn. A resume failure still falls
+# through to the fresh spawn: the message is durable in the store and inbound
+# routing must never break on a revive hiccup.
+
+
+def _find_suspended_user_conversation(cfg: Any, slug: str, window: str) -> str | None:
+    """SID of the most recently suspended, resumable user-conversation session
+    for this gid's window, else None. Scans the session mds (the same store
+    ``live_user_conversation_sid`` reads); requires a real ``claude_uuid`` —
+    without one ``resume`` cannot ``--resume`` and a fresh spawn is strictly
+    better than resurrecting an empty shell."""
+    from bot_squad_worker import sessions as _sessions
+
+    sess_dir = cfg.data_dir / slug / "sessions"
+    if not sess_dir.exists():
+        return None
+    best: tuple[str, str] | None = None  # (suspended_at, sid)
+    for md in sess_dir.glob("*.md"):
+        meta = _sessions._read_session_metadata(md)
+        if not meta:
+            continue
+        if str(meta.get("window") or "") != window:
+            continue
+        if str(meta.get("status") or "") != "suspended":
+            continue
+        if str(meta.get("archived") or "").strip().lower() in ("true", "1", "yes"):
+            continue
+        uuid = str(meta.get("claude_uuid") or "")
+        if not uuid or uuid == "~":
+            continue
+        key = (str(meta.get("suspended_at") or ""), str(meta.get("sid") or md.stem))
+        if best is None or key > best:
+            best = key
+    return best[1] if best else None
 
 
 def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
@@ -2545,10 +2571,27 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
                     pass
             return {"ok": True, "sid": existing, "spawned": False}
 
-        # Spawn: no live attendant → open one in the gid-keyed window. A
-        # recycled-attendant resume is deliberately NOT attempted first —
-        # see the T-0720 note above this function for why that state can
-        # never exist for this role.
+        # T-0930: a suspended attendant (the ~3 h idle exit) is RESUMED —
+        # `claude --resume` keeps the full in-session history, which a fresh
+        # spawn reading the store cannot match. Best-effort: any resume
+        # failure falls through to the fresh spawn below (the message is
+        # already durable in the store; routing never breaks on a revive).
+        suspended = _find_suspended_user_conversation(cfg, slug, window)
+        if suspended is not None:
+            try:
+                wake = ("Your conversation resumed — a new message arrived in "
+                        "your user-conversation thread. Read it and respond.")
+                res = _sessions.resume(cfg, slug, suspended, initial_prompt=wake)
+                if res.get("ok") and res.get("sid"):
+                    return {"ok": True, "sid": res["sid"], "spawned": False,
+                            "resumed": True}
+            except Exception:  # noqa: BLE001 — fall through to a fresh spawn
+                log.exception(
+                    "ensure_user_conversation: resume of %s failed — "
+                    "falling back to a fresh spawn", suspended)
+
+        # Spawn: no live or resumable attendant → open one in the gid-keyed
+        # window.
         result = _sessions.spawn(
             cfg,
             slug,

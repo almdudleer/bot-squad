@@ -144,7 +144,44 @@ and the `bsq task digest` paste. Not to peer sends between sessions.
    put the user id / message ref in `provenance` (that belongs in the
    task's Context). The user + message attribution is preserved separately.
 
-3. **Do the work yourself by default (stakeholder, 2026-08-20, T-0924
+3. **A request about EXISTING work goes ONTO that ticket — never into
+   someone's inbox (T-0938, stakeholder 2026-08-31).** This is the rule he
+   opened a p1 for, in his own words:
+
+   > «и еще был другой момент что я перестал писать в юзер-сессию, потому что
+   > вместо пути, где она обновляет тикеты, пока оператор занимается своим
+   > делом, а система сама пингует релевантные сессии, что в тикете апдейт,
+   > начался путь, где юзер-сессия тупо копипастит оператору в почту мои
+   > запросы, создавая глухой телефон»
+
+   He **stopped writing to the user-session over it.** So:
+
+   - **His words about work that already has a ticket →
+     `bsq ticket quote <T-id> "<his exact words>"`.** That is the durable,
+     board-visible medium, and it is the FIRST thing the next session on that
+     ticket is told to re-read. Rule 2 above already covers NEW work; this is
+     the same anti-broken-telephone rule for work that exists.
+   - **A state change a session needs to know → `bsq ticket context <T-id>`**
+     (working area) **or `bsq ticket note`** (checkpoint feed).
+   - **Then stop.** Do not also paste it into the operator's inbox. The system
+     now notifies for you: a ticket-update fan-out (T-0938) nudges every
+     session bound to that ticket — the live operator when nobody holds it —
+     within ~60s, naming the ticket and which section moved. Every ticket write
+     verb prints who that will be (`→ fan-out will nudge: …`), so you never
+     have to guess whether the write reached anyone.
+   - **Relay only what fits NO ticket** — and if it deserves to reach anyone at
+     all, it deserves a ticket, so `task_new` is almost always the better
+     answer. The one honest relay case is what the write verbs name for you:
+     nobody bound and no live operator.
+
+   **Why the copy-paste path is the defect and not a shortcut.** It adds a
+   second lossy hop between him and the builder, leaves no trace on the board
+   (so a later session re-reading the ticket never sees what he said), and
+   makes the operator the bottleneck for every request — which is the state
+   that made him route around the channel entirely. Writing onto the ticket
+   costs you the same one command and does none of those three things.
+
+4. **Do the work yourself by default (stakeholder, 2026-08-20, T-0924
    follow-up) — spawning is the exception, not the baseline.** The scaling
    ladder's own starting rung (F-2026-08-06-bsq-6c16cca10b.md) is "one
    universal session — it talks to the user AND does the work itself." A

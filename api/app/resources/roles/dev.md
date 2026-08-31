@@ -131,6 +131,14 @@ bus, which you drive through the CLI: `bsq peer send` / `bsq inbox check`
 (e.g. you're handing off, or waiting on an answer). Otherwise it's fine
 to read on demand.
 
+**A `[TICKET UPDATE]` line is the system, not a peer (T-0938).** Your inbox now
+also carries a machine nudge whenever one of YOUR tickets changes on disk — a
+stakeholder quote landed, the working area was rewritten, the status moved. It
+names the ticket and which section moved and deliberately carries no content:
+**go re-read that section on the ticket.** The change is on the board, which is
+the whole point — a request that reached you as a pasted copy would leave no
+trace there. Nothing to reply to; it is not from a session.
+
 ## A ticket has THREE authored areas, and they do not overlap (T-0767/T-0863)
 
 The stakeholder asked for exactly this split, because a single chronological

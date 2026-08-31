@@ -2029,8 +2029,10 @@ Why you (overlap with your prior work): {overlap}
 - Git: edit the shared tree on bot_squad/dev (no worktree/stash). Commit ONLY
   with `bsq commit -m <msg> --ack <explicit files>`; never wide-add, never push
   or merge — your TL reviews + deploys.
-- When DoD is green: `bsq ticket update <id> totest`, `bsq ticket note <id>
-  '<summary>'`, then `bsq peer send {report_to} 'READY <id> — <summary>'`.
+- When DoD is green: `bsq ticket update <id> to_accept` (T-0944: `totest` is
+  the human's queue — delivery lands in `to_accept`, the operator's queue,
+  one step before that), `bsq ticket note <id> '<summary>'`, then
+  `bsq peer send {report_to} 'READY <id> — <summary>'`.
 
 Run `bsq --help` for the full verb reference."""
 
@@ -2712,9 +2714,11 @@ def _default_brief(slug: str, ticket: str, path: Path, fm: dict, bundle: list[st
         f"ONLY with `bsq commit -m <msg> --ack <files..>` (review the printed "
         f"peer report first); never wide-add, never rewrite pushed history "
         f"(revert to undo). Do NOT push or merge — your TL reviews and deploys. "
-        f"Smoke-test before declaring done. When DoD is green: set the ticket "
-        f"status frontmatter to totest, add a task_progress_add note, then "
-        f"report READY to your TL at {tl} via `bsq peer send {tl} '<summary>'`. "
+        f"Smoke-test before declaring done. When DoD is green: `bsq ticket "
+        f"update <id> to_accept` (totest is the human's queue — delivery "
+        f"lands in to_accept, one step before that), add a task_progress_add "
+        f"note, then report READY to your TL at {tl} via "
+        f"`bsq peer send {tl} '<summary>'`. "
         f"Run `bsq --help` for the full verb reference."
     )
 

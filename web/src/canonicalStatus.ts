@@ -19,6 +19,9 @@ export const CANONICAL_STATE: Record<Task["status"], CanonicalState> = {
   in_progress: "in-progress",
   // T-0889 — see api/app/canonical_status.py for why in-progress.
   paused: "in-progress",
+  // T-0931 — same bucket as paused: started, bound work, stalled on a
+  // dependency (there a session, here an answer).
+  blocked_on_user: "in-progress",
   totest: "validating",
   closed: "done",
 };
@@ -48,6 +51,7 @@ export const INTERNAL_LABELS: Record<Task["status"], string> = {
   open: "Open",
   in_progress: "In progress",
   paused: "Paused",
+  blocked_on_user: "Blocked on user",
   totest: "To Test",
   reopened: "Reopened",
   closed: "Closed",

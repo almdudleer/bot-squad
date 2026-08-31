@@ -83,6 +83,7 @@ export type Task = {
     | "open"
     | "in_progress"
     | "paused"
+    | "blocked_on_user"
     | "totest"
     | "reopened"
     | "closed";

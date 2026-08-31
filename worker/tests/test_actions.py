@@ -121,6 +121,10 @@ def test_registry_lists_only_allowed_actions():
         # T-0855: direct (user-session drives devs) vs operator tier — the
         # scaling ladder's first rung. Backs `bsq route`.
         "topology_decision",
+        # T-0932: gradual budding — the WRITE side of that same ladder. The
+        # read (which rung, should this session bud) and the one deliberate
+        # spawn a session performs on the operator rung. Back `bsq bud`.
+        "budding_decision", "bud_operator",
         # T-0184: per-session drift-check off-ramp (bsq drift on/off).
         "set_drift_paused",
         # T-0926 follow-up: per-session pin against every automatic action

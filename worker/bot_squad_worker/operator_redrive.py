@@ -454,6 +454,66 @@ def _respawn_operator(cfg: Any, slug: str) -> Optional[str]:
         return None
 
 
+def bud_operator(cfg: Any, slug: str, *, requested_by: str = "") -> dict:
+    """T-0932: bud an OPERATOR off deliberately, at a session's own request.
+
+    The L1→L2 rung of the budding ladder («выделение оператора ... если надо
+    менеджить несколько параллельных девов»). It is the SAME spawn the 60s
+    re-drive would perform — :func:`_respawn_operator`, so the operator boots
+    with the same pickup brief, the same carried-forward model and the same
+    capacity backpressure handling — with the same two invariants applied
+    ahead of it:
+
+      * the T-0472 singleton (a live operator means one is already driving;
+        a second would double-drive the board), and
+      * the spawn cooldown, shared with the re-drive through the same state
+        file so the two paths cannot stampede each other.
+
+    What it deliberately does NOT re-check is the load threshold: a session
+    asking for this has read :func:`dispatch.decide_topology` (via ``bsq bud``)
+    and decided — triggers suggest, sessions decide (T-0929). Returns
+    ``{ok, spawned, operator, reason}``; ``spawned`` is False for every
+    no-op/deferred outcome, never an exception, so the caller can report the
+    reason verbatim.
+    """
+    from bot_squad_worker import dispatch as _dispatch
+    from bot_squad_worker.actions import ActionError
+
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"bud_operator: unknown project slug {slug!r}")
+    if is_paused(cfg, slug):
+        return {"ok": True, "spawned": False, "operator": None,
+                "reason": "operator re-drive is PAUSED for this project "
+                          "(`bsq operator resume` to lift it)"}
+
+    live = _dispatch.live_operator_sids(cfg, slug)
+    if live:
+        return {"ok": True, "spawned": False, "operator": live[0],
+                "reason": f"operator {live[0]} is already driving this board "
+                          f"— exactly one per project (T-0472); route through it"}
+
+    state = _load_state(cfg, slug)
+    last_spawn = float(state.get("last_spawn_at", 0) or 0)
+    if time.time() - last_spawn < _SPAWN_COOLDOWN_SEC:
+        return {"ok": True, "spawned": False, "operator": None,
+                "reason": f"an operator spawn fired less than "
+                          f"{_SPAWN_COOLDOWN_SEC}s ago — wait for it to register"}
+
+    sid = _respawn_operator(cfg, slug)
+    if not sid:
+        return {"ok": True, "spawned": False, "operator": None,
+                "reason": "spawn deferred under capacity/quota backpressure — "
+                          "retry when a session slot frees"}
+
+    state["last_spawn_at"] = time.time()
+    _save_state(cfg, slug, state)
+    log.info("budding[%s]: %s budded off operator %s", slug,
+             requested_by or "a session", sid)
+    return {"ok": True, "spawned": True, "operator": sid,
+            "reason": f"budded off operator {sid} — it drives the board from "
+                      f"here; you stay user-facing and talk to IT, not to the devs"}
+
+
 def tick(cfg: Any, slug: str) -> dict:
     """One re-drive pass for a single project. Returns a small record dict
     ``{action, ...}`` describing what the pass decided (for tests + the journal).

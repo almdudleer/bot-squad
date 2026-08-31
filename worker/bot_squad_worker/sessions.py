@@ -685,7 +685,14 @@ def _derive_role(
 # become dev, spawn teammates and become teamlead, or become operator if there's
 # no operator working right now -- sessions are transient, system is persistent"
 # (clarification-03 / voice-09).
-MORPH_ROLES = ("dev", "teamlead", "operator")
+# T-0932 adds the DE-differentiation direction: ``user-conversation``. The set
+# above only ever climbed — a session could take on a task, take on a team or
+# take the board, but never narrow back down — which left «отделение себя в
+# юзер-сессию» (the stakeholder's own phrasing for half of gradual budding)
+# with no primitive at all. Morphing back is what a session does right after it
+# buds its work off to a dev: it sheds the task and returns to the
+# conversation. See :mod:`bot_squad_worker.budding`.
+MORPH_ROLES = ("dev", "teamlead", "operator", "user-conversation")
 
 
 def _role_of(
@@ -4203,13 +4210,29 @@ def morph_session(cfg: Any, slug: str, sid: str, role: str, *,
     it UPSERTS one from the live-pane fields the caller passes.
 
     Guards:
-      * ``role`` ∈ :data:`MORPH_ROLES` (``dev`` | ``teamlead`` | ``operator``).
+      * ``role`` ∈ :data:`MORPH_ROLES` (``dev`` | ``teamlead`` | ``operator``
+        | ``user-conversation``).
       * ``operator`` morph is refused when another operator already holds the
         project — the one-operator-per-project singleton via the operator-identity
         SSOT (:func:`dispatch.live_operator_sids`, minus self — T-0472/T-0523).
       * an ``operator`` must NOT carry a dev task (it orchestrates and spawns
         devs for tickets, never self-binds a ticket — T-0523); its primary
         task is cleared on morph.
+      * a ``user-conversation`` morph is the DE-differentiation (T-0932) and
+        likewise sheds the primary task, for a sharper reason than the
+        operator's: ``graceful_exit.work_done`` tests ``task_id`` BEFORE it
+        falls through to the role, so a session that narrowed back to the
+        conversation while still holding the task it just handed to a bud
+        would be exited the moment that BUD reached ``totest`` — the root
+        session killed by its own child's success. An explicit non-empty
+        ``task_id`` is refused rather than silently dropped.
+
+    Side effect worth naming: ``user-conversation`` is a recycle-EXEMPT role
+    (``recycle_gate.role_exempt``, T-0564), so this morph also makes the
+    session immune to the terminate-and-remember recycle paths. That is the
+    intent — "the root session never exits" — and it costs nothing to a
+    would-be abuser, since the same morph strips the task binding that made
+    the session a dev in the first place.
 
     Returns ``{ok, sid, role, task_id, initiative, created}``.
     """
@@ -4255,6 +4278,18 @@ def morph_session(cfg: Any, slug: str, sid: str, role: str, *,
         if claude_uuid and not (meta.get("claude_uuid") and meta["claude_uuid"] != "~"):
             meta["claude_uuid"] = claude_uuid
 
+    if role == "user-conversation":
+        # T-0932: narrowing back to the conversation means the work went
+        # somewhere else. A task bind here is a contradiction in terms AND a
+        # live hazard (see the docstring's graceful_exit note), so say so
+        # instead of quietly ignoring the argument.
+        if task_id and task_id != "~":
+            raise ActionError(
+                "morph: a user-conversation session must not carry a dev task "
+                "— hand it to a bud first (`bsq bud dev <id>`), which sheds it "
+                "here (T-0932)"
+            )
+
     if role == "operator":
         # T-0523: the operator orchestrates — it must never self-claim a dev
         # assignment. Reject a task bind (the `~` sentinel is not a real bind).
@@ -4281,7 +4316,7 @@ def morph_session(cfg: Any, slug: str, sid: str, role: str, *,
     # Task / initiative metadata. The operator never holds a single ticket (its
     # standing task is "clear the backlog"), so clear any primary on that morph;
     # dev / teamlead adopt what the caller passed.
-    if role == "operator":
+    if role in ("operator", "user-conversation"):
         meta["task_id"] = "~"
     elif task_id is not None:
         meta["task_id"] = task_id or "~"

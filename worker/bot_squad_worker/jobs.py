@@ -1219,6 +1219,27 @@ def drift_check_tick(cfg: Config) -> None:
             log.exception("drift_check_tick: unhandled error for project %s", slug)
 
 
+def budding_check_tick(cfg: Config) -> None:
+    """T-0932: per-project gradual-budding pass.
+
+    SUGGESTS (never performs) a bud to a project's ROOT session when the
+    energy ladder says the load has outgrown its current rung — too many
+    queued user requests behind the task it is holding, or too many devs to
+    steer without an operator. Triggers suggest, sessions decide (T-0929), so
+    this tick's only side effect is one advisory line in a root pane, at most
+    once per cooldown window and never into a pane a human is watching or
+    typing in. Disabled by ``BOT_SQUAD_BUDDING=0``. Per-project errors are
+    caught and logged so one bad project never kills the sweep.
+    """
+    from bot_squad_worker import budding as _budding
+
+    for slug in cfg.projects:
+        try:
+            _budding.budding_check(cfg, slug)
+        except Exception:
+            log.exception("budding_check_tick: unhandled error for project %s", slug)
+
+
 def voice_audio_gc_tick(cfg: Config) -> None:
     """T-0433 P3: per-project retention GC for voice-note audio blobs.
 

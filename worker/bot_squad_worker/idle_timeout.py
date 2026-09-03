@@ -1368,6 +1368,14 @@ def _maybe_warn_while_typing(cfg: Any, slug: str, sid: str, row: dict, meta: dic
                                  autocompact._capture_pane(pane), now)
     if obs["state"] != composer_watch.STATE_TYPING:
         return False
+    if obs.get("first_sighting"):
+        # We have seen this text exactly once, so "typing" is an assumption, not
+        # an observation — and on the first tick after a restart it is the wrong
+        # one for every parked composer at once (measured: four sessions warned
+        # in eight seconds, none of them being typed in). Say nothing until the
+        # NEXT tick, which costs 60s and buys the difference between a person
+        # and a leftover.
+        return False
 
     if cache_warning_due(idle_age, idle_timeout_sec()):
         left = max(0, int(idle_timeout_sec() - (idle_age or 0)) // 60)

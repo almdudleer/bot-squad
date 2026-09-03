@@ -111,6 +111,22 @@ _DIALOG_ASK_RE = re.compile(
 #: Claude Code's mid-generation marker (same string ``autocompact`` keys on).
 _GENERATING_MARK = "esc to interrupt"
 
+# An EMPTY composer is not blank: Claude Code renders a dim placeholder in it.
+# Measured live 2026-09-03 — this is what a pane shows immediately after C-u:
+#
+#     ❯ Try "fix lint errors"
+#
+# and a busy session with a queue shows `Press up to edit queued messages`.
+# Reading either as "he typed something" cost real drafts: the delivery swap
+# concluded its C-u had failed, skipped the restore, and left three unsent
+# messages on disk instead of in their panes. Anchored whole-line so a human
+# who genuinely types `Try "x"` is still respected — his line would have to be
+# the placeholder byte for byte.
+_PLACEHOLDER_RE = re.compile(
+    r'^(?:Try\s+"[^"]*"|Press up to edit queued messages'
+    r'|Ask anything|Try a command)$'
+)
+
 
 def composer_text(buf: str) -> str | None:
     """The live composer's content, or None when the pane shows no composer.
@@ -131,7 +147,10 @@ def composer_text(buf: str) -> str | None:
         return None
     if live.startswith(" "):
         live = live[1:]
-    return live.rstrip()
+    live = live.rstrip()
+    if _PLACEHOLDER_RE.match(live.strip()):
+        return ""          # the box is EMPTY; that is Claude Code's own hint
+    return live
 
 
 def looks_like_dialog(buf: str, live: str | None = None) -> bool:
@@ -236,7 +255,8 @@ def observe(cfg: Any, slug: str, sid: str, buf: str,
 
     rec = _load(path)
     digest = _digest(live)
-    if rec.get("hash") != digest or rec.get("kind") != STATE_TYPING:
+    first_sighting = rec.get("hash") != digest or rec.get("kind") != STATE_TYPING
+    if first_sighting:
         # Changed (or first ever seen) — the clock restarts. This is the branch
         # that makes "he is editing" self-evident: every keystroke moves it.
         rec = {"hash": digest, "kind": STATE_TYPING, "first_seen": now,
@@ -247,7 +267,16 @@ def observe(cfg: Any, slug: str, sid: str, buf: str,
     unchanged_for = max(0.0, now - float(rec.get("first_seen") or now))
     state = STATE_STALE if unchanged_for >= stale_after_sec() else STATE_TYPING
     return {"state": state, "text": live, "unchanged_for": unchanged_for,
-            "since": _iso(rec.get("first_seen"))}
+            "since": _iso(rec.get("first_seen")),
+            # A FIRST sighting cannot tell "he is typing right now" from "this
+            # has been sitting here for two days" — the clock has to start
+            # somewhere, and on a restart it starts for everyone at once.
+            # Measured cost of ignoring that: four sessions were warned «ты
+            # печатаешь» within seconds of a worker restart, at panes nobody had
+            # touched in days — the exact «но не на stale сессию» he ruled out.
+            # So callers that SPEAK (rather than merely wait) require a second
+            # sighting, which only a pane someone is really working in produces.
+            "first_sighting": first_sighting}
 
 
 def _iso(epoch: Any) -> str | None:

@@ -261,6 +261,23 @@ building, and the exact verb for the move it suggests. Then:
   lone piece of queued work: take it yourself rather than pay for a second
   process.
 
+**Which rung you are on is YOUR call, and it is never a question to him
+(stakeholder 2026-09-03, T-0956).** He ruled on this after a root session
+finished a report by offering him the choice:
+
+> «ты это не должен у меня спрашивать, сам решать, это тоже корректировка для
+> системы. Сейчас а) я пишу тебе мало, б) параллельной работы никакой не просил
+> делать прямо сейчас, соответственно, по обоим направлениям отпочковывания, нет
+> боттлнека, соответственно, и масштабироваться под нагрузку не надо»
+
+Note the shape of his reasoning, because it is the test you apply, not a mood:
+**budding scales under a BOTTLENECK, and the ladder has exactly two axes** —
+how much HE is writing (requests queueing behind your build) and how much
+PARALLEL dev work he asked for. Neither loaded means there is nothing to scale:
+stay at L0 and build it here. Asking him to pick the rung is the defect —
+it hands him an ops decision the system exists to make, and «нужно, чтобы я вот
+этого не говорил».
+
 Three things this does NOT do, on purpose:
 
 1. **It never fires on its own.** The worker computes the verdict and SUGGESTS

@@ -440,14 +440,22 @@ def test_he_is_warned_once_while_typing_near_the_cache_edge(tmp_path, seams,
                cwd_repo=data.parent / "repo")
     seams["state"]["buf"] = _pane("он печатает прямо сейчас")
 
-    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+    # tick 1 — a first sighting cannot tell him from leftover text, so it is
+    # silent (see test_no_warning_on_a_first_sighting for why that matters)
+    t0 = time.time()
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=t0,
+                            user_home="/home/x") is False
+    assert sent == []
+
+    # tick 2 — the same text is still there and someone is evidently at it
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=t0 + 60,
                             user_home="/home/x") is True
     assert len(sent) == 1
     assert "выйдет из кеша" in sent[0][1]
     assert seams["calls"]["compact"] == []      # nothing touched his pane
 
     # ...and the next tick, still typing, says nothing more
-    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=t0 + 120,
                             user_home="/home/x") is False
     assert len(sent) == 1
 
@@ -589,3 +597,78 @@ def test_phase_two_waits_if_he_started_typing_after_the_handoff(tmp_path, seams)
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
     assert seams["calls"]["compact"] == [sid]
+
+
+# --- G. what the LIVE deploy caught, as regressions ------------------------
+
+def _placeholder_pane(hint: str = 'Try "fix lint errors"') -> str:
+    """An EMPTY Claude Code composer — it renders a dim placeholder, not blank.
+
+    Captured verbatim from a live pane immediately after `C-u`. Reading this as
+    typed text is what made the delivery swap skip its restore and leave three
+    of his unsent messages on disk instead of in their panes (2026-09-03).
+    """
+    return _pane(hint)
+
+
+@pytest.mark.parametrize("hint", ['Try "fix lint errors"', 'Try "add a test"',
+                                  "Press up to edit queued messages"])
+def test_an_empty_composer_placeholder_is_not_text(cw_cfg, hint):
+    cfg, slug = cw_cfg
+    assert CW.composer_text(_placeholder_pane(hint)) == ""
+    obs = CW.observe(cfg, slug, "S-x", _placeholder_pane(hint), now=1000.0)
+    assert obs["state"] == CW.STATE_EMPTY
+    assert A.composer_free(_placeholder_pane(hint), sid="S-x", now=1000.0,
+                           cfg=cfg, slug=slug) is True
+
+
+def test_a_human_typing_the_placeholder_words_is_still_respected(cw_cfg):
+    """The negative control for that exclusion: it is anchored to the WHOLE
+    line, so his own sentence that merely starts the same way is still his."""
+    cfg, slug = cw_cfg
+    assert CW.composer_text(_pane('Try "fix lint errors" on the api package')) \
+        == 'Try "fix lint errors" on the api package'
+    assert A.composer_free(_pane('Try "fix lint errors" on the api package'),
+                           sid="S-x", now=1000.0, cfg=cfg, slug=slug) is False
+
+
+def test_the_swap_restores_the_draft_over_a_placeholder(tmp_path, monkeypatch):
+    """End to end for the live defect: a pane that shows a placeholder once
+    cleared must still be treated as cleared, so the restore runs."""
+    from bot_squad_worker import input_mux
+
+    class _PlaceholderPane(_FakePane):
+        def capture(self, pane_id):
+            return _pane(self.composer if self.composer
+                         else 'Try "fix lint errors"')
+
+    pane = _PlaceholderPane("мой черновик")
+    monkeypatch.setattr(input_mux, "raw_keys", pane.keys)
+    monkeypatch.setattr(input_mux, "_DIRECT_INTERLINE_PAUSE_SEC", 0)
+    monkeypatch.setattr(input_mux, "_DIRECT_GATE_TIMEOUT_SEC", 0)
+
+    input_mux.deliver_direct(tmp_path, "S-x", "%1", "check mail",
+                             capture=pane.capture)
+    assert pane.submitted == ["check mail"]
+    assert pane.composer == "мой черновик"      # ...and it came BACK
+
+
+def test_no_warning_on_a_first_sighting(tmp_path, seams, monkeypatch):
+    """Measured on the deploy: four sessions were warned «ты печатаешь» within
+    eight seconds of a worker restart, at panes nobody had touched for days —
+    because a first sighting reads as `typing` by construction. Speaking now
+    requires a SECOND sighting; waiting still does not."""
+    sent: list = []
+    monkeypatch.setattr(IT, "_send_typing_warning",
+                        lambda sid, text: sent.append(text))
+    sid = "S-almdudleer-user-session-p8"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None)
+    row = _row(sid, window="user-session", task_id=None,
+               cwd_repo=data.parent / "repo")
+    seams["state"]["buf"] = _pane("текст, который лежит тут вторые сутки")
+
+    t0 = time.time()
+    IT.maybe_recycle(cfg, "bot-squad", row, now=t0, user_home="/home/x")
+    assert sent == []                       # first sighting: say nothing
+    IT.maybe_recycle(cfg, "bot-squad", row, now=t0 + 60, user_home="/home/x")
+    assert len(sent) == 1                   # second: now it is a real signal

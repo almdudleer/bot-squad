@@ -422,7 +422,13 @@ def _deliver_ahead_of_draft(data_dir: Path | str, sid: str, pane_id: str,
 
     raw_keys(pane_id, "C-u")
     time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
-    if _live_draft(capture, pane_id):
+    # "Did the clear work" is asked about HIS DRAFT, not about emptiness. An
+    # empty Claude Code composer is not blank — it renders a placeholder — and
+    # reading that as leftover text is what made this path skip the restore and
+    # drop three real unsent messages into the drafts directory instead of back
+    # into their panes (measured live, 2026-09-03).
+    after = _live_draft(capture, pane_id)
+    if after == draft:
         log.warning("input_mux: %s's composer did not clear — delivering the "
                     "legacy way (his draft may be submitted with it); draft "
                     "saved at %s", sid, saved)
@@ -433,7 +439,7 @@ def _deliver_ahead_of_draft(data_dir: Path | str, sid: str, pane_id: str,
     raw_keys(pane_id, "--", draft)
     time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
     restored = _live_draft(capture, pane_id)
-    if restored != draft:
+    if restored.strip() != draft.strip():
         log.error("input_mux: restored draft for %s does not match what was "
                   "captured (%r != %r) — the original is saved at %s",
                   sid, restored, draft, saved)

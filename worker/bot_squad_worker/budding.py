@@ -583,10 +583,6 @@ def budding_check(cfg: Any, slug: str) -> dict:
             continue
         if str(meta.get("status", "")).strip().lower() != "active":
             continue
-        # T-0926 follow-up: a pinned session takes no automatic action of ANY
-        # kind, this one included.
-        if _gate.session_pinned(meta):
-            continue
         last = _parse_iso(meta.get("budding_suggested_at"))
         if last is not None and (now - last) < cooldown:
             continue

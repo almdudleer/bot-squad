@@ -48,6 +48,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import json
+import logging
 import os
 import re
 import time
@@ -59,6 +60,8 @@ from bot_squad_worker.autocompact import composer_ready
 # sids are filename-clean (``S-<user>-<slug>-pNNN`` → letters/digits/.-_), so
 # the sanitised stem round-trips to the sid. The substitution is purely
 # defensive against an unexpected character.
+log = logging.getLogger(__name__)
+
 _SID_SAFE = re.compile(r"[^A-Za-z0-9_.-]")
 
 _PROMPT_RUNE = "❯"
@@ -324,13 +327,120 @@ def deliver_direct(data_dir: Path | str, sid: str, pane_id: str, text: str, *,
                 if time.monotonic() >= deadline:
                     break
                 time.sleep(_DIRECT_GATE_POLL_INTERVAL_SEC)
-        lines_sent = 0
-        for line in text.split("\n"):
-            raw_keys(pane_id, "--", line)
-            time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
-            raw_keys(pane_id, "Enter")
-            lines_sent += 1
-        return lines_sent
+
+        # T-0954: the wait can time out with his draft still in the box, and
+        # what happened then was the defect he reported — «вот так же check mail
+        # штуки, они приходят просто поверх моего текста всегда даже без
+        # пробела». `raw_keys` types at the CURSOR, so the payload landed
+        # against the tail of his sentence and the Enter submitted both as one
+        # line. His fix, verbatim: «он должен слать check mail вперед моего
+        # текста, а мой текст оставлять как есть в поле ввода».
+        draft = _live_draft(capture, pane_id) if _draft_swap_enabled() else ""
+        if draft:
+            return _deliver_ahead_of_draft(data_dir, sid, pane_id, text, draft,
+                                           capture)
+
+        return _type_lines(pane_id, text)
+
+
+def _draft_swap_enabled() -> bool:
+    """T-0954 kill switch. ``BOT_SQUAD_DRAFT_SWAP=0`` restores the pre-T-0954
+    delivery — the payload types straight into the composer, against whatever he
+    has half-written there."""
+    return os.environ.get("BOT_SQUAD_DRAFT_SWAP", "1") != "0"
+
+
+def _type_lines(pane_id: str, text: str) -> int:
+    """The verbatim lane's keystrokes: one send-keys per line, one Enter each."""
+    lines_sent = 0
+    for line in text.split("\n"):
+        raw_keys(pane_id, "--", line)
+        time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
+        raw_keys(pane_id, "Enter")
+        lines_sent += 1
+    return lines_sent
+
+
+def _live_draft(capture: Callable[[str], str], pane_id: str) -> str:
+    """His in-progress composer text, or "" when there is nothing to protect.
+
+    A permission/choice dialog is NOT a draft — its ``❯`` belongs to the prompt,
+    and clearing it would answer it. That case falls through to the legacy
+    keystrokes, which is what a dialog needs anyway (the keys go to the dialog,
+    not into a composer that isn't there).
+    """
+    from bot_squad_worker import composer_watch
+
+    try:
+        buf = capture(pane_id)
+    except Exception:  # noqa: BLE001 — a capture hiccup must not drop delivery
+        return ""
+    if composer_watch.looks_like_dialog(buf):
+        return ""
+    live = composer_watch.composer_text(buf)
+    return live if (live or "").strip() else ""
+
+
+def drafts_dir(data_dir: Path | str) -> Path:
+    return Path(data_dir) / "_worker" / "drafts"
+
+
+def _save_draft(data_dir: Path | str, sid: str, draft: str) -> Path | None:
+    """Persist his text before we touch the composer. The swap below is the only
+    place the system deletes something a human typed, so it is also the only
+    place that keeps a copy first."""
+    try:
+        d = drafts_dir(data_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"{_safe(sid)}-{int(time.time())}.txt"
+        path.write_text(draft, encoding="utf-8")
+        return path
+    except Exception:  # noqa: BLE001
+        log.warning("input_mux: could not save %s's draft before the swap",
+                    sid, exc_info=True)
+        return None
+
+
+def _deliver_ahead_of_draft(data_dir: Path | str, sid: str, pane_id: str,
+                            text: str, draft: str,
+                            capture: Callable[[str], str]) -> int:
+    """Submit ``text`` as its OWN message, then put ``draft`` back untouched.
+
+    A pane's composer holds exactly one buffer, so "ahead of his text" has to be
+    done in three steps — save + clear (``C-u``, which Claude Code also exposes
+    an undo for: `Ctrl+Y to paste deleted text`), send, restore. Measured on a
+    live Claude Code pane (v2.1.259) before it was written: ``C-u`` empties the
+    composer, and typing the draft back restores it even while the session is
+    generating the answer to the message we just sent.
+
+    Fails toward DELIVERY, never toward silence: if the clear does not take, the
+    payload still goes out the legacy way (which is the pre-T-0954 behaviour,
+    so no regression), and if the restore does not take, the copy on disk is
+    named in the log.
+    """
+    saved = _save_draft(data_dir, sid, draft)
+
+    raw_keys(pane_id, "C-u")
+    time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
+    if _live_draft(capture, pane_id):
+        log.warning("input_mux: %s's composer did not clear — delivering the "
+                    "legacy way (his draft may be submitted with it); draft "
+                    "saved at %s", sid, saved)
+        return _type_lines(pane_id, text)
+
+    lines_sent = _type_lines(pane_id, text)
+
+    raw_keys(pane_id, "--", draft)
+    time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
+    restored = _live_draft(capture, pane_id)
+    if restored != draft:
+        log.error("input_mux: restored draft for %s does not match what was "
+                  "captured (%r != %r) — the original is saved at %s",
+                  sid, restored, draft, saved)
+    else:
+        log.info("input_mux: delivered %d line(s) to %s ahead of his draft "
+                 "(%d chars), draft restored", lines_sent, sid, len(draft))
+    return lines_sent
 
 
 def _default_pane_lookup(sid: str) -> str | None:

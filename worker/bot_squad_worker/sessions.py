@@ -1666,8 +1666,6 @@ def suspend(cfg: Any, slug: str, sid: str, *,
         meta["drift_paused"] = existing["drift_paused"]
     # T-0926 follow-up: same loss-on-recycle hazard as drift_paused above —
     # `bsq pin on` has no SID/heuristic backstop either.
-    if existing.get("pinned"):
-        meta["pinned"] = existing["pinned"]
     if source:  # T-0444: visible-close stamp on the auto-close path
         meta["suspend_source"] = source
         meta["suspend_reason"] = reason or source
@@ -4048,47 +4046,6 @@ def set_drift_paused(cfg: Any, slug: str, sid: str, paused: bool) -> dict:
     return {"ok": True, "sid": meta.get("sid", sid), "drift_paused": bool(paused)}
 
 
-def set_pinned(cfg: Any, slug: str, sid: str, pinned: bool) -> dict:
-    """T-0926 follow-up (stakeholder, 2026-08-28): a session the human is
-    actively typing into directly can go quiet-idle by tmux's own accounting
-    (no keystrokes for the ``idle_timeout`` window, or a client that briefly
-    reads as un-attached) while he still considers himself "there" — the
-    T-0926 attach-grace fix only survives a single flickered sample, not the
-    stretch of a real look-away or a busy Claude turn. ``bsq pin on`` sets
-    ``pinned: true`` on the SessionMd as an explicit, human-set override that
-    the attachment/idle heuristics can't second-guess; ``recycle_gate.
-    session_pinned`` is checked ahead of every automatic action — not just
-    terminate, but the T-0617 compact-and-stay path too — in idle_timeout and
-    autocompact alike. Distinct from ``recycle_exempt`` (T-0616, a role/window
-    convention marker that still permits compact-and-stay by design) and from
-    ``drift_paused``/``drive`` (different concerns entirely): pinning means
-    "do not touch this session's pane AT ALL," full stop, until the human
-    unpins it. Mirrors :func:`set_drift_paused`'s shape. Idempotent.
-
-    Returns ``{ok, sid, pinned}``.
-    """
-    from bot_squad_worker.actions import ActionError
-
-    project = cfg.projects.get(slug)
-    if project is None:
-        raise ActionError(f"set_pinned: unknown project slug {slug!r}")
-
-    sessions_dir = cfg.data_dir / slug / "sessions"
-    md_path = _find_session_md(sessions_dir, sid, None)
-    if md_path is None:
-        raise ActionError(f"set_pinned: no session metadata for SID {sid!r}")
-    meta = _read_session_metadata(md_path)
-    if meta is None:
-        raise ActionError(f"set_pinned: unreadable session metadata for SID {sid!r}")
-
-    if pinned:
-        meta["pinned"] = True
-    else:
-        meta.pop("pinned", None)
-    _write_session_metadata(md_path, meta, atomic=True)
-    return {"ok": True, "sid": meta.get("sid", sid), "pinned": bool(pinned)}
-
-
 def set_drive(cfg: Any, slug: str, sid: str, on: bool) -> dict:
     """T-0655: the operator's OWN drive=on/off toggle (``bsq drive off`` /
     ``bsq drive on``).
@@ -4235,55 +4192,6 @@ def last_operator_model(cfg: Any, slug: str) -> str:
     if best and best.get("provider") == "codex":
         return str(best.get("model") or "codex")
     return str(best.get("model")) if best else ""
-
-
-def set_idle_postpone(cfg: Any, slug: str, sid: str,
-                      seconds: int | None = None, reason: str | None = None) -> dict:
-    """T-0466: defer this session's next cache-window recycle (``bsq postpone``).
-
-    Stamps ``idle_postpone_until`` on the SessionMd so ``idle_timeout`` skips the
-    session until that deadline. The default deferral is one full window
-    (``idle_timeout_sec``); pass ``seconds`` to declare a bounded wait with a
-    known ETA (the stakeholder's "expected to finish within known time
-    boundaries", e.g. a long build). Repeatable indefinitely — each call just
-    pushes the deadline forward. Resolves the md by SID with the rename-tolerant
-    claude_uuid fallback, mirroring :func:`set_drift_paused`.
-
-    Returns ``{ok, sid, postpone_until, seconds}``.
-    """
-    from bot_squad_worker.actions import ActionError
-    from bot_squad_worker import idle_timeout as _idle
-
-    project = cfg.projects.get(slug)
-    if project is None:
-        raise ActionError(f"set_idle_postpone: unknown project slug {slug!r}")
-
-    window = _idle.idle_timeout_sec()
-    try:
-        secs = int(seconds) if seconds is not None else window
-    except (TypeError, ValueError):
-        raise ActionError("set_idle_postpone: 'seconds' must be an integer")
-    if secs <= 0:
-        raise ActionError("set_idle_postpone: 'seconds' must be positive")
-
-    sessions_dir = cfg.data_dir / slug / "sessions"
-    md_path = _find_session_md(sessions_dir, sid, None)
-    if md_path is None:
-        raise ActionError(f"set_idle_postpone: no session metadata for SID {sid!r}")
-    meta = _read_session_metadata(md_path)
-    if meta is None:
-        raise ActionError(f"set_idle_postpone: unreadable session metadata for SID {sid!r}")
-
-    until = time.time() + secs
-    until_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(until))
-    meta["idle_postpone_until"] = until_iso
-    if reason:
-        meta["idle_postpone_reason"] = reason
-    else:
-        meta.pop("idle_postpone_reason", None)
-    _write_session_metadata(md_path, meta, atomic=True)
-    return {"ok": True, "sid": meta.get("sid", sid),
-            "postpone_until": until_iso, "seconds": secs}
 
 
 def morph_session(cfg: Any, slug: str, sid: str, role: str, *,

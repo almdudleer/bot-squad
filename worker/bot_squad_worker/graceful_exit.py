@@ -447,17 +447,13 @@ def maybe_exit(cfg: Any, slug: str, row: dict, now: float, user_home: str) -> bo
         return False
 
     # T-0945: this path had NO recycle_gate check — a done session the human had
-    # attached to (or explicitly pinned) was suspended out from under him. Both
-    # signals now defer the exit for as long as they last; nothing is lost by
-    # waiting, since the work is already done and the deliverable already
-    # exists.
+    # attached to was suspended out from under him. That signal defers the exit
+    # for as long as it lasts; nothing is lost by waiting, since the work is
+    # already done and the deliverable already exists. (T-0954 dropped the
+    # second signal, an explicit `pinned` marker, with the rest of the pin
+    # feature — «это была ошибка».)
     md_path = sessions._session_file(cfg.data_dir, slug, sid)
     meta = sessions._read_session_metadata(md_path) or {}
-    if recycle_gate.session_pinned(meta):
-        if recycle_gate.should_log_skip(f"exit-pinned:{sid}", now):
-            log.info("graceful_exit: %s is done but PINNED — holding the exit "
-                     "(T-0945)", sid)
-        return False
     if recycle_gate.is_attached(pane, sid=sid, now=now):
         if recycle_gate.should_log_skip(f"exit-attached:{sid}", now):
             log.info("graceful_exit: %s is done but a human client is attached "

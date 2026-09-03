@@ -223,7 +223,7 @@ md_path    = data / "sessions" / f"{sid}.md"
 # template below is preserved VERBATIM. This rewrite used to rebuild the md
 # from the template alone, silently dropping whatever another module had
 # stamped on it (idle_timeout's idle_recycle_phase / idle_recycle_armed_at,
-# `bsq postpone`'s idle_postpone_until, `bsq morph`'s role, recycle_exempt,
+# `bsq morph`'s role, recycle_exempt,
 # resume stamps). SessionStart fires with source=compact the moment a
 # /compact completes — so the drop erased the in-flight recycle phase and
 # idle_timeout re-armed every recycle: the stakeholder's double-compact
@@ -262,6 +262,11 @@ _INFLIGHT_RECYCLE = {
     # same rule, as the three fields above it.
     "idle_recycle_wrote_state",
     "compact_stay_phase", "compact_stay_armed_at",
+    # T-0954: compact-and-stay now hands off BEFORE it squeezes, so its
+    # ARM-time mark rides the same source=compact fire as the pair above
+    # it — losing the mark would read as "it never wrote" and abandon a
+    # handoff that had already landed.
+    "compact_stay_mark",
     # T-0945: graceful_exit's pre-exit handoff wait. It never sends a /compact,
     # so in practice this only ever CLEARS — which is the point: a stale
     # "writing" phase surviving into a fresh life would hand the next tick a

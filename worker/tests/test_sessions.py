@@ -21,7 +21,6 @@ from bot_squad_worker.sessions import (
     set_drift_paused,
     set_drive,
     set_model,
-    set_pinned,
     sid_display_label,
     spawn,
     _append_task_session_history,
@@ -3918,29 +3917,6 @@ def test_set_drift_paused_round_trip(tmp_path, monkeypatch):
     res = set_drift_paused(cfg, "test-project", "S-alice-w-p2", False)
     assert res["drift_paused"] is False
     assert "drift_paused" not in _read_session_metadata(md)
-
-
-def test_set_pinned_round_trip(tmp_path):
-    """T-0926 follow-up: set_pinned toggles the pinned flag on the SessionMd."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    cfg = _make_cfg(tmp_path, repo)
-
-    sessions_dir = cfg.data_dir / "test-project" / "sessions"
-    sessions_dir.mkdir(parents=True, exist_ok=True)
-    md = sessions_dir / "S-alice-w-p2.md"
-    _write_session_metadata(md, {
-        "sid": "S-alice-w-p2", "status": "active", "window": "w",
-        "cwd": str(repo), "claude_uuid": "u-1", "task_id": "T-0001",
-    })
-
-    res = set_pinned(cfg, "test-project", "S-alice-w-p2", True)
-    assert res["ok"] and res["pinned"] is True
-    assert _read_session_metadata(md).get("pinned") in (True, "true", "True")
-
-    res = set_pinned(cfg, "test-project", "S-alice-w-p2", False)
-    assert res["pinned"] is False
-    assert "pinned" not in _read_session_metadata(md)
 
 
 def test_set_drive_round_trip_on_operator_session(tmp_path):

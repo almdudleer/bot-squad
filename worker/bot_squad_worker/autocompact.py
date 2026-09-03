@@ -230,9 +230,18 @@ def composer_ready(buf: str, *, sid: str | None = None,
     return True
 
 
+def composer_wait_enabled() -> bool:
+    """T-0954 kill switch. ``BOT_SQUAD_COMPOSER_WAIT=0`` restores the pre-T-0954
+    gate — any text in the composer defers, forever, with no staleness clock.
+    Rolling back to a known-worse behaviour on purpose is the point of a switch;
+    this one exists so a bad staleness call can be undone without a deploy."""
+    return os.environ.get("BOT_SQUAD_COMPOSER_WAIT", "1") != "0"
+
+
 def composer_free(buf: str, *, sid: str | None = None,
-                  now: float | None = None) -> bool:
-    """:func:`composer_ready` AND no human-typed text sitting in the composer.
+                  now: float | None = None, cfg: Any = None,
+                  slug: str | None = None) -> bool:
+    """:func:`composer_ready` AND nothing in the composer worth waiting for.
 
     T-0930 (stakeholder, 2026-08-30, verbatim: «только не надо ее компактить,
     когда у меня текст во вводе»): every compact/handoff send must use THIS
@@ -242,9 +251,36 @@ def composer_free(buf: str, *, sid: str | None = None,
     anyway (correct for a wake nudge that must never be dropped, exactly wrong
     for a compact that can simply wait a tick). Deferring here means the
     bounded-force path is never reached with his text at risk.
+
+    T-0954 makes that wait FINITE. Pass ``cfg`` + ``slug`` and the decision is
+    :func:`composer_watch.observe`'s: a composer that changed inside the
+    staleness window is `typing` and is waited on (unchanged behaviour, and his
+    text still never loses), while the SAME bytes sitting there for ten minutes
+    are `stale` — nobody is composing them — and the gate OPENS, saying so. The
+    old behaviour deferred both cases identically and forever: measured
+    2026-09-03, that held four live sessions' compacts for days behind text
+    nobody was editing, one of which was the system's own unsent `check mail`.
+
+    Without ``cfg``/``slug`` this degrades to the pre-T-0954 rule (any text
+    defers). That path has no state directory to age the text against, so it
+    cannot tell the two apart — callers that can pass them, must.
     """
     if not composer_ready(buf, sid=sid, now=now):
         return False
+
+    if cfg is not None and slug and sid and composer_wait_enabled():
+        from bot_squad_worker import composer_watch
+        obs = composer_watch.observe(cfg, slug, sid, buf, now)
+        if obs["state"] in composer_watch.ACTIONABLE:
+            if obs["state"] == composer_watch.STATE_STALE:
+                # Proceeding, not deferring — but never silently: «он должен
+                # подписывать, что кажется, это stale текст в окне».
+                log.info("recycle: %s proceeding over the composer — %s",
+                         sid, composer_watch.describe(obs))
+            return True
+        _log_not_composer_ready(sid, composer_watch.describe(obs), now)
+        return False
+
     from bot_squad_worker import input_mux
     if input_mux.user_is_typing(buf):
         _log_not_composer_ready(sid, "human-typed text is sitting in the "
@@ -923,7 +959,8 @@ def _do_claude_compact(cfg: Any, slug: str, rec: dict, now: float) -> bool:
     pane = _pane_for(sid)
     if not pane:
         return False
-    if not composer_free(_capture_pane(pane), sid=sid, now=now):
+    if not composer_free(_capture_pane(pane), sid=sid, now=now, cfg=cfg,
+                         slug=slug):
         return False
     try:
         _send_compact(sid)
@@ -1089,6 +1126,7 @@ def _maybe_finalize(cfg: Any, slug: str, rec: dict, compact: dict, now: float) -
         if idle:
             pane = _pane_for(sid)
             if not pane or not composer_free(_capture_pane(pane), sid=sid,
+                                             cfg=cfg, slug=slug,
                                              now=now):
                 return False  # typing/mid-turn — retry next tick, never force
             try:
@@ -1150,7 +1188,9 @@ def _maybe_finalize(cfg: Any, slug: str, rec: dict, compact: dict, now: float) -
 
 
 def _maybe_compact_stay_ceiling(sid: str, meta: dict, md_path, level: str, now: float,
-                                pane: str | None) -> bool:
+                                pane: str | None, *, cfg: Any = None,
+                                slug: str | None = None,
+                                rec: dict | None = None) -> bool:
     """T-0649: the ceiling-trigger counterpart to :mod:`idle_timeout`'s T-0617
     compact-and-stay. Drives the SAME ``compact_stay_phase`` /
     ``compact_stay_armed_at`` / ``compact_stay_last_at`` session-md fields as
@@ -1167,28 +1207,74 @@ def _maybe_compact_stay_ceiling(sid: str, meta: dict, md_path, level: str, now: 
     """
     from bot_squad_worker import idle_timeout, sessions as _sessions
 
-    if meta.get("compact_stay_phase") == "compacting":
+    stay_phase = meta.get("compact_stay_phase")
+    if stay_phase == "compacting":
         return idle_timeout._finalize_compact_stay(sid, meta, md_path, now, pane)
+    if stay_phase in (idle_timeout.PHASE_STAY_HANDOFF,
+                      idle_timeout.PHASE_STAY_READY):
+        # T-0954: the handoff half is in flight. Shared machinery, shared
+        # fields — whichever trigger armed it, the same finalize drives it.
+        if cfg is None or not slug:
+            return False
+        return idle_timeout._finalize_stay_handoff(
+            cfg, slug, sid, meta, md_path, now, pane,
+            role=str((rec or {}).get("role") or meta.get("role") or "") or None)
 
     if level != "urgent":
         return False
     if not idle_timeout.compact_stay_due(meta.get("compact_stay_last_at"), now,
                                          idle_timeout.idle_timeout_sec()):
         return False  # already compacted-and-stayed this cache window
-    if not pane or not composer_free(_capture_pane(pane), sid=sid, now=now):
+    if not pane or not composer_free(_capture_pane(pane), sid=sid, now=now,
+                                     cfg=cfg, slug=slug):
+        return False
+
+    # T-0954: the ceiling squeezes through the SAME handoff -> ready -> compact
+    # sequence as the idle window — «не должно происходить просто compact». It
+    # used to send a bare /compact here, which is the harder case of the two:
+    # the ceiling fires precisely when the context is largest, i.e. when the
+    # summary drops the most, and a session that stays alive on a summarized
+    # transcript has no other record of what it dropped.
+    if cfg is None or not slug:
+        # No project context to resolve a handoff destination against. Refuse
+        # rather than fall back to the bare compact this ticket removed.
+        log.warning("autocompact: ceiling compact-and-stay for %s has no "
+                    "cfg/slug — cannot hand off, NOT compacting (T-0954)", sid)
+        return False
+    # The ceiling trigger is handed a live roster `rec` (role + task_id come
+    # from the session row); the md is the fallback for whatever it omits.
+    src = dict(rec or {})
+    target = _resolve_compact_target(cfg, slug, {
+        "sid": sid,
+        "role": src.get("role") or meta.get("role") or "",
+        "task_id": src.get("task_id") or meta.get("task_id"),
+        "window": src.get("window") or meta.get("window"),
+    })
+    if target["kind"] == "none":
+        log.warning("autocompact: %s hit the context ceiling but has nowhere "
+                    "to hand off to — NOT compacting (T-0954: never a bare "
+                    "compact)", sid)
         return False
 
     try:
-        _send_compact(sid)
+        if target["kind"] == "context":
+            _inject_context_handoff(sid, target["task_id"], relaunch=False,
+                                    resume=True)
+        else:
+            _inject_handoff(sid, target["artifact_path"], target["role"],
+                            relaunch=False, resume=True)
     except Exception:
-        log.exception("autocompact: ceiling compact-and-stay /compact send "
+        log.exception("autocompact: ceiling compact-and-stay handoff inject "
                       "failed for %s (will retry)", sid)
         return False
-    meta["compact_stay_phase"] = "compacting"
+    meta["compact_stay_phase"] = idle_timeout.PHASE_STAY_HANDOFF
     meta["compact_stay_armed_at"] = idle_timeout._now_iso()
+    meta["compact_stay_mark"] = handoff_mark(target)
     _sessions._write_session_metadata(md_path, meta, atomic=True)
-    log.info("autocompact: ceiling compact-and-stay sent /compact to %s — "
-             "session stays, no relaunch", sid)
+    log.info("autocompact: ceiling compact-and-stay asked %s to hand off into "
+             "%s — awaiting the write, then /compact", sid,
+             f"{target['task_id']} ## Context" if target["kind"] == "context"
+             else target["artifact_path"])
     return True
 
 
@@ -1229,20 +1315,6 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
     # the compact-and-stay path below: no ceiling action at all.
     #
     # T-0945 KEEPS the half that protects the session and drops the half that
-    # starved it. A pin still bars the clear+relaunch and every exit — but the
-    # stakeholder's ruling on manual sessions names this exact case: «В целом к
-    # ручной сессии актуальны те же правила … и если контекст разросся, нужно
-    # сделать тоже компакт», and he reads pinning itself as «симптом плохо
-    # настроенного вот этого процесса». A pinned session over the ceiling with
-    # no way to compact is the starvation that produced. Same treatment as an
-    # ATTACHED pane, which T-0930 had already routed here for the same reason
-    # («это разумная компакт логика даже когда я работаю с сессией»); the
-    # typing gate inside `_maybe_compact_stay_ceiling` is what protects a
-    # half-typed draft.
-    if recycle_gate.session_pinned(meta):
-        if md_path is None or not ceiling_stay_enabled():
-            return False
-        return _maybe_compact_stay_ceiling(sid, meta, md_path, level, now, pane)
     # T-0930 (stakeholder, 2026-08-30): an ATTACHED pane no longer blocks the
     # ceiling response outright — «это разумная компакт логика даже когда я
     # работаю с сессией». Attended sessions get the compact-in-place flow only
@@ -1270,7 +1342,8 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
     if recycle_gate.user_session_exempt(role=role, window=window, meta=meta):
         if md_path is None:
             return False
-        return _maybe_compact_stay_ceiling(sid, meta, md_path, level, now, pane)
+        return _maybe_compact_stay_ceiling(sid, meta, md_path, level, now, pane,
+                                           cfg=cfg, slug=slug, rec=rec)
 
     fired = rec.get("alert_fired_at") or {}
     rec["alert_fired_at"] = fired
@@ -1290,7 +1363,8 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
     pane = _pane_for(sid)
     if not pane:
         return False
-    if not composer_free(_capture_pane(pane), sid=sid, now=now):
+    if not composer_free(_capture_pane(pane), sid=sid, now=now, cfg=cfg,
+                         slug=slug):
         return False
 
     # Handoff mode + a resolvable destination → ARM the write-it-down flow.

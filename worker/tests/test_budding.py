@@ -539,18 +539,6 @@ def test_the_tick_never_types_over_half_typed_text(tmp_path, monkeypatch):
     assert delivered == []
 
 
-def test_a_pinned_session_takes_no_budding_suggestion(tmp_path, monkeypatch):
-    cfg = _make_cfg(tmp_path)
-    _task(cfg, "T-0001", "in_progress")
-    _task(cfg, "T-0002", "open")
-    _task(cfg, "T-0003", "open")
-    _root(cfg, task_id="T-0001", role="dev", pinned=True)
-    delivered = _arm_tick(monkeypatch)
-
-    assert budding.budding_check(cfg, "test-project")["suggested"] == []
-    assert delivered == []
-
-
 def test_the_kill_switch_disables_the_tick(tmp_path, monkeypatch):
     cfg = _make_cfg(tmp_path)
     _task(cfg, "T-0001", "in_progress")

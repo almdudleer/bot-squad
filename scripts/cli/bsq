@@ -26,7 +26,6 @@ Verbs:
   bsq compact [--sid SID]           send /compact to a session (self by default)
   bsq compact-save "<state>"        task-LESS handoff: forward-state -> your role artifact
                                     (task-bound? use `bsq ticket context <id>` instead — T-0863)
-  bsq postpone [--for SECS]         defer your ~1h cache-window recycle one window (repeatable)
   bsq msg-route list/set/clear      where each automated message TYPE is delivered (T-0799)
   bsq drive off/on/status           operator-only: your own drive continuity toggle (T-0655)
   bsq model set/clear/status         durable per-session agent/model override (T-0678)
@@ -3624,38 +3623,6 @@ def cmd_assignment_write_result(args) -> None:
           f"({res.get('bytes_written')} bytes, kind {res.get('kind')})")
 
 
-def cmd_postpone(args) -> None:
-    """T-0466: defer this session's next ~1h cache-window recycle.
-
-    A stale *waiting* session is asked at the cache-invalidation window to record
-    its forward-state and exit. Run this to be left running one more window
-    instead — repeatable indefinitely. Pass ``--for <seconds>`` to declare a
-    bounded wait with a known ETA (e.g. you're watching a long build)."""
-    slug = resolve_slug()
-    sid = require_sid(getattr(args, "sid", None))
-    params = {"slug": slug, "sid": sid}
-    if getattr(args, "seconds", None) is not None:
-        params["seconds"] = args.seconds
-    if getattr(args, "reason", None):
-        params["reason"] = args.reason
-    res = post("idle_postpone", params)
-    print(f"recycle postponed for {res.get('sid', sid)} until "
-          f"{res.get('postpone_until')} (+{res.get('seconds')}s)")
-
-
-_MORPH_ROLE_ALIASES = {
-    "dev": "dev",
-    "tl": "teamlead", "teamlead": "teamlead", "team-lead": "teamlead",
-    "op": "operator", "operator": "operator",
-    # T-0932: the DE-differentiation direction — narrow back down to the
-    # conversation after handing your work to a bud («отделение себя в
-    # юзер-сессию»). Sheds the task binding worker-side.
-    "uc": "user-conversation", "user": "user-conversation",
-    "user-conversation": "user-conversation",
-    "user_conversation": "user-conversation",
-}
-
-
 def _normalize_morph_role(raw: str) -> str:
     role = _MORPH_ROLE_ALIASES.get((raw or "").strip().lower())
     if role is None:
@@ -3816,47 +3783,6 @@ def cmd_drift_status(args) -> None:
 # fix only survives one flickered tmux sample, not a real stretch of no
 # keystrokes/no detected client during a long turn or a look-away. Mirrors
 # the drift CLI shape.
-# --------------------------------------------------------------------------
-
-def _set_pinned(args, pinned: bool) -> None:
-    slug = resolve_slug()
-    sid = require_sid(getattr(args, "sid", None))
-    res = post("set_pinned", {"slug": slug, "sid": sid, "pinned": pinned})
-    state = "ON (pinned)" if res.get("pinned") else "OFF (unpinned)"
-    print(f"pin for {res.get('sid', sid)}: {state}")
-
-
-def cmd_pin_on(args) -> None:
-    _set_pinned(args, True)
-
-
-def cmd_pin_off(args) -> None:
-    _set_pinned(args, False)
-
-
-def cmd_pin_status(args) -> None:
-    slug = resolve_slug()
-    sid = require_sid(getattr(args, "sid", None))
-    md = sessions_dir(slug) / f"{sid}.md"
-    pinned = False
-    if md.exists():
-        fm = read_frontmatter(md)
-        pinned = str(fm.get("pinned", "")).strip().lower() in {"true", "1", "yes", "on"}
-    else:
-        print(f"bsq: no SessionMd at {md} (status may be stale)", file=sys.stderr)
-    print(f"pin for {sid}: {'ON (pinned)' if pinned else 'OFF (unpinned)'}")
-
-
-# --------------------------------------------------------------------------
-# T-0655: operator's own drive=on/off continuity toggle.
-#
-# Distinct from `bsq pace pause` (a project-wide dispatch gate — stop
-# admitting new work) and from drift (a per-session nag off-ramp): `drive`
-# governs whether THIS operator session stays alive across its own ~1h
-# cache-expiry-while-idle window, or is allowed to recycle. Only the operator
-# itself may set it (worker-side role check in sessions.set_drive) — the
-# stakeholder's explicit ask is that THE OPERATOR decides this, not the
-# harness. Mirrors the drift CLI shape/pattern.
 # --------------------------------------------------------------------------
 
 def _set_drive(args, on: bool) -> None:
@@ -7248,19 +7174,6 @@ def build_parser() -> argparse.ArgumentParser:
     drs.add_argument("--sid", help="target SID (default: this session)")
     drs.set_defaults(func=cmd_drift_status)
 
-    # pin (T-0926 follow-up: block EVERY automatic action for this session)
-    pn = sub.add_parser("pin", help="block terminate AND compact-and-stay for THIS session (T-0926)")
-    pn_sub = pn.add_subparsers(dest="sub", required=True)
-    pno = pn_sub.add_parser("on", help="pin this session — no automatic action touches it")
-    pno.add_argument("--sid", help="target SID (default: this session)")
-    pno.set_defaults(func=cmd_pin_on)
-    pnoff = pn_sub.add_parser("off", help="unpin this session — automatic actions resume")
-    pnoff.add_argument("--sid", help="target SID (default: this session)")
-    pnoff.set_defaults(func=cmd_pin_off)
-    pns = pn_sub.add_parser("status", help="show whether this session is pinned")
-    pns.add_argument("--sid", help="target SID (default: this session)")
-    pns.set_defaults(func=cmd_pin_status)
-
     # drive (T-0655: operator-only drive=on/off continuity toggle)
     dv = sub.add_parser("drive", help="operator-only: your own drive=on/off continuity toggle (T-0655)")
     dv_sub = dv.add_subparsers(dest="sub", required=True)
@@ -7606,17 +7519,6 @@ def build_parser() -> argparse.ArgumentParser:
                      help="assignment kind (default: task)")
     awr.add_argument("--sid", help="session SID (default: derived from tmux)")
     awr.set_defaults(func=cmd_assignment_write_result)
-
-    # postpone (T-0466) — defer this session's next ~1h cache-window recycle
-    pp = sub.add_parser(
-        "postpone",
-        help="defer your ~1h cache-window recycle one window (repeatable); "
-             "--for <secs> for a bounded wait (e.g. a long build)")
-    pp.add_argument("--for", dest="seconds", type=int,
-                    help="deferral length in seconds (default: one idle window)")
-    pp.add_argument("--reason", help="why you're postponing (optional note)")
-    pp.add_argument("--sid", help="session SID (default: derived from tmux)")
-    pp.set_defaults(func=cmd_postpone)
 
     # morph (T-0509, M11/F11.2) — morph THIS user session's role in place
     mo = sub.add_parser(

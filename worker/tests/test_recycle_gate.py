@@ -121,17 +121,6 @@ def test_user_session_exempt_md_marker():
     assert G.user_session_exempt(role="dev", window="adhoc", meta=None) is False
 
 
-def test_session_pinned():
-    assert G.session_pinned({"pinned": True}) is True
-    assert G.session_pinned({"pinned": "true"}) is True
-    assert G.session_pinned({"pinned": "1"}) is True
-    assert G.session_pinned({"pinned": "yes"}) is True
-    assert G.session_pinned({"pinned": False}) is False
-    assert G.session_pinned({"pinned": "~"}) is False
-    assert G.session_pinned({}) is False
-    assert G.session_pinned(None) is False
-
-
 def test_recycle_allowed_blocks_hand_launched_user_session(monkeypatch):
     monkeypatch.delenv("BOT_SQUAD_RECYCLE_PROJECTS", raising=False)
     monkeypatch.setattr(G, "is_attached", lambda t, **kw: False)

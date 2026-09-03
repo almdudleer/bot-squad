@@ -503,19 +503,6 @@ def test_tick_exits_done_active_skips_suspended(tmp_path, seams, monkeypatch):
 
 # --- T-0945: pin/attach hold the exit; the handoff never wedges -------------
 
-def test_pinned_done_session_is_not_exited(tmp_path, seams):
-    """«исчезновение сессии у меня из под носа» — this path had NO recycle_gate
-    check at all, so a done session the human had pinned was suspended anyway."""
-    sid = "S-almdudleer-bot-squad-demo-p5"
-    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
-                          task_status="totest", extra_md={"pinned": True})
-    row = _row(sid, role="dev", cwd_repo=data.parent / "repo")
-    assert GE.maybe_exit(cfg, "bot-squad", row, now=time.time(),
-                         user_home="/home/x") is False
-    assert seams["calls"]["suspend"] == []
-    assert seams["calls"]["ctx_handoff"] == []
-
-
 def test_attached_done_session_is_not_exited(tmp_path, seams, monkeypatch):
     """Same rule for a live tmux client — the exit waits out the attachment."""
     monkeypatch.setattr(GE.recycle_gate, "is_attached", lambda target, **kw: True)

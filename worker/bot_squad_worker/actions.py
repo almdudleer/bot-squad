@@ -5312,33 +5312,6 @@ def _action_set_drift_paused(params: dict[str, Any]) -> dict[str, Any]:
     return _sessions.set_drift_paused(cfg, params["slug"], params["sid"], params["paused"])
 
 
-_SET_PINNED_REQUIRED = {"slug", "sid", "pinned"}
-_SET_PINNED_ALLOWED = _SET_PINNED_REQUIRED
-
-
-def _action_set_pinned(params: dict[str, Any]) -> dict[str, Any]:
-    """T-0926 follow-up: pin/unpin a single session against every automatic
-    action (terminate AND compact-and-stay alike).
-
-    Required params: slug, sid, pinned (bool). Returns {ok, sid, pinned}.
-    Backs ``bsq pin on`` / ``bsq pin off``. ``tmux_only`` so a session can pin
-    itself via the user-worker without coordinator privileges, mirroring
-    set_drift_paused/set_drive.
-    """
-    extra = set(params) - _SET_PINNED_ALLOWED
-    if extra:
-        raise ActionError(f"set_pinned got unexpected params: {sorted(extra)}")
-    missing = _SET_PINNED_REQUIRED - set(params)
-    if missing:
-        raise ActionError(f"set_pinned missing required params: {sorted(missing)}")
-    if not isinstance(params["pinned"], bool):
-        raise ActionError("set_pinned: 'pinned' must be a boolean")
-
-    cfg = _get_config()
-    from bot_squad_worker import sessions as _sessions
-    return _sessions.set_pinned(cfg, params["slug"], params["sid"], params["pinned"])
-
-
 _SET_DRIVE_REQUIRED = {"slug", "sid", "on"}
 _SET_DRIVE_ALLOWED = _SET_DRIVE_REQUIRED
 
@@ -5396,32 +5369,6 @@ _IDLE_POSTPONE_REQUIRED = {"slug", "sid"}
 _IDLE_POSTPONE_ALLOWED = _IDLE_POSTPONE_REQUIRED | {"seconds", "reason"}
 
 
-def _action_idle_postpone(params: dict[str, Any]) -> dict[str, Any]:
-    """T-0466: defer this session's next ~1h cache-window recycle (``bsq postpone``).
-
-    Required params: slug, sid. Optional: seconds (deferral length; default = one
-    full idle window), reason. Returns {ok, sid, postpone_until, seconds}.
-    Backs the postpone protocol — a stale waiting session asks to be left running
-    one more window, repeatable indefinitely; pass ``seconds`` to declare a
-    bounded wait with a known ETA (e.g. a long build). ``tmux_only`` — it writes
-    only its OWN SessionMd frontmatter (filesystem-local), like set_drift_paused.
-    """
-    extra = set(params) - _IDLE_POSTPONE_ALLOWED
-    if extra:
-        raise ActionError(f"idle_postpone got unexpected params: {sorted(extra)}")
-    missing = _IDLE_POSTPONE_REQUIRED - set(params)
-    if missing:
-        raise ActionError(f"idle_postpone missing required params: {sorted(missing)}")
-    seconds = params.get("seconds")
-    if seconds is not None and not isinstance(seconds, int):
-        raise ActionError("idle_postpone: 'seconds' must be an integer")
-
-    cfg = _get_config()
-    from bot_squad_worker import sessions as _sessions
-    return _sessions.set_idle_postpone(cfg, params["slug"], params["sid"],
-                                       seconds=seconds, reason=params.get("reason"))
-
-
 _MORPH_SESSION_REQUIRED = {"slug", "sid", "role"}
 _MORPH_SESSION_ALLOWED = _MORPH_SESSION_REQUIRED | {
     "task_id", "initiative", "window", "cwd", "claude_uuid",
@@ -5443,7 +5390,7 @@ def _action_morph_session(params: dict[str, Any]) -> dict[str, Any]:
     the CLI seed an md for an unregistered, manually-launched user session).
     Returns {ok, sid, role, task_id, initiative, created}. ``tmux_only`` — it
     writes only its OWN SessionMd frontmatter (filesystem-local), like
-    set_drift_paused / idle_postpone.
+    set_drift_paused.
     """
     extra = set(params) - _MORPH_SESSION_ALLOWED
     if extra:
@@ -6177,13 +6124,11 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "set_drift_paused": _action_set_drift_paused,
     # T-0926 follow-up: per-session pin against every automatic action
     # (bsq pin on/off).
-    "set_pinned": _action_set_pinned,
     # T-0655: operator's own drive=on/off continuity toggle (bsq drive on/off).
     "set_drive": _action_set_drive,
     # T-0678: per-session `claude --model` override (bsq model set/status).
     "set_model": _action_set_model,
     # T-0466: per-session cache-window recycle postpone (bsq postpone).
-    "idle_postpone": _action_idle_postpone,
     # T-0509 (M11/F11.2): user-session role morph (user→dev/teamlead/operator).
     "morph_session": _action_morph_session,
     "unbind_task": _action_unbind_task,
@@ -6385,7 +6330,6 @@ ACTION_MODES: dict[str, str] = {
     # T-0926 follow-up: a session pins/unpins ITSELF against every automatic
     # action — writes only its own SessionMd frontmatter (filesystem-local),
     # tmux_only like set_drift_paused.
-    "set_pinned": "tmux_only",
     # T-0655: the operator toggles its OWN drive continuity flag — writes
     # only its own SessionMd frontmatter (filesystem-local), tmux_only like
     # set_drift_paused.
@@ -6397,9 +6341,8 @@ ACTION_MODES: dict[str, str] = {
     # T-0466: a session postpones its OWN cache-window recycle by stamping its
     # own SessionMd frontmatter (filesystem-local) — tmux_only, like the drift
     # off-ramp; no coordinator privilege required.
-    "idle_postpone": "tmux_only",
     # T-0509: a user session morphs its OWN role by stamping its own SessionMd
-    # frontmatter (filesystem-local) — tmux_only, like idle_postpone. The
+    # frontmatter (filesystem-local) — tmux_only, like set_drift_paused. The
     # operator-singleton guard reads mds + a tmux pane scan, both user-local.
     "morph_session": "tmux_only",
     "unbind_task": "coordinator_only",

@@ -209,26 +209,6 @@ def user_session_exempt(role: str | None = None, window: str | None = None,
     return str(marker or "").strip().lower() in ("true", "1", "yes")
 
 
-def session_pinned(meta: dict | None = None) -> bool:
-    """T-0926 follow-up (stakeholder, 2026-08-28): True iff the session's own
-    ``pinned: true`` SessionMd field is set (``bsq pin on`` /
-    :func:`sessions.set_pinned`).
-
-    Distinct from :func:`user_session_exempt`: that one still lets T-0617's
-    compact-and-stay quietly compact a session's context in place by design
-    (T-0616's ``recycle_exempt`` marker never meant "never touch," only
-    "never terminate"). Pinning is a stronger, explicit, human-set override —
-    "do not act on this pane at all" — for exactly the case the attach-grace
-    fix (:data:`_ATTACH_GRACE_SEC`) can't cover: a real stretch of no
-    keystrokes or no detected tmux client (a long Claude turn, a look-away)
-    that the human doesn't consider "gone," not a single flickered sample.
-    Every caller must check this AHEAD of both the terminate path and the
-    compact-and-stay path — a pinned session takes no automatic action of any
-    kind until unpinned."""
-    marker = (meta or {}).get("pinned")
-    return str(marker or "").strip().lower() in ("true", "1", "yes")
-
-
 def operator_drive_on(role: str | None = None, meta: dict | None = None) -> bool:
     """T-0655: True for an operator-role session whose ``drive`` is on.
 

@@ -247,14 +247,40 @@ def stay_harness(monkeypatch):
     T-0649 ceiling compact-and-stay path needs an actual md_path to arm/
     finalize against."""
     sent: list[str] = []
+    asked: list[tuple] = []
     state = {"pane": "%9", "buf": "❯ \n"}
     monkeypatch.setattr(A, "_pane_for", lambda sid: state["pane"])
     monkeypatch.setattr(A, "_capture_pane", lambda pane: state["buf"])
     monkeypatch.setattr(A, "_send_compact", lambda sid: sent.append(sid))
+    # T-0954: the ceiling now ASKS for the forward-state before it squeezes.
+    # Stubbed here for the same reason `_send_compact` is — the real ones type
+    # into a pane, and `state["pane"]` is a live pane id on the host running
+    # the suite.
+    monkeypatch.setattr(A, "_inject_context_handoff",
+                        lambda sid, task_id, *, relaunch=True, resume=False:
+                        asked.append(("context", sid, task_id, resume)))
+    monkeypatch.setattr(A, "_inject_handoff",
+                        lambda sid, art, role=None, *, relaunch=True, resume=False:
+                        asked.append(("artifact", sid, art, resume)))
     monkeypatch.setattr(A, "autocompact_enabled", lambda: True)
     monkeypatch.setenv("BOT_SQUAD_RECYCLE_PROJECTS", "bot-squad")
     monkeypatch.setattr(A.recycle_gate, "is_attached", lambda target, **kw: False)
-    return {"sent": sent, "state": state}
+    return {"sent": sent, "asked": asked, "state": state}
+
+
+def _finish_ceiling_handoff(cfg, data, sid, rec, *, slug="bot-squad", now=1001.0):
+    """T-0954: land the ceiling handoff, then run the tick that squeezes.
+
+    Same shape as the idle trigger's driver in ``test_idle_timeout.py``: the
+    ARM-time mark is made to differ from the destination's current one, which is
+    how ``_finalize_stay_handoff`` decides the session wrote its state.
+    """
+    md = S._session_file(data, slug, sid)
+    meta = S._read_session_metadata(md)
+    assert meta.get("compact_stay_phase") == IT.PHASE_STAY_HANDOFF, meta
+    meta["compact_stay_mark"] = "ctx:the-state-before-the-session-wrote"
+    S._write_session_metadata(md, meta)
+    return A.maybe_compact(cfg, slug, rec, "urgent", now=now)
 
 
 def test_exempt_session_ceiling_compacts_in_place_no_suspend(tmp_path, stay_harness, monkeypatch):
@@ -267,6 +293,9 @@ def test_exempt_session_ceiling_compacts_in_place_no_suspend(tmp_path, stay_harn
 
     rec = {"sid": sid, "activity": "idle", "role": "user-conversation"}
     assert A.maybe_compact(cfg, "bot-squad", rec, "urgent", now=1000.0) is True
+    assert stay_harness["sent"] == []  # T-0954: the handoff comes first
+    assert len(stay_harness["asked"]) == 1
+    assert _finish_ceiling_handoff(cfg, data, sid, rec) is True
     assert stay_harness["sent"] == [sid]
     assert suspended == []
 
@@ -293,6 +322,9 @@ def test_pinned_session_ceiling_compacts_in_place_but_never_exits(
 
     rec = {"sid": sid, "activity": "idle", "role": "user-conversation"}
     assert A.maybe_compact(cfg, "bot-squad", rec, "urgent", now=1000.0) is True
+    assert stay_harness["sent"] == []  # T-0954: the handoff comes first
+    assert len(stay_harness["asked"]) == 1
+    assert _finish_ceiling_handoff(cfg, data, sid, rec) is True
     assert stay_harness["sent"] == [sid]
     assert suspended == []
 
@@ -300,26 +332,6 @@ def test_pinned_session_ceiling_compacts_in_place_but_never_exits(
     assert meta["compact_stay_phase"] == "compacting"
     # the terminate-flow fields are never touched on this path
     assert "idle_recycle_phase" not in meta
-
-
-def test_pinned_session_ceiling_takes_no_action_with_stay_disabled(
-        tmp_path, stay_harness, monkeypatch):
-    """Control for the above: with compact-in-place killed
-    (BOT_SQUAD_CEILING_COMPACT_STAY=0) the only remaining ceiling response is
-    the clear+relaunch a pin must never get — so a pinned session goes back to
-    taking no action at all, exactly as T-0926 left it."""
-    monkeypatch.setenv("BOT_SQUAD_CEILING_COMPACT_STAY", "0")
-    sid = "S-almdudleer-operator-p9"
-    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None,
-                          extra_md={"pinned": True})
-    suspended = []
-    monkeypatch.setattr(S, "suspend", lambda *a, **k: suspended.append(a))
-
-    rec = {"sid": sid, "activity": "idle", "role": "user-conversation"}
-    assert A.maybe_compact(cfg, "bot-squad", rec, "urgent", now=1000.0) is False
-    assert stay_harness["sent"] == [] and suspended == []
-    meta = S._read_session_metadata(S._session_file(data, "bot-squad", sid))
-    assert "compact_stay_phase" not in meta
 
 
 def test_exempt_session_ceiling_skips_below_urgent(tmp_path, stay_harness):
@@ -373,6 +385,9 @@ def test_exempt_session_ceiling_rearms_once_window_elapsed(tmp_path, stay_harnes
                           extra_md={"compact_stay_last_at": long_ago})
     rec = {"sid": sid, "activity": "idle", "role": "user-conversation"}
     assert A.maybe_compact(cfg, "bot-squad", rec, "urgent", now=1000.0) is True
+    assert stay_harness["sent"] == []  # T-0954: the handoff comes first
+    assert len(stay_harness["asked"]) == 1
+    assert _finish_ceiling_handoff(cfg, data, sid, rec) is True
     assert stay_harness["sent"] == [sid]
 
 
@@ -383,6 +398,9 @@ def test_hand_launched_user_session_ceiling_also_compacts_in_place(tmp_path, sta
     cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None)
     rec = {"sid": sid, "activity": "idle", "role": "dev"}
     assert A.maybe_compact(cfg, "bot-squad", rec, "urgent", now=1000.0) is True
+    assert stay_harness["sent"] == []  # T-0954: the handoff comes first
+    assert len(stay_harness["asked"]) == 1
+    assert _finish_ceiling_handoff(cfg, data, sid, rec) is True
     assert stay_harness["sent"] == [sid]
 
 
@@ -397,7 +415,11 @@ def test_worker_session_ceiling_unaffected_by_exempt_path(tmp_path, stay_harness
     monkeypatch.setattr(A, "compact_mode", lambda: "claude")
     rec = {"sid": sid, "activity": "idle", "role": "dev"}
     assert A.maybe_compact(cfg, "bot-squad", rec, "urgent", now=1000.0) is True
+    # NOT the compact-and-stay path: this is the legacy claude-/compact
+    # fallback for a non-exempt worker session, so T-0954's handoff sequence
+    # does not apply and the squeeze is this tick's own.
     assert stay_harness["sent"] == [sid]
+    assert stay_harness["asked"] == []
 
     meta = S._read_session_metadata(S._session_file(data, "bot-squad", sid))
     assert "compact_stay_phase" not in meta

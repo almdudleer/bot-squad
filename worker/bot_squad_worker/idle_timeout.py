@@ -1,4 +1,4 @@
-"""T-0466 / M1-F1.3 — ~1h cache-window idle/waiting-session recycle + postpone.
+"""T-0466 / M1-F1.3 — the ~1h cache-window idle/waiting-session recycle.
 
 Stakeholder (SOURCE-VERBATIM Part A): *"it should get recycled on timeout. Good
 time for that is cache invalidation timeout, e.g. for claude subscription it's 1
@@ -7,6 +7,13 @@ and exit. They should be able to postpone this until next timeout, allowed to
 repeat indefinitely on each timeout. Generally they should postpone if they are
 actively waiting for some long ongoing process to finish (e.g. long build),
 which is expected to finish within known time boundaries."*
+
+The postpone half of that quote is now served WITHOUT a session-facing verb:
+T-0954 (stakeholder, 2026-09-03) withdrew the manual controls — «ту тему с
+пинами/manual handling сессий … надо убрать, это была ошибка» — and what he
+described here, a session parked on a long build with a known ETA, is exactly
+what :func:`tracking_long_job` detects by itself. The need survives; the
+declaration does not.
 
 SIBLING of :mod:`autocompact` (T-0467), not a rival. autocompact recycles a
 session when its CONTEXT crosses the ceiling; idle_timeout recycles a session
@@ -21,8 +28,8 @@ incarnation that boots from the artifact, re-bound to the same assignment).
 idle_timeout REUSES autocompact's handoff helpers for every concrete operation
 (resolve-artifact / inject-prompt / artifact-mtime / suspend / relaunch /
 orphan-alert) — it does NOT fork the exit. It only adds (1) a time-based TRIGGER
-and (2) the postpone protocol. autocompact.py is left untouched; the in-flight
-handoff + postpone STATE lives on the session md (a sessions-lifecycle concern),
+and (2) the auto-postpone. autocompact.py is left untouched; the in-flight
+handoff STATE lives on the session md (a sessions-lifecycle concern),
 so the two recyclers never share storage and can't race on each other's state.
 
 THE IDLE CLOCK is the Claude transcript jsonl mtime (the last assistant turn ≈
@@ -31,11 +38,13 @@ long-polling its inbox has a fresh heartbeat but a cold cache — and that IS th
 "stale waiting session" the stakeholder means. Using ``_pane_activity_at``
 (jsonl-only) instead of the row's heartbeat-folded ``activity_at`` is deliberate.
 
-POSTPONE (per-window, unbounded): a session runs ``bsq postpone`` → the worker
-stamps ``idle_postpone_until = now + window`` on its session md, so the tick
-skips the next window. It can repeat every window, forever. ``bsq postpone --for
-<seconds>`` stamps a longer deadline — the way a session declares it is waiting
-on a bounded job with a known ETA (the stakeholder's "known time boundaries").
+POSTPONE, the manual verb, is GONE (T-0954). A session used to defer its own
+window with ``bsq postpone``, and the stakeholder withdrew that whole class of
+control on 2026-09-03 — «ту тему с пинами/manual handling сессий, которую мы
+ввели, надо убрать, это была ошибка. Надо просто сделать нормальный процесс.» A
+session hand-deferring the process that manages it is a patch over a process
+that misbehaves; the auto-postpone below is the same need met by measurement
+instead of by a declaration, and it is what remains.
 
 AUTO-POSTPONE: while the session is waiting on a *tracked* long bounded job the
 recycle auto-defers with NO session action — killing it mid-build would throw
@@ -161,8 +170,8 @@ done-or-not judgement — *«Это должна решать сама сесс�
 
   role / state                      plan           at the deadline
   --------------------------------  -------------  --------------------------
-  human attached, or ``pinned``,    stay           compact IN PLACE, no exit
-  or a hand-launched user-session
+  human attached, or a             stay           handoff → ready → compact
+  hand-launched user-session                       IN PLACE, no exit
   / ``recycle_exempt`` pane
   user-conversation                 compact_exit   handoff → /compact → exit
                                                    resumable, always resumed
@@ -436,6 +445,16 @@ COORDINATOR_ROLES = ("teamlead", "prod-teamlead")
 # into the wrong half of the machine after a worker restart.
 PHASE_COMPACT_EXIT = "compacting_exit"
 
+# T-0954: compact-and-stay is a THREE-phase machine, not a bare /compact. The
+# stakeholder's rule — «не должно происходить просто compact, должен всегда
+# handoff + ready for compact и только потом compact» — makes the handoff a
+# precondition of the squeeze on EVERY trigger, not only on the exiting plans.
+# `handoff` is armed and waiting for the session's write; `ready` is the state
+# the write lands in and is stamped before the `/compact` is sent, so "compact
+# without a completed handoff" is a state the md can never show.
+PHASE_STAY_HANDOFF = "handoff"
+PHASE_STAY_READY = "ready"
+
 
 def worker_nudge_sec(role: str | None) -> int:
     """The keep-alive cadence for a :data:`WORKER_ROLES` session with live work.
@@ -527,9 +546,16 @@ def recycle_plan(*, role: str | None, window: str | None, meta: dict | None,
 
     Precedence, and why each step sits where it does:
 
-    1. **attached / pinned → stay.** A human is looking at this pane. The only
-       action that is ever safe here is the compact he asked for; the exit is
-       what cost him «весь контекст беседы».
+    1. **attached → stay.** A human is looking at this pane. The only action
+       that is ever safe here is the compact he asked for; the exit is what
+       cost him «весь контекст беседы».
+
+       T-0954 removed the second half of this test. A ``pinned`` marker used to
+       force the same verdict, and the stakeholder withdrew the whole idea:
+       «ту тему с пинами/manual handling сессий, которую мы ввели, надо убрать,
+       это была ошибка. Надо просто сделать нормальный процесс.» A pin was a
+       manual patch over a process that misbehaved — it is the process that had
+       to change, and the rest of this ticket is that change.
     2. **a hand-launched user-session / ``recycle_exempt`` pane → stay.** Same
        reason, without needing a client attached this second: these are his own
        panes and they are never terminated, only compacted in place (T-0616/
@@ -546,7 +572,7 @@ def recycle_plan(*, role: str | None, window: str | None, meta: dict | None,
        non-exempt session, unchanged).
     """
     r = (role or "").strip()
-    if attached or recycle_gate.session_pinned(meta):
+    if attached:
         return PLAN_STAY
     if not recycle_gate.role_exempt(r) and recycle_gate.user_session_exempt(
             role=r, window=window, meta=meta):
@@ -580,16 +606,6 @@ def idle_due(idle_age: float | None, window: int) -> bool:
     return idle_age >= window
 
 
-def postpone_active(postpone_until: Any, now: float) -> bool:
-    """True when a postpone deadline is set and still in the future."""
-    ts = sessions._parse_ts_epoch(postpone_until)
-    if ts is None:
-        return False
-    return now < ts
-
-
-# --- tracked-long-job detection (auto-postpone) -----------------------------
-
 def _inflight_deploy_for(cfg: Any, slug: str, sid: str) -> bool:
     """True when ``sid`` has a deploy queued or processing — the bot-squad
     analogue of the stakeholder's "long build". Reads the deploy job dir
@@ -621,17 +637,17 @@ def _inflight_deploy_for(cfg: Any, slug: str, sid: str) -> bool:
 def tracking_long_job(cfg: Any, slug: str, sid: str) -> bool:
     """True when the session is actively waiting on a tracked, time-bounded job.
 
-    Today that is an in-flight deploy/build it requested. A session-declared
-    bounded wait (``bsq postpone --for <seconds>``) rides the ``idle_postpone_until``
-    stamp instead (handled by :func:`postpone_active`), so it is not re-checked
-    here.
+    Today that is an in-flight deploy/build it requested. This is the ONLY
+    deferral left: T-0954 removed the session-declared one (``bsq postpone``),
+    so a wait now has to be VISIBLE to the worker to count, not merely asserted
+    by the session that wants it.
     """
     return _inflight_deploy_for(cfg, slug, sid)
 
 
 # --- per-session executor ---------------------------------------------------
 
-# In-flight compact-wait + postpone state lives as FLAT scalar md fields (never
+# In-flight compact-wait state lives as FLAT scalar md fields (never
 # a nested mapping) so the line-based session_start hook reader stays happy.
 # T-0616 hook contract: session_start.sh preserves these two fields ONLY on a
 # source=compact fire (the /compact this recycle sent — clearing them there
@@ -677,6 +693,9 @@ def _clear_recycle_state(meta: dict) -> None:
 _COMPACT_STAY_FIELDS = (
     "compact_stay_phase",
     "compact_stay_armed_at",
+    # T-0954: the ARM-time handoff mark. In-flight like its siblings — a
+    # mark that outlived its sequence would read as "it already wrote".
+    "compact_stay_mark",
 )
 
 
@@ -725,7 +744,7 @@ def _context_tokens(cfg: Any, slug: str, sid: str) -> int:
 
 def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) -> bool:
     """Act on ``row``'s session per its T-0945 :func:`recycle_plan`, once it is
-    idle past the window AND safe AND not postponed AND not gated by T-0563.
+    idle past the window AND safe AND not gated by T-0563.
     Returns True iff an action was taken this tick (nudge sent, compact sent, or
     terminate+record finalized). Every gate fails closed.
 
@@ -787,8 +806,26 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
     # a `/compact` has already been sent and abandoning the wait would let the
     # next tick arm a second one. autocompact's CEILING trigger arms this same
     # pair (T-0649), so the in-flight state here is not always ours.
-    if meta.get("compact_stay_phase") == "compacting":
+    # T-0954: he is mid-sentence and the deadline is near — say so once, rather
+    # than deferring in silence for the rest of the window. Applies to every
+    # plan (whatever we were about to do, we are not doing it while he types),
+    # but NOT while a sequence is already in flight: a handoff or a /compact
+    # that has already left needs its finalize half more than he needs a second
+    # message, and preempting it here would leave the phase armed.
+    if not (meta.get("compact_stay_phase") or meta.get("idle_recycle_phase")):
+        if _maybe_warn_while_typing(cfg, slug, sid, row, meta, md_path, now,
+                                    pane, user_home):
+            return True
+
+    stay_phase = meta.get("compact_stay_phase")
+    if stay_phase == "compacting":
         return _finalize_compact_stay(sid, meta, md_path, now, pane)
+    if stay_phase in (PHASE_STAY_HANDOFF, PHASE_STAY_READY):
+        # T-0954: the handoff half of a compact-and-stay is in flight. Same
+        # reason as the `compacting` case above — dropping the wait here
+        # would let the next tick arm a second handoff on top of it.
+        return _finalize_stay_handoff(cfg, slug, sid, meta, md_path, now,
+                                      pane, role=role)
 
     if plan == PLAN_STAY:
         # T-0945: a human attached (or pinned the pane) while a terminate
@@ -803,7 +840,7 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
                      "terminate half abandoned (compact-in-place only)", sid)
             return True
         return _maybe_compact_and_stay(cfg, slug, sid, row, meta, md_path, now,
-                                       pane, user_home)
+                                       pane, user_home, role=role)
 
     # A handoff already in flight → drive its finalize half (independent of the
     # idle window; the phase field is its own guard). `compacting` is the
@@ -822,6 +859,25 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
         # Never dies on the timeout while its drive condition holds: the
         # operator's own `drive: on` (T-0655), or a dev/TL still holding live
         # work (T-0930, widened to TL + all bindings by T-0945).
+        #
+        # T-0954: a session working ALONE in its window gets the squeeze too —
+        # «и если сессия сама работает в окне автономно, то тут тоже если грядет
+        # таймаут, ей надо слать compact». A bare "продолжай" nudge costs a full
+        # cache-write turn (T-0856 measured 33/33 misses) and does nothing about
+        # a context that has grown; when there IS something to squeeze, the
+        # handoff -> ready -> compact sequence keeps the session alive AND
+        # smaller. Below the threshold there is nothing to compact, so the nudge
+        # remains what it always was.
+        # ...but only AT the window, and only if the compact actually happens:
+        # the nudge cadence (dev 5 min, TL 40 min) is a different clock and must
+        # keep running underneath. A compact-and-stay that declines — anti-loop
+        # stamp, a composer he is typing in, nothing to hand off to — falls
+        # through to the nudge rather than silencing the tick.
+        if (idle_due(_idle_age(row, meta, user_home, now), idle_timeout_sec())
+                and _context_tokens(cfg, slug, sid) > compact_min_context_tokens(cfg)):
+            if _maybe_compact_and_stay(cfg, slug, sid, row, meta, md_path, now,
+                                       pane, user_home, role=role):
+                return True
         if (role or "") == "operator":
             return _maybe_keepalive_nudge(cfg, slug, sid, row, meta, md_path,
                                           now, pane, user_home)
@@ -835,8 +891,6 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
     idle_age = _idle_age(row, meta, user_home, now)
     deadline = uc_exit_sec() if plan == PLAN_COMPACT_EXIT else idle_timeout_sec()
     if not idle_due(idle_age, deadline):
-        return False
-    if postpone_active(meta.get("idle_postpone_until"), now):
         return False
     if tracking_long_job(cfg, slug, sid):
         # Auto-postpone: waiting on a tracked bounded job — defer (reactively, no
@@ -907,7 +961,8 @@ def _start_recycle(cfg: Any, slug: str, sid: str, row: dict, meta: dict, md_path
     NOT passed any more — T-0945 gives the operator the user-conversation
     contract, «то же самое», so its exit is resumable like the attendant's."""
     if not pane or not autocompact.composer_free(
-            autocompact._capture_pane(pane), sid=sid, now=now):
+            autocompact._capture_pane(pane), sid=sid, now=now, cfg=cfg,
+            slug=slug):
         return False
 
     # T-0470: the stall crossed the window → record the timeout lifecycle event
@@ -940,7 +995,8 @@ def _start_recycle(cfg: Any, slug: str, sid: str, row: dict, meta: dict, md_path
             # straight to the pre-exit compact phase.
             log.info("idle_timeout: no handoff destination for %s — compacting "
                      "before the resumable exit anyway (T-0945)", sid)
-            return _arm_compact_exit(sid, meta, md_path, now, pane,
+            return _arm_compact_exit(sid, meta, md_path, now, pane, cfg=cfg,
+                                     slug=slug,
                                      wrote_state=False)
         log.info("idle_timeout: no handoff destination for %s — terminating "
                  "without a compact", sid)
@@ -1032,7 +1088,8 @@ def _finalize_compact(cfg: Any, slug: str, sid: str, meta: dict, md_path, now: f
             # squeeze is what that resume loads rather than something discarded
             # a tick later — the distinction T-0863 drew when it removed the
             # unconditional /compact from here.
-            return _arm_compact_exit(sid, meta, md_path, now, pane,
+            return _arm_compact_exit(sid, meta, md_path, now, pane, cfg=cfg,
+                                     slug=slug,
                                      wrote_state=wrote_state)
         # Timed out against a busy pane. `/compact` needs the same idle,
         # composer-ready pane this finalize does, so there is no way to spend it
@@ -1047,7 +1104,8 @@ def _finalize_compact(cfg: Any, slug: str, sid: str, meta: dict, md_path, now: f
 
 
 def _arm_compact_exit(sid: str, meta: dict, md_path, now: float,
-                      pane: str | None, *, wrote_state: bool) -> bool:
+                      pane: str | None, *, wrote_state: bool,
+                      cfg: Any = None, slug: str | None = None) -> bool:
     """T-0945 PHASE 2 of a ``compact_exit``: send the native ``/compact``, then
     hand the terminate to :func:`_finalize_compact_exit` on a later tick.
 
@@ -1059,7 +1117,8 @@ def _arm_compact_exit(sid: str, meta: dict, md_path, now: float,
     derived from is stale the moment the session wrote.
     """
     if not pane or not autocompact.composer_free(
-            autocompact._capture_pane(pane), sid=sid, now=now):
+            autocompact._capture_pane(pane), sid=sid, now=now, cfg=cfg,
+            slug=slug):
         return False
     try:
         autocompact._send_compact(sid)
@@ -1231,32 +1290,153 @@ def uc_exit_sec() -> int:
     return idle_timeout_sec()
 
 
+def handoff_first_enabled() -> bool:
+    """T-0954 kill switch for «всегда handoff + ready for compact и только потом
+    compact». ``BOT_SQUAD_COMPACT_HANDOFF_FIRST=0`` restores the pre-T-0954 bare
+    ``/compact`` on the compact-and-stay paths."""
+    return os.environ.get("BOT_SQUAD_COMPACT_HANDOFF_FIRST", "1") != "0"
+
+
+def typing_warnings_enabled() -> bool:
+    """T-0954 kill switch for the mid-typing warnings.
+    ``BOT_SQUAD_TYPING_WARNINGS=0`` goes back to deferring in silence."""
+    return os.environ.get("BOT_SQUAD_TYPING_WARNINGS", "1") != "0"
+
+
+# --- T-0954: warn him instead of waiting in silence ------------------------
+
+#: How close to the cache edge the warning fires. His number: «warning: через 5
+#: минут, сессия выйдет из кеша».
+WARN_BEFORE_CACHE_SEC = 300
+
+
+def _send_typing_warning(sid: str, text: str) -> None:
+    from bot_squad_worker.actions import _action_inject_input
+    _action_inject_input({"sid": sid, "text": text})
+
+
+def cache_warning_due(idle_age: float | None, now_window: int) -> bool:
+    """True when the prompt cache is within :data:`WARN_BEFORE_CACHE_SEC` of the
+    recycle window — i.e. the point at which saying something is still useful."""
+    if idle_age is None:
+        return False
+    return idle_age >= max(0, now_window - WARN_BEFORE_CACHE_SEC)
+
+
+def _maybe_warn_while_typing(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
+                             md_path, now: float, pane: str | None,
+                             user_home: str) -> bool:
+    """T-0954: when he is mid-sentence and the deadline is coming, SAY SO.
+
+    His alternative to waiting mutely, verbatim:
+
+        «Либо же, если я пишу, он должен вставлять enter и warning: скоро
+        закончится контекст, надо запускать handoff/compact цикл или warning:
+        через 5 минут, сессия выйдет из кеша (но не на stale сессию очевидно)»
+
+    Three things this does NOT do, each because of a word in that sentence:
+
+    * it never fires at a `stale` composer — «но не на stale сессию очевидно».
+      Nobody is typing there, so there is nobody to warn; that pane gets the
+      compact instead.
+    * it never submits HIS text. The Enter belongs to the warning: the delivery
+      path (``input_mux``) puts the message ahead of his draft and puts the
+      draft back, which is the same transport his `check mail` complaint asked
+      for. Deciding it this way is recorded on T-0954.
+    * it never repeats inside one cache window — one warning is information, a
+      warning every 60s is noise he would learn to ignore.
+    """
+    from bot_squad_worker import composer_watch
+
+    if not pane or not typing_warnings_enabled():
+        return False
+    if not compact_stay_due(meta.get("composer_warned_at"), now,
+                            idle_timeout_sec()):
+        return False
+
+    # Decide whether there is anything to warn ABOUT before capturing the pane:
+    # this runs for every active session on every 60s tick, and a tmux capture
+    # per session per tick to discover "no deadline is near" is a cost with no
+    # answer attached.
+    idle_age = _idle_age(row, meta, user_home, now)
+    tokens = _context_tokens(cfg, slug, sid)
+    ceiling = compact_min_context_tokens(cfg)
+    if not (cache_warning_due(idle_age, idle_timeout_sec()) or tokens > ceiling):
+        return False
+
+    obs = composer_watch.observe(cfg, slug, sid,
+                                 autocompact._capture_pane(pane), now)
+    if obs["state"] != composer_watch.STATE_TYPING:
+        return False
+
+    if cache_warning_due(idle_age, idle_timeout_sec()):
+        left = max(0, int(idle_timeout_sec() - (idle_age or 0)) // 60)
+        text = (f"⚠ через ~{left} мин эта сессия выйдет из кеша. Допечатывай "
+                f"спокойно — как только отправишь, я запущу цикл "
+                f"handoff → compact; твой текст в поле ввода не трогаю.")
+    elif tokens > ceiling:
+        text = (f"⚠ скоро закончится контекст ({tokens} токенов) — надо "
+                f"запускать handoff/compact цикл. Допечатывай, я жду; твой "
+                f"текст в поле ввода не трогаю.")
+    else:
+        return False
+
+    try:
+        _send_typing_warning(sid, text)
+    except Exception:
+        log.exception("idle_timeout: typing warning send failed for %s", sid)
+        return False
+    meta["composer_warned_at"] = _now_iso()
+    sessions._write_session_metadata(md_path, meta, atomic=True)
+    log.info("idle_timeout: warned %s while he is typing (%s)", sid,
+             composer_watch.describe(obs))
+    return True
+
+
 # --- T-0617: compact-and-stay (exempt user sessions) ------------------------
 
 def _maybe_compact_and_stay(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
                             md_path, now: float, pane: str | None,
-                            user_home: str) -> bool:
+                            user_home: str, *, role: str | None = None) -> bool:
     """T-0617: the exempt-session counterpart to :func:`_start_recycle` /
     :func:`_finalize_compact` — same idle-window trigger and context-threshold
-    gate, but FINALIZE never terminates. Drives its own 2-phase machine on
-    ``compact_stay_phase`` so a tick that lands mid-``/compact`` just retries
-    the wait instead of re-arming."""
-    if meta.get("compact_stay_phase") == "compacting":
+    gate, but FINALIZE never terminates.
+
+    T-0954 turns it into the THREE-phase sequence the stakeholder ruled every
+    compact must follow — **handoff -> ready-for-compact -> compact**:
+
+    1. :data:`PHASE_STAY_HANDOFF` — ask the session to write its forward-state
+       where that state lives (its ticket's ``## Context``, or its role
+       artifact), exactly as :func:`_start_recycle` does for the exiting plans.
+    2. :data:`PHASE_STAY_READY` — the write landed. Stamped before the
+       ``/compact`` leaves, so a squeeze that skipped the handoff is a state the
+       md cannot be in.
+    3. ``compacting`` — the ``/compact`` is in flight;
+       :func:`_finalize_compact_stay` clears it. Never terminates.
+
+    Before T-0954 this path sent a bare ``/compact``: the session kept running
+    on a summarized transcript with nothing written down, so anything the
+    summary dropped was simply gone — «не должно происходить просто compact».
+    """
+    phase = meta.get("compact_stay_phase")
+    if phase == "compacting":
         return _finalize_compact_stay(sid, meta, md_path, now, pane)
+    if phase in (PHASE_STAY_HANDOFF, PHASE_STAY_READY):
+        return _finalize_stay_handoff(cfg, slug, sid, meta, md_path, now, pane,
+                                      role=role)
 
     idle_age = _idle_age(row, meta, user_home, now)
     if not idle_due(idle_age, idle_timeout_sec()):
         return False
     if not compact_stay_due(meta.get("compact_stay_last_at"), now, idle_timeout_sec()):
         return False  # already compacted-and-stayed once this cache window
-    if postpone_active(meta.get("idle_postpone_until"), now):
-        return False
     if tracking_long_job(cfg, slug, sid):
         log.info("idle_timeout: compact-and-stay auto-postpone %s — waiting "
                  "on a tracked long job", sid)
         return False
     if not pane or not autocompact.composer_free(
-            autocompact._capture_pane(pane), sid=sid, now=now):
+            autocompact._capture_pane(pane), sid=sid, now=now, cfg=cfg,
+            slug=slug):
         return False
 
     tokens = _context_tokens(cfg, slug, sid)
@@ -1267,6 +1447,54 @@ def _maybe_compact_and_stay(cfg: Any, slug: str, sid: str, row: dict, meta: dict
         # window, until there's actually context worth clearing.
         return False
 
+    if not handoff_first_enabled():
+        # Kill switch: the pre-T-0954 bare /compact, kept reachable ONLY here.
+        return _send_bare_compact_stay(sid, meta, md_path, tokens, threshold)
+
+    # T-0954 PHASE 1: the handoff, which is now a PRECONDITION of the squeeze.
+    target = autocompact._resolve_compact_target(cfg, slug, {
+        "sid": sid, "role": role or meta.get("role") or "",
+        "task_id": meta.get("task_id"), "window": meta.get("window"),
+    })
+    if target["kind"] == "none":
+        # No destination -> no handoff -> no compact. Deliberately NOT a bare
+        # /compact: the session stays on a summarized transcript, so whatever
+        # the summary drops is lost with nothing written down anywhere. Said
+        # once per window (the anti-loop stamp is left alone on purpose, so the
+        # moment a destination appears the normal sequence runs).
+        log.warning("idle_timeout: %s is over the context threshold (%d > %d) "
+                    "but has nowhere to hand off to — NOT compacting "
+                    "(T-0954: never a bare compact)", sid, tokens, threshold)
+        return False
+
+    try:
+        if target["kind"] == "context":
+            autocompact._inject_context_handoff(sid, target["task_id"],
+                                                relaunch=False, resume=True)
+        else:
+            autocompact._inject_handoff(sid, target["artifact_path"],
+                                        target["role"], relaunch=False,
+                                        resume=True)
+    except Exception:
+        log.exception("idle_timeout: compact-and-stay handoff inject failed "
+                      "for %s (will retry)", sid)
+        return False
+    meta["compact_stay_phase"] = PHASE_STAY_HANDOFF
+    meta["compact_stay_armed_at"] = _now_iso()
+    meta["compact_stay_mark"] = autocompact.handoff_mark(target)
+    sessions._write_session_metadata(md_path, meta, atomic=True)
+    log.info("idle_timeout: compact-and-stay asked %s to hand off into %s "
+             "(%d tokens > %d threshold) — awaiting the write, then /compact",
+             sid,
+             f"{target['task_id']} ## Context" if target["kind"] == "context"
+             else target["artifact_path"], tokens, threshold)
+    return True
+
+
+def _send_bare_compact_stay(sid: str, meta: dict, md_path, tokens: int,
+                            threshold: int) -> bool:
+    """The pre-T-0954 behaviour, reachable only via
+    :func:`handoff_first_enabled`'s kill switch: ``/compact`` with no handoff."""
     try:
         autocompact._send_compact(sid)
     except Exception:
@@ -1276,9 +1504,77 @@ def _maybe_compact_and_stay(cfg: Any, slug: str, sid: str, row: dict, meta: dict
     meta["compact_stay_phase"] = "compacting"
     meta["compact_stay_armed_at"] = _now_iso()
     sessions._write_session_metadata(md_path, meta, atomic=True)
-    log.info("idle_timeout: compact-and-stay sent /compact to %s (%d tokens "
-             "> %d threshold) — session stays, no terminate", sid, tokens,
-             threshold)
+    log.info("idle_timeout: compact-and-stay sent a BARE /compact to %s (%d > "
+             "%d) — BOT_SQUAD_COMPACT_HANDOFF_FIRST=0", sid, tokens, threshold)
+    return True
+
+
+def _finalize_stay_handoff(cfg: Any, slug: str, sid: str, meta: dict, md_path,
+                           now: float, pane: str | None, *,
+                           role: str | None = None) -> bool:
+    """T-0954 PHASES 2-3: the write landed -> ready-for-compact -> ``/compact``.
+
+    The "did it write" test is :func:`autocompact.handoff_mark` against the
+    ARM-time mark, the same one :func:`_finalize_compact` uses, so both
+    sequences agree about what a completed handoff is.
+
+    Never wedges: past :func:`autocompact.handoff_timeout_sec` the wait is
+    abandoned. Abandoned means abandoned — the compact does NOT then fire on its
+    own, because a squeeze whose handoff never happened is the exact thing this
+    ticket removed. The window's anti-loop stamp is set so the next attempt
+    starts a clean sequence rather than re-arming every tick.
+    """
+    armed_at = sessions._parse_ts_epoch(meta.get("compact_stay_armed_at")) or now
+    timed_out = (now - armed_at) > autocompact.handoff_timeout_sec()
+
+    if not pane:
+        _clear_compact_stay_state(meta)
+        sessions._write_session_metadata(md_path, meta, atomic=True)
+        return False
+
+    target = autocompact._resolve_compact_target(cfg, slug, {
+        "sid": sid, "role": role or meta.get("role") or "",
+        "task_id": meta.get("task_id"), "window": meta.get("window"),
+    })
+    mark = autocompact.handoff_mark(target)
+    wrote_state = bool(mark) and mark != meta.get("compact_stay_mark")
+    # `composer_free`, not `composer_ready`: he may have started typing between
+    # the handoff and now, and «он должен ждать, если я что-то пишу в окне»
+    # applies to the second half of the sequence exactly as much as the first.
+    # The draft-preserving transport would keep his text either way — but the
+    # rule is that we WAIT, not that we can safely interrupt him.
+    ready = autocompact.composer_free(autocompact._capture_pane(pane),
+                                      sid=sid, now=now, cfg=cfg, slug=slug)
+
+    if not (wrote_state and ready):
+        if not timed_out:
+            return False  # still writing — retry next tick
+        log.warning("idle_timeout: %s never completed its compact-and-stay "
+                    "handoff (wrote_state=%s, composer_free=%s) — abandoning "
+                    "the sequence WITHOUT compacting (T-0954)", sid,
+                    wrote_state, ready)
+        _clear_compact_stay_state(meta)
+        meta["compact_stay_last_at"] = _now_iso()
+        sessions._write_session_metadata(md_path, meta, atomic=True)
+        return True
+
+    # PHASE 2 -> the state the /compact is allowed to leave from, stamped
+    # BEFORE it is sent so the md can never show a compact with no handoff.
+    meta["compact_stay_phase"] = PHASE_STAY_READY
+    sessions._write_session_metadata(md_path, meta, atomic=True)
+    log.info("idle_timeout: %s wrote its forward-state — ready for compact", sid)
+
+    try:
+        autocompact._send_compact(sid)
+    except Exception:
+        log.exception("idle_timeout: compact-and-stay /compact send failed "
+                      "for %s (will retry)", sid)
+        return False
+    meta["compact_stay_phase"] = "compacting"
+    meta["compact_stay_armed_at"] = _now_iso()
+    sessions._write_session_metadata(md_path, meta, atomic=True)
+    log.info("idle_timeout: compact-and-stay sent /compact to %s — session "
+             "stays, no terminate", sid)
     return True
 
 
@@ -1381,14 +1677,13 @@ def _maybe_keepalive_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
         return False
     if not keepalive_due(meta.get("operator_keepalive_last_at"), now, operator_nudge_sec()):
         return False  # already nudged once this cadence window
-    if postpone_active(meta.get("idle_postpone_until"), now):
-        return False
     if tracking_long_job(cfg, slug, sid):
         log.info("idle_timeout: keepalive auto-postpone %s — waiting on a "
                  "tracked long job", sid)
         return False
     if not pane or not autocompact.composer_free(
-            autocompact._capture_pane(pane), sid=sid, now=now):
+            autocompact._capture_pane(pane), sid=sid, now=now, cfg=cfg,
+            slug=slug):
         return False
 
     try:
@@ -1457,8 +1752,6 @@ def _maybe_worker_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
         return False
     if not keepalive_due(meta.get("dev_nudge_last_at"), now, cadence):
         return False  # already nudged once this cadence window
-    if postpone_active(meta.get("idle_postpone_until"), now):
-        return False
     if tracking_long_job(cfg, slug, sid):
         # "если он не ждет build или что-то еще может его разбудить" — the
         # SAME tracked-job auto-postpone the terminate path already uses.
@@ -1466,7 +1759,8 @@ def _maybe_worker_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
                  "tracked long job", sid)
         return False
     if not pane or not autocompact.composer_free(
-            autocompact._capture_pane(pane), sid=sid, now=now):
+            autocompact._capture_pane(pane), sid=sid, now=now, cfg=cfg,
+            slug=slug):
         return False
 
     try:

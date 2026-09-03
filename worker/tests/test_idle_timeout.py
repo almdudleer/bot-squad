@@ -153,16 +153,6 @@ def test_idle_due():
     assert IT.idle_due(None, 3600) is False
 
 
-def test_postpone_active():
-    now = 1000.0
-    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 500))
-    past = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 500))
-    assert IT.postpone_active(future, now) is True
-    assert IT.postpone_active(past, now) is False
-    assert IT.postpone_active(None, now) is False
-    assert IT.postpone_active("~", now) is False
-
-
 # --- cfg + session-md harness (mirrors test_compact_handoff) ----------------
 
 def _make_cfg(tmp_path: Path, *, sid: str, window: str, task_id: str | None,
@@ -814,6 +804,8 @@ def test_hand_launched_user_session_compacts_but_never_terminates(tmp_path, seam
                cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
+    assert seams["calls"]["compact"] == []  # T-0954: the handoff comes first
+    assert _finish_stay_handoff(cfg, data, row, sid) is True
     assert seams["calls"]["compact"] == [sid]
     assert seams["calls"]["terminate"] == []
     meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
@@ -843,6 +835,8 @@ def test_hand_launched_user_session_stale_terminate_phase_never_finalized(tmp_pa
     # and the NEXT tick behaves like any other exempt session: compact in place
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
+    assert seams["calls"]["compact"] == []  # T-0954: the handoff comes first
+    assert _finish_stay_handoff(cfg, data, row, sid) is True
     assert seams["calls"]["compact"] == [sid]
     assert seams["calls"]["terminate"] == []
 
@@ -858,6 +852,8 @@ def test_recycle_exempt_marker_blocks_terminate_but_allows_compact_stay(tmp_path
                cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
+    assert seams["calls"]["compact"] == []  # T-0954: the handoff comes first
+    assert _finish_stay_handoff(cfg, data, row, sid) is True
     assert seams["calls"]["compact"] == [sid] and seams["calls"]["terminate"] == []
 
 
@@ -876,23 +872,32 @@ def test_pinned_marker_blocks_terminate_but_now_allows_compact_stay(tmp_path, se
                cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
+    assert seams["calls"]["compact"] == []  # T-0954: the handoff comes first
+    assert _finish_stay_handoff(cfg, data, row, sid) is True
     assert seams["calls"]["compact"] == [sid]
     assert seams["calls"]["terminate"] == []
 
 
-def test_pinned_dev_session_is_never_terminated(tmp_path, seams):
-    """The half of T-0926 that T-0945 keeps, on the role where it bites: a
-    pinned WORKER session (not exempt by role or window) still never rides the
-    terminate path, whatever its task says."""
-    sid = "S-almdudleer-bot-squad-demo-p5"
-    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
-                          task_status="closed", extra_md={"pinned": True})
-    row = _row(sid, cwd_repo=data.parent / "repo")
-    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
-                            user_home="/home/x") is True
-    assert seams["calls"]["terminate"] == []
-    assert seams["calls"]["ctx_handoff"] == []
-    assert seams["calls"]["compact"] == [sid]
+def _finish_stay_handoff(cfg, data, row, sid, *, slug="bot-squad",
+                         user_home="/home/x", now=None):
+    """T-0954: land the compact-and-stay handoff, then run the tick that squeezes.
+
+    The first idle-due tick ASKS for the forward-state and sends NO ``/compact``
+    («не должно происходить просто compact, должен всегда handoff + ready for
+    compact и только потом compact»). This drives the second half the way the
+    real sequence does — by making the ARM-time mark differ from the
+    destination's current one, which is how :func:`_finalize_stay_handoff`
+    decides the session wrote — and returns that tick's verdict.
+    """
+    md = data / slug / "sessions" / f"{sid}.md"
+    meta = S._read_session_metadata(md)
+    assert meta.get("compact_stay_phase") == IT.PHASE_STAY_HANDOFF, meta
+    assert meta.get("compact_stay_mark") is not None, meta
+    meta["compact_stay_mark"] = "ctx:the-state-before-the-session-wrote"
+    S._write_session_metadata(md, meta)
+    return IT.maybe_recycle(cfg, slug, row,
+                            now=time.time() if now is None else now,
+                            user_home=user_home)
 
 
 # --- A3. T-0617: compact-and-stay — arm, finalize, anti-loop ----------------
@@ -1013,6 +1018,8 @@ def test_compact_stay_rearms_once_the_window_has_elapsed(tmp_path, seams):
                cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
+    assert seams["calls"]["compact"] == []  # T-0954: the handoff comes first
+    assert _finish_stay_handoff(cfg, data, row, sid) is True
     assert seams["calls"]["compact"] == [sid]
 
 
@@ -1027,17 +1034,6 @@ def test_compact_stay_due_helper():
 
 # --- B. POSTPONE: per-window, repeatable ------------------------------------
 
-def test_postpone_skips_the_recycle(tmp_path, seams):
-    sid = "S-almdudleer-bot-squad-demo-p5"
-    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 1800))
-    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
-                          extra_md={"idle_postpone_until": future})
-    row = _row(sid, cwd_repo=data.parent / "repo")
-    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
-                            user_home="/home/x") is False
-    assert seams["calls"]["compact"] == [] and seams["calls"]["terminate"] == []
-
-
 def test_expired_postpone_lets_recycle_fire_again(tmp_path, seams):
     sid = "S-almdudleer-bot-squad-demo-p5"
     past = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 10))
@@ -1047,60 +1043,6 @@ def test_expired_postpone_lets_recycle_fire_again(tmp_path, seams):
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
     assert _fired(seams)  # due again — postpone is per-window
-
-
-def test_set_idle_postpone_default_one_window(tmp_path, monkeypatch):
-    sid = "S-almdudleer-bot-squad-demo-p5"
-    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
-    monkeypatch.setenv("BOT_SQUAD_IDLE_TIMEOUT_SEC", "3600")
-    before = time.time()
-    out = S.set_idle_postpone(cfg, "bot-squad", sid)
-    assert out["ok"] is True and out["seconds"] == 3600
-    until = S._parse_ts_epoch(out["postpone_until"])
-    assert before + 3600 - 5 <= until <= before + 3600 + 5
-    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
-    assert meta["idle_postpone_until"] == out["postpone_until"]
-
-
-def test_set_idle_postpone_custom_seconds_is_repeatable(tmp_path):
-    sid = "S-almdudleer-bot-squad-demo-p5"
-    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
-    out1 = S.set_idle_postpone(cfg, "bot-squad", sid, seconds=120, reason="long build")
-    assert out1["seconds"] == 120
-    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
-    assert meta["idle_postpone_reason"] == "long build"
-    # repeat — pushes the deadline forward again (unbounded)
-    time.sleep(0.01)
-    out2 = S.set_idle_postpone(cfg, "bot-squad", sid, seconds=300)
-    assert S._parse_ts_epoch(out2["postpone_until"]) >= S._parse_ts_epoch(out1["postpone_until"])
-
-
-def test_idle_postpone_action_dispatch(tmp_path, monkeypatch):
-    import bot_squad_worker.actions as ACT
-    sid = "S-almdudleer-bot-squad-demo-p5"
-    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
-    monkeypatch.setattr(ACT, "_get_config", lambda: cfg)
-    out = ACT.dispatch("idle_postpone", {"slug": "bot-squad", "sid": sid})
-    assert out["ok"] is True
-    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
-    assert "idle_postpone_until" in meta
-
-
-def test_idle_postpone_action_rejects_extra_and_bad_seconds(tmp_path, monkeypatch):
-    import bot_squad_worker.actions as ACT
-    sid = "S-almdudleer-bot-squad-demo-p5"
-    cfg, _ = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042")
-    monkeypatch.setattr(ACT, "_get_config", lambda: cfg)
-    with pytest.raises(ACT.ActionError, match="unexpected"):
-        ACT.dispatch("idle_postpone", {"slug": "bot-squad", "sid": sid, "bogus": 1})
-    with pytest.raises(ACT.ActionError, match="integer"):
-        ACT.dispatch("idle_postpone", {"slug": "bot-squad", "sid": sid, "seconds": "soon"})
-
-
-def test_idle_postpone_registered_with_mode():
-    from bot_squad_worker.actions import ACTION_MODES, ACTION_REGISTRY
-    assert "idle_postpone" in ACTION_REGISTRY
-    assert ACTION_MODES["idle_postpone"] == "tmux_only"
 
 
 # --- C. AUTO-POSTPONE: waiting on a tracked long bounded job -----------------
@@ -1311,9 +1253,13 @@ def test_attached_session_never_terminated_but_is_compacted_in_place(tmp_path, s
     row = _row(sid, cwd_repo=data.parent / "repo")
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
+    assert seams["calls"]["compact"] == []  # T-0954: the handoff comes first
+    assert _finish_stay_handoff(cfg, data, row, sid) is True
     assert seams["calls"]["compact"] == [sid]
     assert seams["calls"]["terminate"] == []
-    assert seams["calls"]["ctx_handoff"] == []
+    # T-0954: the stay path asks for the forward-state BEFORE it squeezes, so
+    # the ctx handoff is expected; what must never appear here is a terminate.
+    assert len(seams["calls"]["ctx_handoff"]) == 1
 
 
 def test_attaching_mid_recycle_abandons_the_terminate_half(tmp_path, seams,
@@ -1350,6 +1296,13 @@ def keepalive_seams(seams, monkeypatch):
     monkeypatch.setattr(IT, "_send_keepalive_nudge",
                         lambda sid, text: calls.append((sid, text)))
     seams["calls"]["keepalive"] = calls
+    # T-0954: a session at the window WITH context worth squeezing now gets the
+    # handoff -> ready -> compact sequence instead of a bare "продолжай" nudge
+    # («и если сессия сама работает в окне автономно … ей надо слать compact»).
+    # These tests are about the nudge CADENCE, so they sit below the threshold
+    # where there is nothing to squeeze; the interaction itself is pinned in
+    # test_t0954_composer_watch.py.
+    seams["state"]["tokens"] = 5_000
     return seams
 
 
@@ -1433,17 +1386,6 @@ def test_drive_on_operator_nudge_rearms_after_window_elapses(tmp_path, keepalive
     assert len(keepalive_seams["calls"]["keepalive"]) == 1
 
 
-def test_drive_on_operator_postpone_active_skips_nudge(tmp_path, keepalive_seams):
-    sid = "S-almdudleer-bot-squad-operator-p1"
-    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 1800))
-    cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None,
-                          extra_md={"idle_postpone_until": future})
-    row = _operator_row(sid, cwd_repo=data.parent / "repo")
-    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
-                            user_home="/home/x") is False
-    assert keepalive_seams["calls"]["keepalive"] == []
-
-
 def test_drive_on_operator_tracked_job_skips_nudge(tmp_path, keepalive_seams):
     sid = "S-almdudleer-bot-squad-operator-p1"
     cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None)
@@ -1501,6 +1443,13 @@ def dev_nudge_seams(seams, monkeypatch):
     monkeypatch.setattr(IT, "_send_dev_nudge",
                         lambda sid, text: calls.append((sid, text)))
     seams["calls"]["dev_nudge"] = calls
+    # T-0954: a session at the window WITH context worth squeezing now gets the
+    # handoff -> ready -> compact sequence instead of a bare "продолжай" nudge
+    # («и если сессия сама работает в окне автономно … ей надо слать compact»).
+    # These tests are about the nudge CADENCE, so they sit below the threshold
+    # where there is nothing to squeeze; the interaction itself is pinned in
+    # test_t0954_composer_watch.py.
+    seams["state"]["tokens"] = 5_000
     return seams
 
 
@@ -1628,18 +1577,6 @@ def test_dev_nudge_tracked_job_skips_nudge(tmp_path, dev_nudge_seams):
     assert dev_nudge_seams["calls"]["dev_nudge"] == []
 
 
-def test_dev_nudge_postpone_active_skips_nudge(tmp_path, dev_nudge_seams):
-    sid = "S-almdudleer-bot-squad-demo-p5"
-    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 1800))
-    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
-                          task_status="open",
-                          extra_md={"idle_postpone_until": future})
-    row = _row(sid, cwd_repo=data.parent / "repo")
-    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
-                            user_home="/home/x") is False
-    assert dev_nudge_seams["calls"]["dev_nudge"] == []
-
-
 def test_dev_nudge_waits_for_composer_ready(tmp_path, dev_nudge_seams):
     sid = "S-almdudleer-bot-squad-demo-p5"
     cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
@@ -1677,6 +1614,9 @@ def test_drive_off_operator_falls_through_to_normal_recycle(tmp_path, keepalive_
     """Once the operator itself sets drive=off, the normal terminate-and-
     remember machinery applies — but WITHOUT the resumable/resume_hint bait
     (self-terminate, per the stakeholder's explicit preference)."""
+    # this one IS about the over-threshold exit path, so put the context
+    # back above the compact threshold the nudge fixtures lowered.
+    keepalive_seams["state"]["tokens"] = 25_000
     sid = "S-almdudleer-bot-squad-operator-p1"
     cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None,
                           extra_md={"drive": "off"})
@@ -1786,7 +1726,10 @@ def test_attached_check_failure_never_terminates(tmp_path, seams, monkeypatch):
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
     assert seams["calls"]["terminate"] == []
-    assert seams["calls"]["ctx_handoff"] == []
+    # T-0954: the stay path now hands off BEFORE it squeezes, so a handoff ask
+    # is expected here — what must never appear is a terminate.
+    assert seams["calls"]["compact"] == []
+    assert _finish_stay_handoff(cfg, data, row, sid) is True
     assert seams["calls"]["compact"] == [sid]
 
 
@@ -1879,6 +1822,8 @@ def test_uc_exit_disabled_by_env_restores_never_terminate(tmp_path, seams,
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
     assert seams["calls"]["terminate"] == []
+    assert seams["calls"]["compact"] == []  # T-0954: the handoff comes first
+    assert _finish_stay_handoff(cfg, data, row, sid) is True
     assert seams["calls"]["compact"] == [sid]
 
 
@@ -1901,6 +1846,8 @@ def test_uc_attached_is_compacted_in_place_never_exited(tmp_path, seams,
     sid, cfg, data, row = _uc_cfg(tmp_path, seams, idle_age=IT.uc_exit_sec() + 60)
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
+    assert seams["calls"]["compact"] == []  # T-0954: the handoff comes first
+    assert _finish_stay_handoff(cfg, data, row, sid) is True
     assert seams["calls"]["compact"] == [sid]
     assert seams["calls"]["terminate"] == []
 
@@ -1916,6 +1863,8 @@ def test_uc_exit_scoped_to_the_role_not_all_exempt_sessions(tmp_path, seams):
     assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
                             user_home="/home/x") is True
     assert seams["calls"]["terminate"] == []
+    assert seams["calls"]["compact"] == []  # T-0954: the handoff comes first
+    assert _finish_stay_handoff(cfg, data, row, sid) is True
     assert seams["calls"]["compact"] == [sid]
 
 
@@ -1942,7 +1891,6 @@ def test_recycle_plan_table():
     """Every row of the module docstring's table, in order."""
     # the human's own panes — compact in place, never exit
     assert _plan("dev", attached=True) == IT.PLAN_STAY
-    assert _plan("dev", meta={"pinned": True}) == IT.PLAN_STAY
     assert _plan("dev", window="user-session") == IT.PLAN_STAY
     assert _plan("dev", meta={"recycle_exempt": True}) == IT.PLAN_STAY
     # the two roles whose continuation is certain
@@ -1971,7 +1919,7 @@ def test_recycle_plan_only_compact_exit_ever_spends_a_compact():
     assert _plan("teamlead") == IT.PLAN_HANDOFF_EXIT
 
 
-def test_recycle_plan_pin_and_attach_beat_every_role():
+def test_recycle_plan_attach_beats_every_role():
     """Precedence, and the negative control that proves it is precedence and
     not an accident of which roles were tested: the SAME inputs that would
     otherwise exit produce STAY once a human is there."""
@@ -1981,7 +1929,24 @@ def test_recycle_plan_pin_and_attach_beat_every_role():
                        ("teamlead", {})):
         assert _plan(role, meta=meta) != IT.PLAN_STAY, role      # control
         assert _plan(role, meta=meta, attached=True) == IT.PLAN_STAY, role
-        assert _plan(role, meta={**meta, "pinned": True}) == IT.PLAN_STAY, role
+
+
+def test_a_pinned_marker_no_longer_does_anything(tmp_path):
+    """T-0954 removed the pin — «ту тему с пинами/manual handling сессий … надо
+    убрать, это была ошибка». A leftover ``pinned: true`` on some session md must
+    be INERT, not quietly still steering the plan; and re-introducing the
+    predicate is what this test is here to catch.
+
+    The attach row above is what still protects a pane a human is using — that
+    is the half he kept («не хочу … чтобы сессия исчезала у меня из-под носа»),
+    and it is measured, not declared.
+    """
+    from bot_squad_worker import recycle_gate
+
+    assert not hasattr(recycle_gate, "session_pinned")
+    for role, meta in (("dev", {}), ("teamlead", {}),
+                       ("user-conversation", {}), ("operator", {"drive": "off"})):
+        assert _plan(role, meta={**meta, "pinned": True}) == _plan(role, meta=meta)
 
 
 def test_recycle_plan_uc_kill_switch_downgrades_to_stay(monkeypatch):
@@ -2075,6 +2040,9 @@ def test_dev_with_every_binding_done_still_hands_off_and_exits(
         tmp_path, dev_nudge_seams):
     """Control for the test above — the bundle only keeps it alive while a
     bundled ticket IS alive."""
+    # this one IS about the over-threshold exit path, so put the context
+    # back above the compact threshold the nudge fixtures lowered.
+    dev_nudge_seams["state"]["tokens"] = 25_000
     sid = "S-almdudleer-bot-squad-demo-p5"
     cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
                           task_status="totest",
@@ -2108,6 +2076,9 @@ def test_teamlead_with_a_live_task_is_nudged_not_recycled(tmp_path, dev_nudge_se
 
 
 def test_teamlead_with_nothing_open_hands_off_and_exits(tmp_path, dev_nudge_seams):
+    # this one IS about the over-threshold exit path, so put the context
+    # back above the compact threshold the nudge fixtures lowered.
+    dev_nudge_seams["state"]["tokens"] = 25_000
     sid = "S-almdudleer-bot-squad-tl-p7"
     cfg, data = _make_cfg(tmp_path, sid=sid, window="tl", task_id="T-0042",
                           task_status="closed")

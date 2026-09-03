@@ -1339,20 +1339,30 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
     # triggers can never double-compact the same session. Worker sessions
     # (dev/TL/operator) are not exempt and fall through to the unchanged flow
     # below.
+    # A handoff already in flight → drive its finalize half (independent of the
+    # cooldown; the phase dict is its own guard). This is checked BEFORE the
+    # exempt routing below, because whoever armed a sequence must be able to
+    # finish it: an arm made while a session was NOT exempt (a role morph, an
+    # md rewrite, a different code version) otherwise strands forever, since the
+    # exempt branch returns to a state machine that keeps its state elsewhere.
+    #
+    # Measured 2026-09-03 (T-0954): a user-conversation session was armed at
+    # 12:18:07, wrote its 8382-byte checkpoint at 12:19:45 and said HANDOFF
+    # WRITTEN — and no /compact ever followed, because every later tick took the
+    # exempt branch above this line and nothing looked at `phase: writing`
+    # again. The stakeholder saw it as «сказал готов к компакту, но сам себе в
+    # голову не выстрелил».
+    fired = rec.get("alert_fired_at") or {}
+    rec["alert_fired_at"] = fired
+    compact = rec.get("compact") or {}
+    if compact.get("phase") == "writing":
+        return _maybe_finalize(cfg, slug, rec, compact, now)
+
     if recycle_gate.user_session_exempt(role=role, window=window, meta=meta):
         if md_path is None:
             return False
         return _maybe_compact_stay_ceiling(sid, meta, md_path, level, now, pane,
                                            cfg=cfg, slug=slug, rec=rec)
-
-    fired = rec.get("alert_fired_at") or {}
-    rec["alert_fired_at"] = fired
-
-    # A handoff already in flight → drive its finalize half (independent of the
-    # cooldown; the phase dict is its own guard).
-    compact = rec.get("compact") or {}
-    if compact.get("phase") == "writing":
-        return _maybe_finalize(cfg, slug, rec, compact, now)
 
     # Otherwise decide whether to START a compact this tick.
     if not (compact_due(level, fired, now) and compact_safe(rec.get("activity", ""))):

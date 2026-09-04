@@ -192,3 +192,72 @@ def test_the_swap_still_protects_his_text_when_the_probe_says_so(monkeypatch):
     plain = _real_pane("привет это настоящий текст")
     assert input_mux._live_draft(lambda _p: plain, "%513") \
         == "привет это настоящий текст"
+
+
+# --- the recycle gate: a ghost is not "he is typing" ------------------------
+#
+# The observer recorded live operator pane %513 as `kind: typing, text:
+# "check mail"` while nobody was at the keyboard. T-0954's staleness escape
+# cannot rescue that: the ghost is the LAST MESSAGE DELIVERED, so every piece
+# of peer mail refreshes it and restarts the ten-minute clock. A session that
+# receives mail therefore never goes stale and never compacts or suspends.
+
+def _ghost_probe(verdict):
+    def _probe(_pane_id, *_a, **_kw):
+        return verdict
+    return _probe
+
+
+def test_a_ghost_does_not_hold_the_recycle_gate_shut(monkeypatch):
+    from bot_squad_worker import autocompact as A, input_mux
+    monkeypatch.setattr(input_mux, "_composer_is_ghost", _ghost_probe(True),
+                        raising=False)
+    assert A.composer_free(_real_pane("check mail"), sid="S-x", now=1000.0,
+                           pane_id="%513") is True
+
+
+def test_his_real_text_still_holds_it_shut(monkeypatch):
+    """T-0930, verbatim: «только не надо ее компактить, когда у меня текст во
+    вводе». This is the control that must never break — the probe may only
+    open the gate on positive evidence that the line is entirely faint."""
+    from bot_squad_worker import autocompact as A, input_mux
+    monkeypatch.setattr(input_mux, "_composer_is_ghost", _ghost_probe(None),
+                        raising=False)
+    assert A.composer_free(_real_pane("я ещё пишу это предложение"),
+                           sid="S-x", now=1000.0, pane_id="%513") is False
+
+
+def test_a_caller_that_cannot_supply_a_pane_keeps_the_old_behaviour(
+        monkeypatch):
+    from bot_squad_worker import autocompact as A, input_mux
+
+    def _never_called(*_a, **_kw):
+        raise AssertionError("the probe must not run without a pane")
+    monkeypatch.setattr(input_mux, "_composer_is_ghost", _never_called,
+                        raising=False)
+    assert A.composer_free(_real_pane("текст"), sid="S-x", now=1000.0) is False
+
+
+def test_every_recycle_gate_passes_its_pane():
+    """The fix is worthless at the sites that forget the argument, and a
+    grep-by-eye does not stay true. Assert it over the source instead."""
+    import inspect
+    import re as _re
+    from bot_squad_worker import autocompact, budding, graceful_exit
+    from bot_squad_worker import idle_timeout
+    calls = misses = 0
+    for mod in (autocompact, idle_timeout, graceful_exit, budding):
+        src = inspect.getsource(mod)
+        for m in _re.finditer(r"composer_free\(", src):
+            depth, i = 1, m.end()
+            while depth and i < len(src):
+                depth += (src[i] == "(") - (src[i] == ")")
+                i += 1
+            args = src[m.end():i]
+            if src[max(0, m.start() - 4):m.start()] == "def ":
+                continue        # the definition, not a call
+            calls += 1
+            if "pane_id=" not in args:
+                misses += 1
+    assert calls >= 12, f"only found {calls} call sites — did the shape change?"
+    assert misses == 0, f"{misses} composer_free call site(s) pass no pane_id"

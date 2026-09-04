@@ -980,7 +980,7 @@ def _start_recycle(cfg: Any, slug: str, sid: str, row: dict, meta: dict, md_path
     contract, «то же самое», so its exit is resumable like the attendant's."""
     if not pane or not autocompact.composer_free(
             autocompact._capture_pane(pane), sid=sid, now=now, cfg=cfg,
-            slug=slug):
+            slug=slug, pane_id=pane):
         return False
 
     # T-0470: the stall crossed the window → record the timeout lifecycle event
@@ -1136,7 +1136,7 @@ def _arm_compact_exit(sid: str, meta: dict, md_path, now: float,
     """
     if not pane or not autocompact.composer_free(
             autocompact._capture_pane(pane), sid=sid, now=now, cfg=cfg,
-            slug=slug):
+            slug=slug, pane_id=pane):
         return False
     try:
         autocompact._send_compact(sid)
@@ -1475,7 +1475,7 @@ def _maybe_compact_and_stay(cfg: Any, slug: str, sid: str, row: dict, meta: dict
         return False
     if not pane or not autocompact.composer_free(
             autocompact._capture_pane(pane), sid=sid, now=now, cfg=cfg,
-            slug=slug):
+            slug=slug, pane_id=pane):
         return False
 
     tokens = _context_tokens(cfg, slug, sid)
@@ -1583,7 +1583,8 @@ def _finalize_stay_handoff(cfg: Any, slug: str, sid: str, meta: dict, md_path,
     # The draft-preserving transport would keep his text either way — but the
     # rule is that we WAIT, not that we can safely interrupt him.
     ready = autocompact.composer_free(autocompact._capture_pane(pane),
-                                      sid=sid, now=now, cfg=cfg, slug=slug)
+                                      sid=sid, now=now, cfg=cfg, slug=slug,
+                                      pane_id=pane)
 
     if not (wrote_state and ready):
         if not timed_out:
@@ -1722,7 +1723,7 @@ def _maybe_keepalive_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
         return False
     if not pane or not autocompact.composer_free(
             autocompact._capture_pane(pane), sid=sid, now=now, cfg=cfg,
-            slug=slug):
+            slug=slug, pane_id=pane):
         return False
 
     try:
@@ -1799,7 +1800,7 @@ def _maybe_worker_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
         return False
     if not pane or not autocompact.composer_free(
             autocompact._capture_pane(pane), sid=sid, now=now, cfg=cfg,
-            slug=slug):
+            slug=slug, pane_id=pane):
         return False
 
     try:

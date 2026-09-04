@@ -1346,7 +1346,7 @@ def _maybe_warn_while_typing(cfg: Any, slug: str, sid: str, row: dict, meta: dic
     * it never repeats inside one cache window — one warning is information, a
       warning every 60s is noise he would learn to ignore.
     """
-    from bot_squad_worker import composer_watch
+    from bot_squad_worker import composer_watch, telemetry
 
     if not pane or not typing_warnings_enabled():
         return False
@@ -1360,8 +1360,16 @@ def _maybe_warn_while_typing(cfg: Any, slug: str, sid: str, row: dict, meta: dic
     # answer attached.
     idle_age = _idle_age(row, meta, user_home, now)
     tokens = _context_tokens(cfg, slug, sid)
-    ceiling = compact_min_context_tokens(cfg)
-    if not (cache_warning_due(idle_age, idle_timeout_sec()) or tokens > ceiling):
+    # T-0961: this is the WARN LINE (0.8 x the 600k context ceiling), not
+    # `compact_min_context_tokens` — that 20 000 is a FLOOR ("is there enough
+    # here to be worth compacting?") used by the recycle gates below, and a
+    # working session is above it within a couple of turns of every compact.
+    # Comparing against it made this warning fire permanently: measured
+    # seventeen consecutive live firings between 10.4% and 22.3% of the
+    # ceiling, each one landing immediately after a /compact, so the message's
+    # own instruction could never quiet it.
+    warn_at = telemetry.context_warn()
+    if not (cache_warning_due(idle_age, idle_timeout_sec()) or tokens >= warn_at):
         return False
 
     obs = composer_watch.observe(cfg, slug, sid,
@@ -1382,7 +1390,7 @@ def _maybe_warn_while_typing(cfg: Any, slug: str, sid: str, row: dict, meta: dic
         text = (f"⚠ через ~{left} мин эта сессия выйдет из кеша. Допечатывай "
                 f"спокойно — как только отправишь, я запущу цикл "
                 f"handoff → compact; твой текст в поле ввода не трогаю.")
-    elif tokens > ceiling:
+    elif tokens >= warn_at:
         text = (f"⚠ скоро закончится контекст ({tokens} токенов) — надо "
                 f"запускать handoff/compact цикл. Допечатывай, я жду; твой "
                 f"текст в поле ввода не трогаю.")

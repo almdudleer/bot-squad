@@ -3623,6 +3623,19 @@ def cmd_assignment_write_result(args) -> None:
           f"({res.get('bytes_written')} bytes, kind {res.get('kind')})")
 
 
+_MORPH_ROLE_ALIASES = {
+    "dev": "dev",
+    "tl": "teamlead", "teamlead": "teamlead", "team-lead": "teamlead",
+    "op": "operator", "operator": "operator",
+    # T-0932: the DE-differentiation direction — narrow back down to the
+    # conversation after handing your work to a bud («отделение себя в
+    # юзер-сессию»). Sheds the task binding worker-side.
+    "uc": "user-conversation", "user": "user-conversation",
+    "user-conversation": "user-conversation",
+    "user_conversation": "user-conversation",
+}
+
+
 def _normalize_morph_role(raw: str) -> str:
     role = _MORPH_ROLE_ALIASES.get((raw or "").strip().lower())
     if role is None:

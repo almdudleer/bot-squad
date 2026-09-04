@@ -355,6 +355,17 @@ _UUID_RE = re.compile(
 )
 
 
+def _proc_cmdline(pid: int) -> list[str]:
+    """A process's argv, or [] when it is gone. The seam the /proc walks share
+    (and the one their tests drive, so a cmdline shape can be pinned without a
+    live process)."""
+    try:
+        cmd = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return []
+    return cmd.split("\x00")
+
+
 def _pane_claude_uuid_from_proc(
     pane_pid: str, user_home: str, children: dict[int, list[int]] | None = None,
 ) -> str | None:
@@ -403,11 +414,7 @@ def _pane_claude_uuid_from_proc(
         if pid in seen:
             continue
         seen.add(pid)
-        try:
-            cmd = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace")
-        except OSError:
-            cmd = ""
-        parts = cmd.split("\x00")
+        parts = _proc_cmdline(pid)
         if parts and any(p.endswith("claude") or p == "claude" for p in parts[:1]):
             for i, tok in enumerate(parts):
                 if tok in ("--resume", "--session-id") and i + 1 < len(parts):
@@ -416,6 +423,53 @@ def _pane_claude_uuid_from_proc(
                         return candidate
         queue.extend(children.get(pid, []))
     return None
+
+
+def _proc_uuid_is_resume_only(
+    pane_pid: str, uuid: str, children: dict[int, list[int]] | None = None,
+) -> bool:
+    """T-0960: True when ``uuid`` reached us as ``--resume``, never ``--session-id``.
+
+    The two flags are NOT interchangeable, and :func:`_pane_claude_uuid_from_proc`
+    treats them as one. ``--session-id <uuid>`` FORCES the uuid, so the pane
+    really does write that transcript. ``--resume <uuid>`` names the ANCESTOR
+    the session was resumed FROM — Claude Code then forks a NEW transcript under
+    a NEW uuid. Measured live: the operator pane carried ``--resume 29018a66…``
+    while writing ``0c671a5d….jsonl``, so telemetry tailed a file nobody had
+    touched in 97h, ``offset == size`` every tick, and the context reading froze
+    at 410082 forever — over-reporting here, but under-reporting is the
+    dangerous direction (a resumed session whose ancestor was small would never
+    auto-compact).
+
+    Walks the SAME prebuilt children map as the uuid walk, so this costs a
+    handful of ``/proc/<pid>/cmdline`` reads, not the O(panes x host-processes)
+    rescan T-0668 removed. The caller gates it on a uuid MISMATCH, which is rare.
+    """
+    try:
+        target = int(pane_pid)
+    except (ValueError, TypeError):
+        return False
+    if children is None:
+        children = _proc_children_map()
+    queue: list[int] = [target]
+    seen: set[int] = set()
+    saw_resume = False
+    while queue:
+        pid = queue.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        parts = _proc_cmdline(pid)
+        if parts and any(p.endswith("claude") or p == "claude" for p in parts[:1]):
+            for i, tok in enumerate(parts):
+                if tok in ("--resume", "--session-id") and i + 1 < len(parts):
+                    if parts[i + 1].strip() != uuid:
+                        continue
+                    if tok == "--session-id":
+                        return False      # forced: authoritative, keep it
+                    saw_resume = True
+        queue.extend(children.get(pid, []))
+    return saw_resume
 
 
 def _pane_agent_session_id_from_proc(
@@ -1180,6 +1234,23 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
         if proc_uuid is None and existing is not None:
             recorded_uuid = existing.get("claude_uuid")
             if recorded_uuid and recorded_uuid != "~":
+                claude_uuid = recorded_uuid
+
+        # T-0960: the /proc walk DID resolve, but a `--resume` uuid names the
+        # transcript this session was forked FROM, not the one it writes. The
+        # md's uuid is recorded per-session by the SessionStart hook, so when
+        # the two disagree AND the proc one is resume-only, the md wins. A
+        # `--session-id` pane is untouched (that flag forces the uuid), and so
+        # is the normal case where the two agree — the probe never runs there.
+        elif proc_uuid is not None and existing is not None:
+            recorded_uuid = existing.get("claude_uuid")
+            if (recorded_uuid and recorded_uuid != "~"
+                    and recorded_uuid != proc_uuid
+                    and _proc_uuid_is_resume_only(
+                        pane.pid, proc_uuid, proc_children)):
+                log.info(
+                    "sessions: %s carries --resume %s but its md records %s "
+                    "— using the md (T-0960)", sid, proc_uuid, recorded_uuid)
                 claude_uuid = recorded_uuid
 
         # T-0176 #4: a claude `/rename` changes the live tmux window name; sync

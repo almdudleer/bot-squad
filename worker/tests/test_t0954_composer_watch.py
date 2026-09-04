@@ -782,3 +782,98 @@ def test_a_wrapped_draft_is_never_swapped(tmp_path, monkeypatch):
     input_mux.deliver_direct(tmp_path, "S-x", "%1", "check mail",
                              capture=lambda pane: _pane("short"))
     assert ("C-u",) not in keys
+
+
+# --- G. T-0961: the warn line is 0.8 x the ceiling, not the compact floor ---
+
+def test_the_context_warning_does_not_fire_at_a_tenth_of_the_ceiling(
+        tmp_path, seams, monkeypatch):
+    """T-0961, with the number he was actually shown.
+
+    The pre-fix gate compared the reading against ``compact_min_context_tokens``
+    (20 000) — a FLOOR meaning "is there enough here to be worth compacting?" —
+    while calling the local variable ``ceiling``. A working session is back over
+    that floor a couple of turns after every compact, so the warning fired
+    permanently: seventeen consecutive live firings, 10.4%-22.3% of the ceiling,
+    each one landing immediately after a ``/compact``, which is why the
+    message's own instruction could never quiet it.
+
+    The old negative control passed 5 000 tokens — below the floor — so it could
+    not tell "warns above 20k" from "warns above 480k" and stayed green through
+    all seventeen.
+    """
+    sent: list[tuple] = []
+    monkeypatch.setattr(IT, "_send_typing_warning",
+                        lambda sid, text: sent.append((sid, text)))
+    sid = "S-almdudleer-user-session-p8"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None)
+    row = _row(sid, window="user-session", task_id=None,
+               cwd_repo=data.parent / "repo")
+    seams["state"]["buf"] = _pane("он печатает, контекста полно")
+    seams["state"]["idle_age"] = 60.0            # cache edge nowhere near
+    seams["state"]["tokens"] = 68_882            # 11.5% of 600k — a real reading
+
+    t0 = time.time()
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=t0,
+                            user_home="/home/x") is False
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=t0 + 60,
+                            user_home="/home/x") is False
+    assert sent == []
+
+
+def test_the_context_warning_does_fire_at_the_warn_line(tmp_path, seams,
+                                                        monkeypatch):
+    """The positive half, so the test above cannot pass by warning never."""
+    from bot_squad_worker import telemetry as TEL
+
+    sent: list[tuple] = []
+    monkeypatch.setattr(IT, "_send_typing_warning",
+                        lambda sid, text: sent.append((sid, text)))
+    sid = "S-almdudleer-user-session-p8"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None)
+    row = _row(sid, window="user-session", task_id=None,
+               cwd_repo=data.parent / "repo")
+    seams["state"]["buf"] = _pane("он печатает, а контекст правда кончается")
+    seams["state"]["idle_age"] = 60.0
+    seams["state"]["tokens"] = TEL.context_warn()
+
+    t0 = time.time()
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=t0,
+                            user_home="/home/x") is False   # first sighting
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=t0 + 60,
+                            user_home="/home/x") is True
+    assert len(sent) == 1
+    assert "скоро закончится контекст" in sent[0][1]
+
+
+def test_the_warn_line_boundary_is_a_table(tmp_path, seams, monkeypatch):
+    """One token below the line is silence; the line itself speaks."""
+    from bot_squad_worker import telemetry as TEL
+
+    for tokens, expected in ((TEL.context_warn() - 1, 0), (TEL.context_warn(), 1)):
+        sent: list[tuple] = []
+        monkeypatch.setattr(IT, "_send_typing_warning",
+                            lambda sid, text: sent.append((sid, text)))
+        sid = "S-almdudleer-user-session-p8"
+        sub = tmp_path / f"b{tokens}"
+        sub.mkdir(parents=True, exist_ok=True)
+        cfg, data = _make_cfg(sub, sid=sid, window="user-session", task_id=None)
+        row = _row(sid, window="user-session", task_id=None,
+                   cwd_repo=data.parent / "repo")
+        seams["state"]["buf"] = _pane(f"печатает на {tokens}")
+        seams["state"]["idle_age"] = 60.0
+        seams["state"]["tokens"] = tokens
+        t0 = time.time()
+        IT.maybe_recycle(cfg, "bot-squad", row, now=t0, user_home="/home/x")
+        IT.maybe_recycle(cfg, "bot-squad", row, now=t0 + 60, user_home="/home/x")
+        assert len(sent) == expected, (tokens, sent)
+
+
+def test_the_warn_line_is_not_the_compact_floor(tmp_path):
+    """The two constants this ticket confused, pinned apart."""
+    from bot_squad_worker import telemetry as TEL
+
+    cfg, _ = _make_cfg(tmp_path, sid="S-x", window="w", task_id=None)
+    assert TEL.context_warn() == int(TEL.context_ceiling() * TEL.CONTEXT_WARN_RATIO)
+    assert IT.compact_min_context_tokens(cfg) == 20_000
+    assert TEL.context_warn() > IT.compact_min_context_tokens(cfg)

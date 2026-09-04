@@ -102,3 +102,93 @@ def test_the_ascii_separator_is_still_accepted():
 ])
 def test_the_padding_boundary_is_a_table(body, expected):
     assert CW.composer_text(_real_pane(body)) == expected
+
+
+# --- the ghost: Claude Code marks what is NOT his with SGR 2 (faint) --------
+#
+# Every line below is transcribed from `tmux capture-pane -p -e` — the live
+# operator pane %513 and uc pane %514 on 2026-09-04, and an isolated throwaway
+# Claude Code session brought up on its own tmux server for the two controls.
+# Typing one character replaces the whole ghost, so real and faint never mix.
+
+GHOST_LAST_MESSAGE = "\x1b[39m❯\xa0\x1b[2mcheck mail\x1b[0m"
+GHOST_LONGER = ("\x1b[39m❯\xa0\x1b[2mresume checking mail on the "
+                "trigger too\x1b[0m")
+GHOST_PLACEHOLDER = '\x1b[39m❯\xa0\x1b[2mTry "how do I log an error?"\x1b[0m'
+HIS_REAL_TEXT = "\x1b[39m❯\xa0привет это настоящий текст"
+HIS_ONE_CHAR = "\x1b[39m❯\xa0п"
+EMPTY_BOX = "\x1b[38;5;241m❯\xa0\x1b[39m"
+
+
+def _ansi_pane(rune_line: str) -> str:
+    return ("● did some work\n"
+            "────────────────────────────\n"
+            f"{rune_line}\n"
+            "────────────────────────────\n")
+
+
+@pytest.mark.parametrize("line", [GHOST_LAST_MESSAGE, GHOST_LONGER,
+                                  GHOST_PLACEHOLDER])
+def test_a_faint_composer_is_an_empty_box(line):
+    from bot_squad_worker import input_mux
+    assert input_mux._composer_is_ghost(
+        "%513", lambda _p: _ansi_pane(line)) is True
+
+
+@pytest.mark.parametrize("line", [HIS_REAL_TEXT, HIS_ONE_CHAR])
+def test_his_own_typing_carries_no_faint_and_is_never_called_a_ghost(line):
+    """The control that matters: this probe may only ever downgrade "there is
+    a draft" to "empty". Saying ghost about HIS text would erase it."""
+    from bot_squad_worker import input_mux
+    assert input_mux._composer_is_ghost(
+        "%513", lambda _p: _ansi_pane(line)) is not True
+
+
+def test_an_unanswerable_probe_returns_none_and_changes_nothing():
+    from bot_squad_worker import input_mux
+    assert input_mux._composer_is_ghost("%513", lambda _p: "") is None
+    assert input_mux._composer_is_ghost("%513", lambda _p: "no rune") is None
+    # No faint anywhere: nothing to conclude, keep the old behaviour.
+    assert input_mux._composer_is_ghost(
+        "%513", lambda _p: _ansi_pane(EMPTY_BOX)) is None
+
+    def _boom(_p):
+        raise OSError("tmux went away")
+    assert input_mux._composer_is_ghost("%513", _boom) is None
+
+
+def test_unfainted_splits_the_line_the_way_the_renderer_meant_it():
+    from bot_squad_worker import input_mux
+    assert input_mux._unfainted("\xa0\x1b[2mcheck mail\x1b[0m") \
+        == ("\xa0", True)
+    assert input_mux._unfainted("\xa0привет") == ("\xa0привет", False)
+    # A faint run that ENDS still leaves his tail visible.
+    assert input_mux._unfainted("\xa0\x1b[2mdim\x1b[22m tail") \
+        == ("\xa0 tail", True)
+
+
+def test_the_swap_does_not_protect_a_ghost(monkeypatch):
+    """End to end for his p0: «написано check mail, и не отправлено».
+
+    The old path read the ghost as a draft, saved it, and RESTORED it by typing
+    it — turning a dim hint into real unsent text that then blocked the pane.
+    """
+    from bot_squad_worker import input_mux
+    # raising=False on purpose: this is the one BEHAVIOURAL red control. Against
+    # the old module the attribute simply does not exist, and the assertion
+    # below then fails on the VALUE — `_live_draft` hands back "check mail",
+    # the ghost, as though he had typed it — rather than on a missing symbol.
+    monkeypatch.setattr(input_mux, "_capture_pane_ansi",
+                        lambda _p: _ansi_pane(GHOST_LAST_MESSAGE),
+                        raising=False)
+    plain = _real_pane("check mail")
+    assert input_mux._live_draft(lambda _p: plain, "%513") == ""
+
+
+def test_the_swap_still_protects_his_text_when_the_probe_says_so(monkeypatch):
+    from bot_squad_worker import input_mux
+    monkeypatch.setattr(input_mux, "_capture_pane_ansi",
+                        lambda _p: _ansi_pane(HIS_REAL_TEXT))
+    plain = _real_pane("привет это настоящий текст")
+    assert input_mux._live_draft(lambda _p: plain, "%513") \
+        == "привет это настоящий текст"

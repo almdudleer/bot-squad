@@ -226,20 +226,22 @@ def test_missing_substrate_gets_a_banner_and_a_trailer(tmp_path):
     assert "2 failure(s) in this run are THE ENVIRONMENT" in out, out
     # ...and it must not let the unlisted remainder read as vindicated either.
     #
-    # THE MEASURED EPISODE, in the order it actually went, because an earlier
-    # version of this comment froze the middle of it and read as settled:
-    #   api image, whole file  -> 6 failed; this module claimed 5, refused the 6th
-    #   complete worker venv   -> that 6th PASSES
-    #   whole file, post-fix   -> 5 failed; the 6th is GONE
-    # The 6th was a REAL defect (T-1007's stale stimulus, fixed in 5541413) that
-    # only the api image exposed. So "unattributed" is neither "proven real" nor
-    # "proven environmental", and it must cut BOTH ways: an earlier banner said
-    # only "reproduce it on a complete substrate before filing it", which on this
-    # very case would have talked a reader out of a genuine bug.
+    # THE MEASURED EPISODE. It fooled two published conclusions before it was
+    # settled, so the banner must carry all THREE readings, not two:
+    #   api image, whole file   -> 6 failed; 5 attributed, the 6th refused
+    #   complete venv, +33 min  -> that 6th PASSES   (published: "image artefact" — WRONG)
+    #   after the peer's commit -> the 6th is GONE   (published: "real, only that
+    #                                                 substrate exposed" — ALSO WRONG)
+    #   what it was             -> the shared clone SAMPLED MID-EDIT: a peer had
+    #                              changed the reader to match on TYPE and had not
+    #                              yet updated the test raising the old string.
+    # Neither run was about the substrate, and they did not bracket the commit —
+    # a commit log dates ARTEFACTS, not EDITS.
     assert "LOWER BOUND, NOT A SPLIT" in out, out
-    assert "neither proven real NOR proven" in out, out
-    assert "still be a REAL defect that only this substrate exposes" in out, out
-    assert "let the mechanism decide" in out, out
+    assert "neither proven real nor proven environmental" in out, out
+    assert "SAMPLED MID-EDIT" in out, out
+    assert "COMMIT LOG DATES ARTEFACTS" in out, out
+    assert "let" in out and "the mechanism decide" in out, out
 
     # The trailer lands AFTER pytest's own count line, so the caveat travels
     # with whichever line a reader copies into a report.

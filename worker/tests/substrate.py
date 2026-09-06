@@ -41,31 +41,40 @@ KNOWN LIMITS, stated so nobody over-reads this.
   reports as a skip and this does not see it (that loss class is T-0987's). It
   also cannot see a path that has no test at all.
 * **The attributed count is a LOWER BOUND on the environment's damage, not a
-  split of the failures into "environment" and "real".** It is UNATTRIBUTED
-  that the remainder is, and unattributed cuts both ways.
+  split of the failures into "environment" and "real".** What the remainder is
+  is UNATTRIBUTED, and there are THREE readings, not two — the third
+  impersonates both others and is the one nobody looks for.
 
-  The worked example, measured, in the order it went — because the middle of
-  it reads as a settled answer and is not one:
+  The worked example is this ticket's own, and it is recorded because it fooled
+  me TWICE in published conclusions before it was settled:
 
   1. api image, whole `test_monitors.py`: **6 failed**. This module attributed
      5 to apscheduler and refused to claim the 6th
-     (`test_sweep_capacity_deferral_retries_without_stamping_cooldown`).
-  2. Complete worker venv: **that 6th PASSES.** At this point it looks like an
-     artefact of the image, and that is what I published. It was wrong.
-  3. Whole file again, after `5541413`: **5 failed — the 6th is GONE.** It had
-     been a REAL defect all along (T-1007: capacity refusal became a TYPE while
-     three test files still raised a bare `ActionError`), and only the api
-     image exposed it.
+     (`test_sweep_capacity_deferral_retries_without_stamping_cooldown`). The
+     refusal was correct.
+  2. Complete worker venv, same tree, 33 minutes later: **that 6th PASSES.**
+     Published as "an artefact of the image". WRONG.
+  3. After the peer's commit landed: **5 failed, the 6th gone.** Published as
+     "a real defect only that substrate exposed". ALSO WRONG.
+  4. What it actually was: **the shared clone sampled MID-EDIT.** A peer had
+     edited the reader from `if "capacity reached" in str(e)` to
+     `isinstance(e, SpawnBackpressure)` and had not yet updated the test that
+     raises the old hand-typed string. Old stimulus, new reader — so it did not
+     defer, it alerted and advanced, and the assertion failed. Ten minutes
+     later both halves agreed again.
 
-  So a failure this module does not name is neither proven real nor proven
-  environmental. An incomplete substrate invents failures (T-0824 measured 22
-  in this image) AND hides real ones behind a green on the complete substrate.
-  The banner states both errors rather than letting the unlisted remainder read
-  as vindicated — and deliberately ends on an INVESTIGATION rule ("investigate
-  on both substrates, let the mechanism decide") rather than a FILING rule.
-  An earlier version said only "reproduce it on a complete substrate before
-  filing it", which on this very case would have talked a reader out of a
-  genuine bug.
+  **The cheap falsifier nobody runs:** ask whether the two runs bracket a
+  COMMIT TIMESTAMP. These did not — both sat on the same side of it, because a
+  **commit log dates ARTEFACTS, not EDITS**. In a shared clone the intermediate
+  states are not private: every lane running a suite can observe one, and a
+  container mount or a docker build freezes whichever it met.
+
+  So the banner states all three readings and ends on an INVESTIGATION rule
+  ("investigate on both substrates, check the edit interval, let the mechanism
+  decide") rather than a FILING rule. A filing rule tells someone what to
+  conclude; an investigation rule tells them what to do. An earlier version
+  said "reproduce it on a complete substrate before filing it", which on a
+  genuine defect would have suppressed it.
 """
 from __future__ import annotations
 
@@ -232,19 +241,24 @@ def banner_lines() -> list[str]:
     lines += [
         "",
         "⚠ THAT COUNT IS A LOWER BOUND, NOT A SPLIT. A failure NOT listed above",
-        "is UNATTRIBUTED — which means neither proven real NOR proven",
-        "environmental. It cuts both ways and BOTH ERRORS HAVE BEEN MADE HERE:",
-        "  · an incomplete substrate produces failures that exist nowhere else",
-        "    (T-0824 measured 22 in the api image), so filing one as a product",
-        "    bug wastes a lane;",
-        "  · and a failure that does NOT reproduce on a complete substrate can",
-        "    still be a REAL defect that only this substrate exposes. T-1002's",
-        "    own unattributed 6th was exactly that: it passed on the worker venv",
-        "    and failed here, and it was a genuine stale-stimulus defect, fixed",
-        "    in 5541413 — dismissing it for not reproducing would have been the",
-        "    wrong call.",
-        "So: investigate it, on both substrates, and let the mechanism decide.",
-        "Do not let this run's silence about it stand for either verdict.",
+        "is UNATTRIBUTED — neither proven real nor proven environmental — and",
+        "there are THREE readings, the third of which impersonates both:",
+        "  · an incomplete substrate INVENTS failures (T-0824 measured 22 in",
+        "    this image), so filing one as a product bug wastes a lane;",
+        "  · a real defect may be under it, so dismissing one wastes a bug;",
+        "  · or THE SHARED WORKING TREE WAS SAMPLED MID-EDIT. T-1002's own",
+        "    unattributed failure was this, and it fooled two published",
+        "    conclusions: a run mounted the clone while a peer had already",
+        "    edited a reader to match on TYPE but had not yet updated the test",
+        "    raising the old string. An old stimulus met a new reader; two runs",
+        "    33 minutes apart disagreed; NEITHER was about the substrate.",
+        "THE CHEAP FALSIFIER NOBODY RUNS: ask whether your two runs bracket a",
+        "COMMIT TIMESTAMP. Mine did not — both sat on the same side of it,",
+        "which is exactly what made it subtle. A COMMIT LOG DATES ARTEFACTS,",
+        "NOT EDITS: in a shared clone the intermediate states are not private,",
+        "and a container mount or a docker build freezes whichever one it met.",
+        "So: investigate on both substrates, check the edit interval, and let",
+        "the mechanism decide. Do not let this run's silence stand for a verdict.",
         "",
         "Every code path needing one of those went UNMEASURED. The pass count",
         "below counts only what this substrate could reach — it is not a result",

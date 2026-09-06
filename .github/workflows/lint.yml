@@ -52,6 +52,18 @@ jobs:
         # the drifting per-project vision/roles/<role>.md copy.
         run: |
           python3 scripts/lint/role_doc_pointers.py
+      - name: No duplicate top-level def/class in scripts/cli/bsq (T-1017)
+        # Stdlib-only AST census (tree.body only, never ast.walk — see the
+        # script's docstring for the traversal bug that distinction exists to
+        # avoid). scripts/cli/bsq is a live file every bot-squad session in a
+        # shared clone can edit; the real enforcement point for a LOCAL commit
+        # is the .githooks/pre-commit gate (gate 3, commit-policy.sh) which
+        # censuses the STAGED blob before it ever reaches this workflow — this
+        # step is defense in depth for anything that reaches origin without
+        # going through that hook (e.g. --no-verify, or a push from a clone
+        # that never installed core.hooksPath).
+        run: |
+          python3 scripts/lint/duplicate_def_census.py -v scripts/cli/bsq
       - name: Install api test deps
         run: |
           pip install --upgrade pip
@@ -71,7 +83,7 @@ jobs:
           python3 scripts/lint/undefined_names.py
       - name: Run lint script unit tests
         run: |
-          cd api && pytest tests/test_backlog_frontmatter_lint.py tests/test_backlog_ids_lint.py tests/test_backlog_provenance_lint.py tests/test_role_doc_pointers_lint.py tests/test_undefined_names_lint.py -x -q
+          cd api && pytest tests/test_backlog_frontmatter_lint.py tests/test_backlog_ids_lint.py tests/test_backlog_provenance_lint.py tests/test_role_doc_pointers_lint.py tests/test_undefined_names_lint.py tests/test_duplicate_def_census_lint.py -x -q
       - name: Worker /api paths resolve against the mounted routes (T-0775)
         # Cross-directory invariant: it reads worker/ source and builds the api
         # app, so it needs BOTH trees — which is exactly why it lives here and

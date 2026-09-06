@@ -26,7 +26,7 @@ at neither the identity nor the content of the index, and by construction it did
 not block — it printed a peer-activity report and asked for a re-run with
 `BOT_SQUAD_ACK_PEERS=1`, which any automatic actor performs for free.
 
-## The three refusing gates now in place
+## The refusing gates now in place
 
 | gate | refuses | released ONLY by |
 |---|---|---|
@@ -34,6 +34,7 @@ not block — it printed a peer-activity report and asked for a re-run with
 | secret-like path (commit) | `.env*`, `*.pem`, `*.key`, `id_rsa`, `*credentials*`, `*secret*`, … staged | `BOT_SQUAD_ALLOW_SECRET_PATHS=<the exact path(s)>` |
 | secret-like path (push) | any commit in the pushed RANGE introducing such a path | `BOT_SQUAD_ALLOW_SECRET_PUSH=<the exact path(s)>` |
 | no identity policy | the allowlist absent from `HEAD`, empty, comments-only, a directory, or with no line for this clone | `BOT_SQUAD_ALLOW_MISSING_IDENTITY_LIST=<the list's path>` |
+| duplicate top-level def/class in `scripts/cli/bsq` (T-1017) | a name (`def`/`class`) that appears more than once at MODULE level in the staged blob — bot-squad-specific, absent from the byte-identical shared library other clones carry | `BOT_SQUAD_ALLOW_DUP_DEFS=<the exact path(s)>` |
 
 None of them is released by `BOT_SQUAD_ACK_PEERS` (which `bsq commit --ack` sets
 on ordinary commits all day) or by `BOT_SQUAD_SKIP_ATTR_SMOKE` (which belongs to

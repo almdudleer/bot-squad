@@ -66,3 +66,16 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      # T-1017: scripts/cli/bsq is a live file every session in a shared
+      # bot-squad clone can edit; a duplicate top-level def/class there is
+      # invisible until RUNTIME (argparse registration, any other name
+      # lookup) and breaks the CLI for every session at once. The primary
+      # enforcement point for a commit IN this clone is
+      # .githooks/pre-commit (gate 3, commit-policy.sh), which censuses the
+      # STAGED blob directly; this entry gives the same check to anyone
+      # running the pre-commit framework locally instead.
+      - id: duplicate-def-census-bsq
+        name: no duplicate top-level def/class in scripts/cli/bsq
+        entry: python3 scripts/lint/duplicate_def_census.py
+        language: system
+        files: ^scripts/cli/bsq$

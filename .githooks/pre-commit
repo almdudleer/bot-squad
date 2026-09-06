@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 #
-# pre-commit hook — THREE checks, of two different kinds.
+# pre-commit hook — FOUR checks, of two different kinds.
 #
 #   1. identity        REFUSES (T-0659)
 #   2. secret-like     REFUSES (T-0659)
-#   3. peer activity   warns, and asks for a re-run (T-0093) — unchanged
+#   3. duplicate-def   REFUSES, scoped to scripts/cli/bsq (T-1017)
+#   4. peer activity   warns, and asks for a re-run (T-0093) — unchanged
 #
-# The two refusing gates are new and live in `.githooks/lib/commit-policy.sh`;
-# read that file for why they refuse instead of warning, and for what the
-# 2026-08-14 `4576a03` commit did to this clone. They run FIRST and are released
-# by their OWN named keys — never by BOT_SQUAD_ACK_PEERS and never by
-# BOT_SQUAD_SKIP_PEER_CHECK, both of which belong to check 3 alone.
+# The three refusing gates live in `.githooks/lib/commit-policy.sh`; read that
+# file for why gates 1/2 refuse instead of warning (and for what the
+# 2026-08-14 `4576a03` commit did to this clone) and for what gate 3 protects.
+# They run FIRST and are released by their OWN named keys — never by
+# BOT_SQUAD_ACK_PEERS and never by BOT_SQUAD_SKIP_PEER_CHECK, both of which
+# belong to check 4 alone.
 #
-# --- check 3, unchanged from here down ------------------------------------
+# --- check 4, unchanged from here down ------------------------------------
 #
 # pre-commit hook — surface recent peer activity on files being committed.
 #
@@ -59,7 +61,12 @@ if [ "${#secret_scan_paths[@]}" -gt 0 ]; then
     cp_check_secret_paths "${secret_scan_paths[@]}" || exit 1
 fi
 
-# ---- check 3: peer activity (T-0093) — behaviour unchanged ----------------
+# T-1017: refuses a commit that introduces a duplicate top-level def/class
+# name into scripts/cli/bsq — a live file every session in this clone shares.
+# No-ops (returns 0) when bsq is not among the staged paths.
+cp_check_duplicate_defs || exit 1
+
+# ---- check 4: peer activity (T-0093) — behaviour unchanged ----------------
 
 [ "${BOT_SQUAD_SKIP_PEER_CHECK:-}" = "1" ] && exit 0
 

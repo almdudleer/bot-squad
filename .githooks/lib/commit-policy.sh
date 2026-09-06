@@ -416,3 +416,103 @@ unrelated defences.
 EOF
     return 1
 }
+
+# ===========================================================================
+# GATE 3 — DUPLICATE TOP-LEVEL DEF/CLASS ON A LIVE SHARED FILE (T-1017)
+# ===========================================================================
+#
+# ``scripts/cli/bsq`` is edited by every session in this clone, often several
+# in one evening. A duplicated top-level ``def``/``class`` there is invisible
+# until RUNTIME — argparse subcommand registration and any other name lookup
+# just take whichever definition wins, so ``ast.parse`` succeeding proves
+# nothing about it — and it breaks the CLI for every live session at once,
+# including the one trying to fix it.
+#
+# Until this gate, the census that would catch that existed only inside a
+# broadcast message to lanes (T-1017 verbatim request): "a rule that lives in
+# a message holds exactly as long as someone remembers reading it." This is
+# what makes it a control instead of something to remember.
+#
+# Same asymmetry as gates 1/2, so it refuses rather than warns: the
+# false-positive cost is one legitimate name collision (rare, and releasable
+# by name below); the miss cost is every live session's ``bsq`` breaking at
+# once. Reads the STAGED blob (``git show :"$path"``), not the working-tree
+# copy — what is about to be committed is what must be censused, regardless
+# of what the working tree has since moved on to.
+#
+# The actual census (``ast``-based, ``tree.body`` only — never ``ast.walk``,
+# which would count a nested def as top-level) lives in
+# ``scripts/lint/duplicate_def_census.py`` so it is independently testable and
+# so this gate never has to parse Python in bash.
+# ---------------------------------------------------------------------------
+CP_DUP_DEF_TARGETS=("scripts/cli/bsq")
+CP_DUP_DEF_CENSUS="scripts/lint/duplicate_def_census.py"
+
+# cp_check_duplicate_defs -> 0 clean or not staged, 1 refused
+cp_check_duplicate_defs() {
+    local top census p out rc allow i p2
+    local staged_paths=() bad_paths=() bad_reports=() unreleased=()
+
+    top=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+    census="$top/$CP_DUP_DEF_CENSUS"
+    # The control itself may not exist yet in an older checkout of this repo
+    # (or a donor clone under test) — that is a "nothing to run", not a pass
+    # masquerading as a check, and it is the same posture gates 1/2 take when
+    # their OWN policy file is entirely absent from this repository's history.
+    [ -r "$census" ] || return 0
+
+    for p in "${CP_DUP_DEF_TARGETS[@]}"; do
+        if git diff --cached --name-only --diff-filter=ACMR -- "$p" 2>/dev/null | grep -qxF "$p"; then
+            staged_paths+=("$p")
+        fi
+    done
+    [ "${#staged_paths[@]}" -gt 0 ] || return 0
+
+    for p in "${staged_paths[@]}"; do
+        out=$(git show ":$p" 2>/dev/null | python3 "$census" --stdin --name "$p" 2>&1)
+        rc=$?
+        [ "$rc" -eq 0 ] && continue
+        bad_paths+=("$p")
+        bad_reports+=("$out")
+    done
+    [ "${#bad_paths[@]}" -eq 0 ] && return 0
+
+    # Named release: BOT_SQUAD_ALLOW_DUP_DEFS='path1,path2' must name every
+    # offending path — same discipline as gates 1/2, and for the same reason:
+    # the release must not become a habit typed on ordinary commits.
+    allow="${BOT_SQUAD_ALLOW_DUP_DEFS:-}"
+    for i in "${!bad_paths[@]}"; do
+        p2="${bad_paths[$i]}"
+        if ! printf '%s\n' "$allow" | tr ',' '\n' \
+             | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -qxF "$p2"; then
+            unreleased+=("$p2")
+        fi
+    done
+    if [ "${#unreleased[@]}" -eq 0 ]; then
+        printf '%s\n' "── duplicate-def check: released by BOT_SQUAD_ALLOW_DUP_DEFS for: $allow ──" >&2
+        return 0
+    fi
+
+    cat >&2 <<EOF
+
+$(pa_red "── COMMIT REFUSED: duplicate top-level def/class ──")
+EOF
+    for i in "${!bad_paths[@]}"; do
+        printf '\n── %s ──\n' "${bad_paths[$i]}" >&2
+        printf '%s\n' "${bad_reports[$i]}" >&2
+    done
+
+    cat >&2 <<EOF
+
+This is a file every live session in this clone shares. A duplicated
+top-level def/class name is invisible until RUNTIME (argparse registration,
+any other name lookup) and breaks the CLI for every session at once,
+including the one trying to fix it.
+
+Fix the duplicate (rename or delete one of the two), or if it is genuinely
+intentional, name every offending path (not a bare 1):
+  BOT_SQUAD_ALLOW_DUP_DEFS='$(IFS=,; echo "${bad_paths[*]}")' git commit ...
+
+EOF
+    return 1
+}

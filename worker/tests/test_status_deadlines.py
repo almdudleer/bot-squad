@@ -5,12 +5,17 @@ same quiet-hours-defers-not-drops contract), since ``status_deadlines`` reuses
 that SSOT (``actions._send_stakeholder_dm``) and that dedup shape."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from bot_squad_worker import status_deadlines
 from bot_squad_worker.config import Config
+
+
+def _iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _write_task(backlog: Path, task_id: str, *, title: str = "",
@@ -193,6 +198,60 @@ def test_two_breaches_batch_into_one_message(cfg, backlog, dm):
     assert out["breaches"] == 2
     assert len(dm.calls) == 1
     assert "T-0001" in dm.calls[0]["message"] and "T-0002" in dm.calls[0]["message"]
+
+
+def test_over_cap_batch_names_the_oldest_and_counts_the_rest(cfg, backlog, dm):
+    """Operator review (2026-09-06), measured against the live board: a
+    backlog-catchup sweep found 56 of 63 gated tickets already breaching (a
+    pre-existing backlog, not a bug — the feature is new) and rendered one
+    line per ticket, a 56-line/5756-char dump. This pins the fix: the message
+    NAMES only the oldest `MESSAGE_CAP`, with a header stating the true total
+    and oldest age, and a trailing count for the rest — never a silent drop."""
+    since_base = status_deadlines._parse_iso("2026-08-01T00:00:00Z")
+    n = status_deadlines.MESSAGE_CAP + 5
+    for i in range(n):
+        # staggered `since` so age strictly decreases with i — T-0000 is the
+        # OLDEST (breached longest ago), T-000{n-1} the most recently breached.
+        since_iso = _iso(since_base - (n - i))
+        _write_task(backlog, f"T-{i:04d}", status="totest", status_since=since_iso)
+    now = since_base + 73 * 3600  # everyone past totest's 72h deadline
+    out = status_deadlines.deadline_check_tick_one(cfg, "test-project", now=now)
+    assert out["breaches"] == n
+    msg = dm.calls[0]["message"]
+    assert f"{n} ticket(s) past deadline" in msg
+    assert f"showing the {status_deadlines.MESSAGE_CAP} oldest" in msg
+    assert f"+{n - status_deadlines.MESSAGE_CAP} more past deadline" in msg
+    # the OLDEST are the ones named — T-0000 (oldest) must appear, the
+    # youngest (last index) must not.
+    assert "T-0000" in msg
+    assert f"T-{n - 1:04d}" not in msg
+    # only the named subset is marked alerted — the rest stay pending so a
+    # LATER sweep names them instead of folding them into "+N more" forever.
+    sidecar = status_deadlines._read_sidecar(cfg, "test-project")
+    assert len(sidecar) == status_deadlines.MESSAGE_CAP
+    assert "T-0000" in sidecar and f"T-{n - 1:04d}" not in sidecar
+
+
+def test_capped_backlog_rotates_out_over_successive_sweeps(cfg, backlog, dm):
+    since_base = status_deadlines._parse_iso("2026-08-01T00:00:00Z")
+    n = status_deadlines.MESSAGE_CAP + 3
+    for i in range(n):
+        since_iso = _iso(since_base - (n - i))
+        _write_task(backlog, f"T-{i:04d}", status="totest", status_since=since_iso)
+    now = since_base + 73 * 3600
+    out1 = status_deadlines.deadline_check_tick_one(cfg, "test-project", now=now)
+    assert out1["breaches"] == n  # every one of them IS a breach...
+    assert len(dm.calls) == 1  # ...but only one message, capped
+
+    out2 = status_deadlines.deadline_check_tick_one(cfg, "test-project", now=now + 1)
+    assert out2["breaches"] == 3  # the leftover 3, uncapped this time
+    assert len(dm.calls) == 2
+    for i in range(status_deadlines.MESSAGE_CAP, n):
+        assert f"T-{i:04d}" in dm.calls[1]["message"]
+
+    out3 = status_deadlines.deadline_check_tick_one(cfg, "test-project", now=now + 2)
+    assert out3["breaches"] == 0  # fully surfaced now
+    assert len(dm.calls) == 2
 
 
 def test_undelivered_send_defers_not_drops(cfg, backlog, dm):

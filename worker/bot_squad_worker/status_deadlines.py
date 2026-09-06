@@ -134,6 +134,47 @@ def _fmt_age(age_sec: float) -> str:
     return f"{age_sec / 3600.0:.1f}h"
 
 
+# T-0752/operator review (2026-09-06): the first live sweep found 56 of 63
+# gated tickets already breaching (a backlog that predates this feature, not
+# a bug — only 3 tickets on the whole board carried `status_since` yet, so
+# almost everything fell back to `updated`). Rendered one line per ticket that
+# is a 5756-character, 56-line message — a dump, not the "digest-style" batch
+# DoD item 3 promised. Mirrors `task_chat.DIGEST_HEADLINES`'s cap+overflow
+# shape for the same reason: a message nobody can act on is not "reaching
+# him" in the sense that matters, even though nothing was lost in transport
+# (`_send_stakeholder_dm` chunks through `split_for_tg` either way).
+#
+# The fix caps what one message NAMES, never what exists: every breach still
+# computed above is real and still owed an alert (see `deadline_check_tick_one`
+# — only the capped, shown subset gets marked alerted in the sidecar), so the
+# tickets left out of THIS message surface in a LATER sweep instead of being
+# silently absorbed into a count forever. At the 300s tick cadence a 56-ticket
+# backlog fully surfaces, 10 named tickets at a time, inside 30 minutes.
+MESSAGE_CAP = 10
+
+
+def _compose_message(breaches: list[dict]) -> tuple[str, list[dict]]:
+    """``(text, shown)`` — ``shown`` is the subset actually named in ``text``,
+    oldest (longest-overdue) first; that is also the only subset the caller
+    should mark alerted."""
+    ordered = sorted(breaches, key=lambda b: b["age_sec"], reverse=True)
+    shown = ordered[:MESSAGE_CAP]
+    lines = [
+        f"⏳ {b['id']} {b['status']} for {_fmt_age(b['age_sec'])} "
+        f"(since {b['since_source']}) — {_cut_title(b['title'])}"
+        for b in shown
+    ]
+    overflow = len(ordered) - len(shown)
+    if overflow > 0:
+        lines.insert(
+            0,
+            f"⏳ {len(ordered)} ticket(s) past deadline, oldest "
+            f"{_fmt_age(ordered[0]['age_sec'])} — showing the {len(shown)} oldest:",
+        )
+        lines.append(f"+{overflow} more past deadline — see the board")
+    return "\n".join(lines), shown
+
+
 def _scan_backlog(cfg: Any, slug: str) -> list[dict]:
     """Light frontmatter rows for every gated-status ticket on ``slug``'s
     board. Top-level ``*.md`` only (the ``_gc/`` archive subdir is naturally
@@ -278,14 +319,13 @@ def deadline_check_tick_one(cfg: Any, slug: str, now: Optional[float] = None) ->
 
     delivered = False
     if breaches:
-        text = "\n".join(
-            f"⏳ {b['id']} {b['status']} for {_fmt_age(b['age_sec'])} "
-            f"(since {b['since_source']}) — {_cut_title(b['title'])}"
-            for b in breaches
-        )
+        text, shown = _compose_message(breaches)
         delivered = _notify(cfg, slug, text)
         if delivered:
-            for b in breaches:
+            # Only the NAMED subset is marked alerted — a breach left out by
+            # the cap stays pending so it is named in a later sweep instead of
+            # disappearing into "+N more" forever.
+            for b in shown:
                 new_state[b["id"]] = {"status": b["status"], "since": b["since_iso"]}
 
     if new_state != state:

@@ -117,12 +117,23 @@ def merge_task_update(path: Path, updates: dict, body: str | None = None) -> dic
                 "%Y-%m-%dT%H:%M:%SZ"
             )
 
+        # T-0950: a REAL status transition (not a no-op re-send of the same
+        # value) stamps WHEN this status was entered, separate from `updated`
+        # (which every write here bumps, including a body/quote/context edit
+        # that never touched status). Without this, the deadline sweep in
+        # `status_deadlines.py` would measure "last touched" instead of "how
+        # long has this sat waiting on a human" — the exact confusion T-0950's
+        # audit finding is about.
+        now = _now_utc_iso()
+        if "status" in updates and updates["status"] != fm.get("status"):
+            fm["status_since"] = now
+
         # Apply updates
         for k, v in updates.items():
             if k != "body":
                 fm[k] = v
 
-        fm["updated"] = _now_utc_iso()
+        fm["updated"] = now
 
         new_body = body if body is not None else task["body"]
         write_task(path, fm, new_body)

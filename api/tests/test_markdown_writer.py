@@ -73,6 +73,35 @@ def test_merge_task_update_bumps_updated_timestamp(tmp_path: Path):
     assert "updated" in new_fm
 
 
+def test_merge_task_update_stamps_status_since_on_real_transition(tmp_path: Path):
+    """T-0950: a real status change stamps WHEN, separate from `updated`
+    (which every write here bumps regardless of what changed)."""
+    p = tmp_path / "T-0011b-x.md"
+    write_task(p, {"id": "T-0011b", "title": "X", "status": "open"}, "body\n")
+    new_fm = merge_task_update(p, {"status": "in_progress"})
+    assert "status_since" in new_fm
+    assert new_fm["status_since"] == new_fm["updated"]
+
+
+def test_merge_task_update_noop_status_never_restamps(tmp_path: Path):
+    p = tmp_path / "T-0011c-x.md"
+    write_task(p, {"id": "T-0011c", "title": "X", "status": "open",
+                   "status_since": "2020-01-01T00:00:00Z"}, "body\n")
+    new_fm = merge_task_update(p, {"status": "open"})
+    assert new_fm["status_since"] == "2020-01-01T00:00:00Z"
+
+
+def test_merge_task_update_unrelated_field_never_touches_status_since(tmp_path: Path):
+    """A body/title edit bumps `updated` but must NOT reset the status clock —
+    that is precisely the confusion T-0950's deadline sweep exists to avoid."""
+    p = tmp_path / "T-0011d-x.md"
+    write_task(p, {"id": "T-0011d", "title": "X", "status": "blocked_on_user",
+                   "status_since": "2020-01-01T00:00:00Z"}, "body\n")
+    new_fm = merge_task_update(p, {"title": "New"})
+    assert new_fm["status_since"] == "2020-01-01T00:00:00Z"
+    assert new_fm["updated"] != "2020-01-01T00:00:00Z"
+
+
 def test_merge_task_update_changes_title(tmp_path: Path):
     from app.markdown_parser import parse_task
 

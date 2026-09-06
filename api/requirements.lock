@@ -1,0 +1,68 @@
+# api/requirements.lock — T-1004
+#
+# THE IMAGE IS OTHERWISE NOT A FUNCTION OF THE REF. api/pyproject.toml declares
+# 13 dependency specs and every one is a `>=` floor, so two builds of the SAME
+# commit on two days resolve whatever PyPI serves each day. That is not
+# theoretical: on 2026-09-06 the install ran fastapi 0.136.1 while an image
+# under test had 0.141.1, and an api suite result had already been observed to
+# change because a test split MOVED between fastapi versions — a count
+# difference with no commit behind it.
+#
+# EVERY VERSION HERE WAS MEASURED, NOT RESOLVED. It is `pip freeze` taken inside
+# the RUNNING api container at 2026-09-06T19:47Z — image
+# sha256:ed6e988565481254409d0d1cc8238e24d29e01f58465baa45c7b4ad8d9e4b17f, built
+# 17:51:32Z from 760c0fe29136, container started 17:53:41Z. So this pin selects
+# the set this box was already serving on and that today's api certifications
+# were taken against: it is behaviour-preserving BY CONSTRUCTION rather than by
+# hope, and a version bump becomes a separate, visible, one-line change.
+#
+# api/Dockerfile installs from THIS FILE and then FAILS THE BUILD if the
+# resulting environment differs from it. The lock is a control, not a record.
+#
+# Regenerate deliberately, never as a side effect:
+#     docker run --rm --entrypoint python bot-squad-api:latest -m pip freeze \
+#       | grep -E '^[A-Za-z0-9_.-]+==' | sort -f > api/requirements.lock
+# (and re-run the api suite, because that is the change you just made)
+#
+# ⚠ WHAT THIS FILE DOES NOT PIN, so nobody reads it as more than it is:
+#   · apt-get build-essential/git in api/Dockerfile — unpinned, named residual.
+#   · CI's `pip install -e api[dev]` (.github/workflows) still resolves floors.
+#   · No hashes. PyPI versions are immutable in practice, so `==` is sufficient
+#     for reproducibility but NOT for supply-chain integrity; --require-hashes
+#     is the next step, not this one.
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.14.2
+bcrypt==5.0.0
+certifi==2026.7.22
+cffi==2.1.1
+click==8.5.0
+cryptography==50.0.1
+fastapi==0.141.1
+h11==0.16.0
+httpcore==1.0.9
+httptools==0.8.0
+httpx==0.28.1
+idna==3.19
+iniconfig==2.3.0
+packaging==26.3
+pluggy==1.6.0
+pycparser==3.0
+pydantic==2.13.5
+pydantic_core==2.46.5
+pyflakes==3.4.0
+Pygments==2.21.0
+PyJWT==2.13.0
+pytest-asyncio==1.4.0
+pytest==9.1.1
+python-dotenv==1.2.3
+python-multipart==0.0.32
+PyYAML==6.0.3
+starlette==1.6.0
+tomlkit==0.15.1
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+uvicorn==0.52.4
+uvloop==0.22.1
+watchfiles==1.2.0
+websockets==17.1

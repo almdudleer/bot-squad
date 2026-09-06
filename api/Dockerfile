@@ -1,6 +1,11 @@
 # Multi-stage: build web, then assemble api with web/dist as static.
 
-FROM node:20-alpine AS web-builder
+# T-1004: DIGEST, NOT TAG. `node:20-alpine` is a mutable pointer on a
+# registry we do not control — the same rebuild-moves-the-tag defect as
+# bot-squad-api:latest (T-1001), one layer down and somewhere we cannot
+# even retain the outgoing artefact. Digest measured 2026-09-06 as the one
+# this image was actually built from, so pinning it moves nothing today.
+FROM node:20-alpine@sha256:f598378b5240225e6beab68fa9f356db1fb8efe55173e6d4d8153113bb8f333c AS web-builder
 ARG VITE_MOTHERSHIP=0
 ENV VITE_MOTHERSHIP=${VITE_MOTHERSHIP}
 WORKDIR /web
@@ -24,7 +29,9 @@ COPY scripts/install /scripts/install
 COPY api/response_shapes.json /api/response_shapes.json
 RUN npm run build
 
-FROM python:3.12-slim AS api
+# T-1004: DIGEST, NOT TAG — see the web-builder stage above. Measured
+# 2026-09-06 as the base the running image was built from.
+FROM python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf AS api
 WORKDIR /app
 # `git` is needed by app/project_scaffold.py (T-0051) for the
 # `new_from_scratch` project-create mode — it runs `git init` /
@@ -37,8 +44,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
     && rm -rf /var/lib/apt/lists/*
 
-COPY api/pyproject.toml ./
-RUN pip install --no-cache-dir -e ".[dev]" || pip install --no-cache-dir .
+# T-1004 — INSTALL FROM THE LOCK, THEN PROVE THE RESULT MATCHES IT.
+#
+# The old line was `pip install -e ".[dev]"` against 13 `>=` floors with no
+# lockfile, so the image was not a function of the ref: two builds of the same
+# commit on two days resolved whatever PyPI served each day. Measured
+# consequence, not theory — an api suite result that changed because a test
+# split MOVED between fastapi versions.
+#
+# The `|| pip install .` fallback is gone deliberately. A fallback that installs
+# a DIFFERENT dependency set when the primary fails is how a build reports
+# success while producing an environment nobody asked for; with a lock, failing
+# loudly is the whole point.
+#
+# The diff at the end is the control that makes this a pin rather than a
+# comment: if pip resolves ANYTHING the lock does not name — a transitive that
+# moved, a marker that evaluated differently, a stale layer — the build FAILS
+# HERE instead of shipping an image whose contents nobody compared. Names are
+# lowercased and underscores normalised because pip freeze and PyPI disagree on
+# both (pydantic_core vs pydantic-core, PyYAML vs pyyaml).
+COPY api/pyproject.toml api/requirements.lock ./
+RUN pip install --no-cache-dir -r requirements.lock \
+ && pip install --no-cache-dir --no-deps -e . \
+ && pip freeze --exclude-editable | grep -E '^[A-Za-z0-9_.-]+==' \
+      | tr 'A-Z_' 'a-z-' | sort > /tmp/installed.txt \
+ && grep -E '^[A-Za-z0-9_.-]+==' requirements.lock \
+      | tr 'A-Z_' 'a-z-' | sort > /tmp/locked.txt \
+ && { diff -u /tmp/locked.txt /tmp/installed.txt \
+      || { echo "T-1004: LOCK DRIFT — the installed set is not the locked set."; \
+           echo "The image would not be a function of the ref. Refusing."; \
+           exit 1; }; } \
+ && rm -f /tmp/installed.txt /tmp/locked.txt
 
 COPY api/app /app/app
 COPY --from=web-builder /web/dist /app/web/dist

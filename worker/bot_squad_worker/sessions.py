@@ -2657,10 +2657,6 @@ def _wait_for_agent_composer_ready(pane_id: str, provider_name: str) -> bool:
     return False
 
 
-#: Matches a `tmux capture-pane -e` SGR escape, e.g. ``\x1b[2m`` or ``\x1b[0m``.
-_ANSI_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
 def _composer_content(pane_id: str) -> str | None:
     """Return the text Claude's composer currently holds, or None if the pane
     can't be captured / has no composer line.
@@ -2681,20 +2677,41 @@ def _composer_content(pane_id: str) -> str | None:
     (fresh tmux pane, v2.1.251): the hint is wrapped in SGR 2 (dim/faint,
     ``\x1b[2m…\x1b[0m``) immediately after the marker, while real typed or
     pasted content — including the ``[Pasted text #N +M lines]`` placeholder —
-    renders with NO styling there at all. We capture with ``-e`` and treat
-    ANY styling landing directly after the marker (before the first visible
-    character) as decorative UI rather than the caller's own input — this
-    also protects against a different screen that happens to share the ``❯``
-    rune (T-0897's other finding, the first-run trust dialog; see
-    ``_dismiss_trust_dialog``), whose selected row is styled in a highlight
-    color rather than being genuinely blank. The hint's own wording is
-    intentionally NOT part of this check: it rotates between several example
-    prompts and changes across claude versions, so pinning it would be a
-    literal from memory the DoD explicitly rules out.
+    renders with NO styling there at all.
+
+    T-0957: T-0897's original check treated ANY escape landing directly after
+    the marker as decorative UI, not just a faint one — and a GENERATING pane
+    also puts an escape there, a plain foreground reset (``ESC[39m``), ahead
+    of genuinely pasted content (measured live, Claude Code 2.1.263: the rune
+    line renders ``❯ NBSP ESC[39m <real text>`` mid-generation). That reads a
+    real paste as an empty composer, so :func:`_deliver_prompt_unlocked` times
+    out at step (1) and never sends Enter — the paste sits in the box,
+    unsubmitted, exactly the T-0957 symptom. Only SGR 2 (faint) actually marks
+    decorative chrome (the T-0897 hint, ``<no suggestion>``, a replayed
+    message); :func:`input_mux._unfainted` already separates faint chrome from
+    real content correctly (T-0962) and is reused here rather than re-deriving
+    a second ad hoc escape classifier.
+
+    The first-run TRUST DIALOG (T-0897's other finding) is a different screen
+    that happens to share the ``❯`` rune for its own list selector
+    (``❯ No, exit``), highlight-colored rather than faint — so the faint
+    classifier alone would read its selected option as real composer content.
+    It is not this composer at all (see ``_dismiss_trust_dialog``), so it is
+    excluded by its own marker rather than by teaching the escape classifier a
+    second, unrelated style: growing that classifier per screen is exactly the
+    whitelist-can-never-be-complete trap ``composer_watch`` already warns
+    about. The hint's own wording is intentionally NOT part of either check:
+    it rotates between several example prompts and changes across claude
+    versions, so pinning it would be a literal from memory the DoD explicitly
+    rules out.
     """
+    from bot_squad_worker import input_mux
+
     cap = _run(["tmux", "capture-pane", "-t", pane_id, "-p", "-e"])
     if cap.returncode != 0:
         return None
+    if _TRUST_DIALOG_MARKER in cap.stdout.lower():
+        return ""
     content: str | None = None
     markers = tuple(
         dict.fromkeys(
@@ -2710,14 +2727,11 @@ def _composer_content(pane_id: str) -> str | None:
                 continue
             tail = line[idx + len(marker):]
             # T-0897: the separator claude renders right after `❯` is U+00A0
-            # (non-breaking space), not an ASCII space — measured live on both
-            # the placeholder and real-content captures below. Plain
-            # `.lstrip(" ")` leaves it in place and the dim-escape check below
-            # never matches, so this must be a real (default) `.lstrip()`.
-            if tail.lstrip().startswith("\x1b["):
-                content = ""
-            else:
-                content = _ANSI_SGR_RE.sub("", tail).strip()
+            # (non-breaking space), not an ASCII space. `str.strip()` treats
+            # NBSP as whitespace, so it is dropped along with any leading
+            # ASCII space by the `.strip()` below without special-casing it.
+            plain, _saw_faint = input_mux._unfainted(tail)
+            content = plain.strip()
     return content
 
 

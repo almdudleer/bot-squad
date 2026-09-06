@@ -2591,6 +2591,25 @@ def test_composer_content_placeholder_wording_is_never_pinned(monkeypatch):
     assert S._composer_content("%5") == ""
 
 
+def test_composer_content_generating_pane_reads_real_paste_as_content(monkeypatch):
+    """T-0957: the old check treated ANY escape landing right after the marker
+    as decorative — correct for the T-0897 faint hint, but a GENERATING pane
+    renders a plain foreground-reset there too, ahead of genuinely pasted
+    content, and that escape is not a style at all. Measured live (Claude Code
+    2.1.263): the rune line during generation is
+    ``❯<NBSP><ESC[39m><real pasted text>``. Before the fix this read as "",
+    so `_deliver_prompt`'s paste-landed poll timed out and raised before ever
+    sending Enter — the DoD-3 second parking mechanism, distinct from T-0962's
+    ghost/NBSP one. Without the fix this test fails."""
+    import bot_squad_worker.sessions as S
+
+    def fake_run(args, **kwargs):
+        return _CP(args, "❯\xa0\x1b[39mfile backlog tickets for the three blind signals\n")
+
+    monkeypatch.setattr(S, "_run", fake_run)
+    assert S._composer_content("%5") == "file backlog tickets for the three blind signals"
+
+
 def test_composer_content_typed_text_still_reads_as_content(monkeypatch):
     """Positive control (DoD): real typed content must still be read, not
     swept up by the placeholder fix. Fixture measured live (T-0897)."""

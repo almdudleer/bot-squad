@@ -920,6 +920,12 @@ export type Transparency = {
   };
   quota: {
     max_in_progress: number; // 0 = unlimited
+    // T-0966: WHAT the cap counts — "live_dev_sessions", never the board label
+    // below it. Optional for a pre-T-0966 API.
+    cap_counts?: string;
+    // The BOARD LABEL count. Real, but NOT the quantity max_in_progress gates:
+    // measured 2026-09-06 the install had 8 live dev sessions and 1 ticket
+    // labelled in_progress under a cap of 7. Do not render them as a ratio.
     in_progress: number;
     paused: boolean;
     initiatives: Record<
@@ -989,6 +995,15 @@ export type AutomationSnapshot = {
    */
   quota: {
     max_in_progress: number;
+    /**
+     * T-0966 — the unit `max_in_progress` counts ("live_dev_sessions") and the
+     * LIVE value of it. This snapshot is a worker proxy, so unlike the
+     * file-read transparency payload it can carry the real reading: render
+     * "5 / 7 live dev sessions", never a bare cap the reader has to infer the
+     * unit of. `null` is an explicit unknown (count unavailable), never 0.
+     */
+    cap_counts?: string | null;
+    live_dev_sessions?: number | null;
     weekly_target_pct: number | null;
     spend_pct: number | null;
     verdict: string | null;

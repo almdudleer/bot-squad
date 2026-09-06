@@ -21,7 +21,11 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { StaticRouter } from "react-router-dom/server";
 import { describe, expect, test } from "vitest";
 
-import { ObservabilityView, liveSessionsCardCopy } from "./ObservabilityPanel";
+import {
+  ObservabilityView,
+  inProgressCardCopy,
+  liveSessionsCardCopy,
+} from "./ObservabilityPanel";
 import type { Transparency as TransparencyData } from "../api";
 
 // Mirrors the real bot-squad state observed 2026-06-27 (operator-state absent,
@@ -104,8 +108,11 @@ describe("ObservabilityView", () => {
     expect(html).not.toContain("RE-DRIVE");
     expect(html).toContain("LIVE SESSIONS");
 
-    // Quota: unlimited cap (∞) + in_progress count. No pause/resume control.
-    expect(html).toContain("20 / ∞");
+    // Quota: the in_progress count, and a cap line that names its own unit.
+    // T-0966 removed the "20 / ∞" ratio — the two are different units.
+    expect(html).toContain(">20<");
+    expect(html).toContain("tickets labelled in_progress · no cap set");
+    expect(html).not.toContain("20 / ∞");
     expect(html).not.toContain("Resume");
     expect(html).not.toContain("PAUSED");
 
@@ -151,7 +158,9 @@ describe("ObservabilityView", () => {
       quota: { ...REAL_DERIVED.quota, paused: false, max_in_progress: 13 },
     });
     expect(html).toContain("Ship the transparency surface.");
-    expect(html).toContain("20 / 13");
+    expect(html).toContain(">20<");
+    expect(html).toContain("cap 13 counts live dev sessions");
+    expect(html).not.toContain("20 / 13");
     expect(html).not.toContain("Nobody has written the work-state doc yet");
   });
 
@@ -268,7 +277,7 @@ describe("T-0772: the LIVE SESSIONS card says whose count it is", () => {
 
     // ...and the broad number is still right beside it. This pairing IS the
     // recorded defect; the test would pass vacuously if the strip lost a card.
-    expect(html).toContain("6 / ∞");
+    expect(html).toContain(">6<");
   });
 
   test("NO GATE MOVED: the value is still the owner-scoped zero", () => {
@@ -304,5 +313,34 @@ describe("T-0772: the LIVE SESSIONS card says whose count it is", () => {
     for (const s of ["own", "all", null, undefined] as const) {
       expect(liveSessionsCardCopy(s).sub).toContain("Processes");
     }
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// T-0966 — the IN PROGRESS card stopped rendering two units as one ratio
+// ---------------------------------------------------------------------------
+
+describe("T-0966: the cap names the unit it counts", () => {
+  test("says what the cap counts, which is not the number beside it", () => {
+    // The measured install: cap 7 (set from «таргет параллелизма 7»), 1 ticket
+    // carrying the in_progress label, 8 live dev sessions. The old copy read
+    // "1 / 7" — six lanes of headroom, while the system was one lane over.
+    expect(inProgressCardCopy(7)).toBe(
+      "tickets labelled in_progress · cap 7 counts live dev sessions",
+    );
+  });
+
+  test("an unset cap says so rather than printing ∞ as a denominator", () => {
+    expect(inProgressCardCopy(0)).toBe("tickets labelled in_progress · no cap set");
+  });
+
+  test("never renders the board count and the cap as a ratio", () => {
+    const html = renderView({
+      ...REAL_DERIVED,
+      quota: { ...REAL_DERIVED.quota, max_in_progress: 7, in_progress: 1 },
+    });
+    expect(html).not.toContain("1 / 7");
+    expect(html).toContain("cap 7 counts live dev sessions");
   });
 });

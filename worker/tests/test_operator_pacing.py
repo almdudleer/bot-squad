@@ -1,7 +1,13 @@
 """T-0475 / M2-F2.6 — operator pacing status (parallelism + best-effort weekly
 quota target). Unit-tests the signal composition + recommendation in
 ``operator_redrive.pacing_status``; the parallelism cap value itself is owned by
-``pace.py`` (TL-B / T-0482) so we monkeypatch it and test OUR logic on top."""
+``pace.py`` (TL-B / T-0482) so we monkeypatch it and test OUR logic on top.
+
+T-0966: the LOAD the cap is measured against is now live dev sessions, not the
+``in_progress`` board label — so the tests that build load do it with ``_dev``
+(a live session) and the ones that build board rows with ``_task`` are asserting
+about the REPORTED label, which gates nothing. See
+``test_t0966_pace_cap_counts_sessions.py`` for why."""
 from __future__ import annotations
 
 import json
@@ -12,18 +18,41 @@ import pytest
 
 from bot_squad_worker import operator_redrive as ord_
 from bot_squad_worker import pace as _pace
+from bot_squad_worker import sessions as _sessions
 from bot_squad_worker import telemetry as _telemetry
 
 SLUG = "bot-squad"
+
+#: SIDs the patched ``_live_agent_sids`` reports as running a live claude pane.
+_LIVE_AGENTS: set[str] = set()
+
+
+@pytest.fixture(autouse=True)
+def _no_panes(monkeypatch):
+    _LIVE_AGENTS.clear()
+    monkeypatch.setattr(_sessions, "list_panes", lambda: [])
+    monkeypatch.setattr(_sessions, "_live_agent_sids", lambda: set(_LIVE_AGENTS))
 
 
 @pytest.fixture
 def cfg(tmp_path: Path):
     data = tmp_path / "data"
     (data / SLUG / "backlog").mkdir(parents=True, exist_ok=True)
+    (data / SLUG / "sessions").mkdir(parents=True, exist_ok=True)
     cfgdir = tmp_path / "config"
     cfgdir.mkdir(parents=True, exist_ok=True)
-    return SimpleNamespace(data_dir=data, config_dir=cfgdir)
+    return SimpleNamespace(data_dir=data, config_dir=cfgdir, projects={SLUG: object()})
+
+
+def _dev(cfg, sid, task_id="~"):
+    """A live leaf-dev session — one unit of the load the cap gates (T-0966).
+    ``window="w"`` is the leaf-dev marker; a coordinator window would not count."""
+    _sessions._write_session_metadata(
+        cfg.data_dir / SLUG / "sessions" / f"{sid}.md",
+        {"sid": sid, "status": "active", "window": "w",
+         "task_id": task_id, "initiative": "~"},
+    )
+    _LIVE_AGENTS.add(sid)
 
 
 def _task(cfg, tid, status="open", archived=False):
@@ -65,6 +94,7 @@ def test_fresh_project_degrades_to_ok(cfg, monkeypatch):
     _no_target(cfg)
     st = ord_.pacing_status(cfg, SLUG)
     assert st["max_in_progress"] == 0 and st["in_progress"] == 0
+    assert st["live_dev_sessions"] == 0 and st["cap_counts"] == "live_dev_sessions"
     assert st["at_cap"] is False
     assert st["weekly_target_pct"] is None
     assert st["burn_tokens_per_hr"] is None and st["remaining_tokens"] is None
@@ -72,6 +102,8 @@ def test_fresh_project_degrades_to_ok(cfg, monkeypatch):
 
 
 def test_in_progress_counts_only_in_progress_nonarchived(cfg, monkeypatch):
+    """The board-label count is still REPORTED (that is how its drift stays
+    visible); T-0966 only stopped it GATING. This pins the count itself."""
     monkeypatch.setattr(_pace, "max_in_progress", lambda c, s: 0)
     _task(cfg, "T-1", status="in_progress")
     _task(cfg, "T-2", status="in_progress")
@@ -82,17 +114,42 @@ def test_in_progress_counts_only_in_progress_nonarchived(cfg, monkeypatch):
 
 def test_at_cap_throttles(cfg, monkeypatch):
     monkeypatch.setattr(_pace, "max_in_progress", lambda c, s: 2)
+    _dev(cfg, "S-u-dev-p1", "T-1")
+    _dev(cfg, "S-u-dev-p2", "T-2")
+    st = ord_.pacing_status(cfg, SLUG)
+    assert st["live_dev_sessions"] == 2
+    assert st["at_cap"] is True
+    assert st["recommendation"] == "throttle"
+
+
+def test_at_cap_ignores_the_board_label(cfg, monkeypatch):
+    """T-0966: the label is neither necessary nor sufficient for the throttle.
+
+    Two live devs whose tickets are UNSTAMPED still throttle at cap 2 (the
+    measured defect: 7 of 8 live devs had not stamped theirs); two STAMPED
+    tickets with no live dev behind them do not."""
+    monkeypatch.setattr(_pace, "max_in_progress", lambda c, s: 2)
+    _no_target(cfg)
+    _task(cfg, "T-1", status="planned")
+    _task(cfg, "T-2", status="planned")
+    _dev(cfg, "S-u-dev-p1", "T-1")
+    _dev(cfg, "S-u-dev-p2", "T-2")
+    st = ord_.pacing_status(cfg, SLUG)
+    assert st["in_progress"] == 0 and st["live_dev_sessions"] == 2
+    assert st["at_cap"] is True
+
+    _LIVE_AGENTS.clear()  # both devs died; their tickets stay on the board
     _task(cfg, "T-1", status="in_progress")
     _task(cfg, "T-2", status="in_progress")
     st = ord_.pacing_status(cfg, SLUG)
-    assert st["at_cap"] is True
-    assert st["recommendation"] == "throttle"
+    assert st["in_progress"] == 2 and st["live_dev_sessions"] == 0
+    assert st["at_cap"] is False
 
 
 def test_under_cap_is_ok(cfg, monkeypatch):
     monkeypatch.setattr(_pace, "max_in_progress", lambda c, s: 3)
     _no_target(cfg)
-    _task(cfg, "T-1", status="in_progress")
+    _dev(cfg, "S-u-dev-p1", "T-1")
     st = ord_.pacing_status(cfg, SLUG)
     assert st["at_cap"] is False
     assert st["recommendation"] == "ok"
@@ -199,12 +256,12 @@ def test_under_pace_ramps_above_baseline(cfg, monkeypatch):
     monkeypatch.setattr(_pace, "max_in_progress", lambda c, s: 0)  # unlimited board cap
     _set_target(cfg, 70)
     _set_quota(cfg, budget=1000, remaining=700)  # 300/1000 = 30% spent
-    _task(cfg, "T-1", status="in_progress")
+    _dev(cfg, "S-u-dev-p1", "T-1")
     st = ord_.pacing_status(cfg, SLUG)
     assert st["pace_verdict"] == "under"
     assert st["recommendation"] == "ramp"
     assert st["target_in_progress"] is not None
-    assert st["target_in_progress"] > st["in_progress"]
+    assert st["target_in_progress"] > st["live_dev_sessions"]
 
 
 def test_on_pace_no_ramp(cfg, monkeypatch):
@@ -236,7 +293,7 @@ def test_ramp_never_exceeds_max_in_progress_cap(cfg, monkeypatch):
     monkeypatch.setattr(_pace, "max_in_progress", lambda c, s: 1)
     _set_target(cfg, 70)
     _set_quota(cfg, budget=1000, remaining=700)  # 30% spent, well under target
-    _task(cfg, "T-1", status="in_progress")  # already at the cap (1)
+    _dev(cfg, "S-u-dev-p1", "T-1")  # already at the cap (1)
     st = ord_.pacing_status(cfg, SLUG)
     assert st["pace_verdict"] == "under"
     assert st["at_cap"] is True
@@ -250,10 +307,10 @@ def test_ramp_bounded_by_max_in_progress_when_headroom_exists(cfg, monkeypatch):
     monkeypatch.setattr(_pace, "max_in_progress", lambda c, s: 3)
     _set_target(cfg, 70)
     _set_quota(cfg, budget=1000, remaining=700)  # 30% spent
-    _task(cfg, "T-1", status="in_progress")  # in_progress=1, cap=3
+    _dev(cfg, "S-u-dev-p1", "T-1")  # 1 live lane, cap=3
     st = ord_.pacing_status(cfg, SLUG)
     assert st["recommendation"] == "ramp"
-    assert st["in_progress"] < st["target_in_progress"] <= 3
+    assert st["live_dev_sessions"] < st["target_in_progress"] <= 3
 
 
 def test_backoff_clamped_suppresses_ramp(cfg, monkeypatch):
@@ -264,8 +321,8 @@ def test_backoff_clamped_suppresses_ramp(cfg, monkeypatch):
     monkeypatch.setattr(_pace, "max_in_progress", lambda c, s: 0)  # no board cap
     _set_target(cfg, 70)
     _set_quota(cfg, budget=1000, remaining=700)  # 30% spent, well under target
-    _task(cfg, "T-1", status="in_progress")
-    _task(cfg, "T-2", status="in_progress")  # in_progress = 2
+    _dev(cfg, "S-u-dev-p1", "T-1")
+    _dev(cfg, "S-u-dev-p2", "T-2")  # 2 live lanes
     monkeypatch.setattr(_backoff, "effective_limit", lambda c: 2)  # clamped at current load
     st = ord_.pacing_status(cfg, SLUG)
     assert st["pace_verdict"] == "under"

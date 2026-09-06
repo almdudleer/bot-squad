@@ -367,10 +367,30 @@ def _normalized_drive(raw: dict) -> dict:
     return out
 
 
+#: Mirrors ``operator_redrive.CAP_COUNTS`` — the unit ``max_in_progress`` counts.
+#: Published so a consumer of this payload cannot read the ``in_progress`` board
+#: count sitting beside the cap as the cap's own load (T-0966); this surface is
+#: file-read-only by design and cannot take the live count itself, so it says
+#: what the cap counts and does NOT pretend the number it has is that.
+CAP_COUNTS = "live_dev_sessions"
+
+
 def _quota(data_dir: Path, slug: str, in_progress: int) -> dict:
+    """The pace config + the board's ``in_progress`` count.
+
+    ⚠ T-0966: ``in_progress`` is the BOARD LABEL count and is NOT the quantity
+    ``max_in_progress`` gates — the cap counts live dev sessions
+    (``cap_counts``), which only the worker can measure. Measured on the live
+    install 2026-09-06: 8 live dev sessions, 1 ticket labelled ``in_progress``,
+    cap 7 — so rendering "1 / 7" from these two fields stated the opposite of
+    what was happening. Both numbers are real; they are not the same unit, and
+    the payload now says so. The LIVE reading lives on the automation snapshot
+    (``/automation``, a worker proxy) and on ``bsq pace show``.
+    """
     raw = _pace_raw(data_dir, slug)
     return {
         "max_in_progress": max(0, _coerce_int(raw.get("max_in_progress"), 0)),
+        "cap_counts": CAP_COUNTS,
         "in_progress": in_progress,
         "paused": _global_paused(data_dir, slug),
         "initiatives": _normalized_initiatives(raw),

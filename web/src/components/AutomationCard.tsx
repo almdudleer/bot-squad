@@ -58,6 +58,32 @@ const STATE_BUTTONS: { state: DriveState; label: string; hint: string }[] = [
  * means we do not know, and a confident "nothing is running" that turns out to
  * be wrong is exactly the class of statement this ticket exists to remove.
  */
+/**
+ * T-0966 — the max-in-progress cap, with the unit it counts and its LIVE value.
+ *
+ * The cap used to render as a bare number ("cap: max-in-progress 7"), leaving
+ * the reader to infer both what it counts and whether it was reached. It counts
+ * LIVE DEV SESSIONS; measured on the live install 2026-09-06 the board showed 1
+ * ticket labelled `in_progress` under a cap of 7 while **8 dev sessions were
+ * running**, so any number a reader inferred here was wrong in the unsafe
+ * direction. This snapshot is a worker proxy and carries the real count, so it
+ * is stated. `null`/`undefined` is an explicit unknown (a pre-T-0966 worker),
+ * never a 0 standing in for one.
+ *
+ * Pure + exported so the wording is unit-testable without rendering the card.
+ */
+export function paceCapCopy(
+  cap: number,
+  live: number | null | undefined,
+): string {
+  if (!cap) return "max-in-progress ∞ (no parallelism cap)";
+  if (live === null || live === undefined) {
+    return `max-in-progress ${cap} live dev sessions (live count unknown)`;
+  }
+  const verdict = live >= cap ? "AT CAP" : `${cap - live} lane(s) free`;
+  return `max-in-progress ${live}/${cap} live dev sessions — ${verdict}`;
+}
+
 export function automationCopy(snap: AutomationSnapshot | null | undefined): {
   status: "running" | "stopped" | "unknown";
   headline: string;
@@ -194,8 +220,7 @@ export function AutomationCard({ slug }: { slug: string }) {
           is a different fact. */}
       {snap && (
         <div className="mc-an-card-sub" data-testid="automation-quota">
-          cap: max-in-progress{" "}
-          {snap.quota.max_in_progress ? snap.quota.max_in_progress : "∞"} · weekly
+          cap: {paceCapCopy(snap.quota.max_in_progress, snap.quota.live_dev_sessions)} · weekly
           quota target{" "}
           {snap.quota.weekly_target_pct !== null
             ? `${snap.quota.weekly_target_pct}%`

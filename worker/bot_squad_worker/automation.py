@@ -190,8 +190,10 @@ def snapshot(cfg: Any, slug: str) -> dict:
         }
 
     ``quota`` answers "with quota caps and targets" from the same request: the
-    board CAP the state implies (``max_in_progress``, 0 = unlimited) and the
-    weekly-spend TARGET with the measured spend and the under/on/over verdict.
+    parallelism CAP the state implies (``max_in_progress``, 0 = unlimited) with
+    the unit it counts (``cap_counts``) and the LIVE value of that unit
+    (``live_dev_sessions``, T-0966), plus the weekly-spend TARGET with the
+    measured spend and the under/on/over verdict.
     They live in two different stores (``pace.json`` and ``system_settings.toml``
     ``[operator].weekly_quota_target_pct``), which is precisely why they belong
     on one view — needing to know that to answer "what are my caps" is the
@@ -251,9 +253,16 @@ def _quota(cfg: Any, slug: str, max_in_progress: int) -> dict:
     explicit unknown), never as a zero that reads like a real measurement.
     """
     out = {"max_in_progress": max_in_progress, "weekly_target_pct": None,
-           "spend_pct": None, "verdict": None}
+           "spend_pct": None, "verdict": None,
+           # T-0966 DoD4: WHAT the cap counts and its LIVE value, so a surface
+           # renders "5 live / cap 7" instead of a bare 7 the reader must infer
+           # the unit of. `live_dev_sessions` is None (an explicit unknown) only
+           # when the count could not be taken, never 0 standing in for one.
+           "cap_counts": None, "live_dev_sessions": None}
     try:
         from bot_squad_worker import operator_redrive as _ord
+        out["cap_counts"] = _ord.CAP_COUNTS
+        out["live_dev_sessions"] = _ord._live_dev_count(cfg, slug)
         out["weekly_target_pct"] = _ord.weekly_quota_target_pct(cfg)
         out["spend_pct"] = _ord._burn_signal(cfg, slug).get("spend_pct")
         out["verdict"] = _ord.pace_verdict(out["weekly_target_pct"], out["spend_pct"])

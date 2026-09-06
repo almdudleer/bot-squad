@@ -100,7 +100,7 @@ def tmux(monkeypatch):
     monkeypatch.setattr(S, "_run", fake.run)
     monkeypatch.setattr(S, "list_panes", fake.list_panes)
     monkeypatch.setattr(S, "_ensure_project_tmux_session", lambda *a, **k: None)
-    monkeypatch.setattr(S, "_enforce_parallel_cap", lambda cfg: None)
+    monkeypatch.setattr(S, "_enforce_parallel_cap", lambda cfg, slug=None: None)
     monkeypatch.setattr(S, "_enforce_token_cap", lambda cfg: None)
     return fake
 

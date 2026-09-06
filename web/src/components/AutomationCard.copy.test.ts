@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { automationCopy } from "./AutomationCard";
+import { automationCopy, paceCapCopy } from "./AutomationCard";
 import type { AutomationSnapshot } from "../api";
 
 /**
@@ -89,5 +89,47 @@ describe("automationCopy", () => {
       expect(copy.headline).toBe("UNKNOWN");
       expect(copy.sub).not.toContain("nothing automatic runs");
     }
+  });
+});
+
+
+/**
+ * T-0966 — the cap line. The card is a WORKER PROXY, so unlike the file-read
+ * transparency strip it can state the live reading instead of a bare cap the
+ * reader has to infer the unit of.
+ */
+describe("paceCapCopy", () => {
+  it("states the live count, the cap, and the unit both are in", () => {
+    // The install as measured 2026-09-06 13:49Z: cap 7, eight lanes running.
+    expect(paceCapCopy(7, 8)).toBe(
+      "max-in-progress 8/7 live dev sessions — AT CAP",
+    );
+  });
+
+  it("names the headroom when there is some", () => {
+    expect(paceCapCopy(7, 5)).toBe(
+      "max-in-progress 5/7 live dev sessions — 2 lane(s) free",
+    );
+  });
+
+  it("exactly at the cap reads AT CAP, not one lane free", () => {
+    expect(paceCapCopy(7, 7)).toBe(
+      "max-in-progress 7/7 live dev sessions — AT CAP",
+    );
+  });
+
+  it("an absent count is an explicit unknown, never a zero", () => {
+    // A pre-T-0966 worker sends no count. Rendering 0 would read as "no lanes
+    // running" — the exact false reassurance this ticket exists to remove.
+    expect(paceCapCopy(7, null)).toBe(
+      "max-in-progress 7 live dev sessions (live count unknown)",
+    );
+    expect(paceCapCopy(7, undefined)).toBe(
+      "max-in-progress 7 live dev sessions (live count unknown)",
+    );
+  });
+
+  it("no cap says so instead of printing a denominator", () => {
+    expect(paceCapCopy(0, 8)).toBe("max-in-progress ∞ (no parallelism cap)");
   });
 });

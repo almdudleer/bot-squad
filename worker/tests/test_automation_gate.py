@@ -320,7 +320,13 @@ def test_snapshot_carries_the_caps_and_targets_that_go_with_the_state(cfg, monke
     assert q["weekly_target_pct"] == 20.0
     assert q["spend_pct"] == 35.0
     assert q["verdict"] == "over", "35% spent against a 20% target is over pace"
-    assert set(q) == {"max_in_progress", "weekly_target_pct", "spend_pct", "verdict"}
+    # T-0966: the cap value never travels alone any more — `cap_counts` names
+    # the unit and `live_dev_sessions` is its live value, so no surface can
+    # print a bare "1" and leave the reader to infer what it counts.
+    assert q["cap_counts"] == "live_dev_sessions"
+    assert q["live_dev_sessions"] == 0, "no live sessions in this tmp project"
+    assert set(q) == {"max_in_progress", "weekly_target_pct", "spend_pct",
+                      "verdict", "cap_counts", "live_dev_sessions"}
 
     # (b) both ABSENT — an EXPLICIT unknown, never a 0 that reads like a real
     # measurement, and no verdict invented from half a signal.

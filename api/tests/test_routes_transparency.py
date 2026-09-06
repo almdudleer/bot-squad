@@ -78,6 +78,12 @@ def test_transparency_aggregates_the_four_surfaces(tmp_bot_squad: Path, monkeypa
     # Quota: max-in-progress + derived in_progress count + pause + initiatives.
     assert body["quota"]["max_in_progress"] == 13
     assert body["quota"]["in_progress"] == 1
+    # T-0966: the payload names the unit the CAP counts, which is NOT the
+    # `in_progress` board count sitting next to it. Both numbers above are real;
+    # they are different units, and the board renders them as a ratio unless the
+    # wire says otherwise. Measured 2026-09-06 on the live install: 8 live dev
+    # sessions, 1 labelled ticket, cap 7 — the strip read "1 / 7".
+    assert body["quota"]["cap_counts"] == "live_dev_sessions"
     assert body["quota"]["paused"] is False
     assert body["quota"]["initiatives"]["x.md"]["weight"] == 2.0
 

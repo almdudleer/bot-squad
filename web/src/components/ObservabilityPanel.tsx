@@ -118,6 +118,30 @@ function DetailSection({
  * An UNKNOWN scope (legacy server, failed fan-out) keeps today's neutral copy.
  * We can only claim the count is the viewer's when the server says so.
  */
+/**
+ * T-0966 — the IN PROGRESS card's sub-copy, as a function of the cap. Pure +
+ * exported so the wording is unit-testable, same as `liveSessionsCardCopy`.
+ *
+ * THE DEFECT THIS CLOSES: this card rendered `{quota.in_progress} / {cap}` —
+ * two numbers of DIFFERENT units as one ratio, with a red over-cap alarm wired
+ * to the wrong one. `in_progress` counts tickets carrying the `in_progress`
+ * board LABEL; `max_in_progress` caps LIVE DEV SESSIONS. Measured on the live
+ * install 2026-09-06 13:49Z with the stakeholder's own cap of 7: **8 live dev
+ * sessions, 1 labelled ticket** — so the card read "1 / 7", i.e. six lanes of
+ * headroom, while the system was one over. The label is a field a session must
+ * remember to stamp, and 7 of the 8 had not.
+ *
+ * This surface reads files only (it must survive a dead worker) and cannot take
+ * the live session count, so it stops implying it has one: the board number is
+ * shown as itself and the cap is named with the unit it counts. The LIVE
+ * reading is on the automation card, which is a worker proxy.
+ */
+export function inProgressCardCopy(cap: number): string {
+  return cap === 0
+    ? "tickets labelled in_progress · no cap set"
+    : `tickets labelled in_progress · cap ${cap} counts live dev sessions`;
+}
+
 export function liveSessionsCardCopy(
   scope: SessionsScope | undefined,
 ): { label: string; sub: string } {
@@ -322,21 +346,13 @@ function SummaryStrip({
 }) {
   const liveCopy = liveSessionsCardCopy(sessionsScope);
   const cap = quota.max_in_progress;
-  const capLabel = cap === 0 ? "∞" : String(cap);
-  const overCap = cap > 0 && quota.in_progress > cap;
+  const capCopy = inProgressCardCopy(cap);
   return (
     <div className="mc-an-cards">
       <div className="mc-an-card">
         <div className="mc-an-card-label">IN PROGRESS</div>
-        <div
-          className="mc-an-card-value"
-          style={{ color: overCap ? "var(--mc-red)" : "var(--mc-text)" }}
-        >
-          {quota.in_progress} / {capLabel}
-        </div>
-        <div className="mc-an-card-sub">
-          {cap === 0 ? "no max-in-progress cap" : "max-in-progress cap"}
-        </div>
+        <div className="mc-an-card-value">{quota.in_progress}</div>
+        <div className="mc-an-card-sub">{capCopy}</div>
       </div>
       <Link
         to={`/p/${slug}/sessions`}

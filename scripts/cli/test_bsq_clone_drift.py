@@ -303,3 +303,41 @@ def test_the_verb_asks_for_the_reader_wording():
     src = _BSQ_PATH.read_text()
     body = src.split("def cmd_drift(")[1].split("\ndef ")[0]
     assert "_drift_message(st, just_committed=False)" in body
+
+
+def test_a_failed_content_check_is_UNKNOWN_not_zero():
+    """`git cherry` can fail on its own while the behind-count succeeds. The
+    naive quiet path is `if behind <= LIMIT and not unshipped: return None`, and
+    `not None` is TRUE — so a broken content check would have produced silence
+    that reads exactly like "this clone ships everything". That is the failure
+    this whole ticket is about, reproduced inside its own guard."""
+    st = {"status": "ok", "branch": "work", "upstream": "origin/work",
+          "ahead": 3, "behind": 0, "unshipped": None}
+    msg = bsq._drift_message(st)
+    assert msg is not None, "a failed content check must never be silent"
+    assert "UNKNOWN — not zero" in msg
+
+    # and the same state with a real zero stays quiet, so the UNKNOWN branch is
+    # not just "always shout"
+    st_zero = dict(st, unshipped=0)
+    assert bsq._drift_message(st_zero) is None
+
+
+def test_the_content_check_really_can_return_None(world, monkeypatch):
+    """The line above is only worth pinning if `_drift_state` can actually
+    produce it — a test over a hand-built dict alone would be a claim about my
+    own model, not about the code."""
+    real = bsq.subprocess.run
+
+    def fake(args, **kw):
+        if len(args) > 1 and args[1] == "cherry":
+            class R:
+                returncode, stdout, stderr = 1, "", "fatal: bad revision"
+            return R()
+        return real(args, **kw)
+
+    monkeypatch.setattr(bsq.subprocess, "run", fake)
+    st = bsq._drift_state(str(world["clone"]))
+    assert st["status"] == "ok"
+    assert st["unshipped"] is None
+    assert "UNKNOWN — not zero" in bsq._drift_message(st)

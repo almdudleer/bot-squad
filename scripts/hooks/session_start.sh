@@ -995,6 +995,59 @@ GUARD_WARN
     fi
 fi
 
+# 4c. WORK-STATE DOC FRESHNESS (T-0942) — for the roles that boot from it.
+#
+# THE DEFECT THIS PRINTS AGAINST. On 2026-09-06 an operator booted, was told
+# the state doc was its ONLY memory, and read a body last written 2026-07-31 as
+# current fact — a July release in flight, sessions that could not run a shell,
+# standing orders long superseded. The doc's own frontmatter said `updated:
+# 2026-07-30` two lines above that body. **A date is not a warning.** So the
+# session start says it in words, at the moment the session would otherwise
+# start trusting the file, and it says it here rather than only in the spawn
+# brief because a session that was RESUMED never sees a brief at all.
+#
+# Scoped to the roles whose forward-state IS this doc (work_state.PROJECT_ROLES)
+# — an operator or a user-session. A dev has its ticket's `## Context`.
+case "$ROLE" in
+  operator|user-conversation)
+    _ws=$(BOT_SQUAD="$BOT_SQUAD" python3 - "$DATA" "$slug" 2>/dev/null <<'WS_EOF' || true
+import sys, os
+sys.path.insert(0, os.path.join(os.environ.get("BOT_SQUAD", "/home/www/bot-squad"), "worker"))
+try:
+    from bot_squad_worker import work_state
+except Exception:
+    raise SystemExit(0)
+data_dir, slug = sys.argv[1], sys.argv[2]
+# DATA is <root>/data/<slug>; work_state wants the dir ABOVE the slug.
+root = os.path.dirname(os.path.abspath(data_dir))
+try:
+    res = work_state.read(root, slug)
+except Exception:
+    raise SystemExit(0)
+st = res["staleness"]
+if not st["exists"]:
+    print("No work-state doc exists yet for this project → " + res["path"])
+    print("You hold a project-level role, so writing it is yours: "
+          "`bsq work-state --template`, then `bsq work-state write --file <f> --base-rev 0`.")
+    raise SystemExit(0)
+print(f"{res['path']}  (rev {res['rev']})")
+if res["banner"]:
+    print(res["banner"])
+    print("Read it with `bsq work-state`; replace it with what you measure: "
+          f"`bsq work-state write --file <f> --base-rev {res['rev']}`.")
+else:
+    print(f"Current — written {st['age_human']} ago by "
+          f"{st['updated_by'] or 'an unrecorded session'}. Read it with `bsq work-state`.")
+WS_EOF
+)
+    if [ -n "$_ws" ]; then
+        print_section "WORK-STATE DOC"
+        echo "$_ws"
+    fi
+    unset _ws
+    ;;
+esac
+
 # 5. Message bus — give every session the recipe for cross-session messaging
 # via the `bsq` CLI. TLs are expected to keep a `bsq inbox wait` armed
 # in the background; devs use it as a backup channel (their primary is the

@@ -295,19 +295,50 @@ def test_an_unconfigured_project_is_all_tasks_and_running(cfg):
 # The visibility half
 # ---------------------------------------------------------------------------
 
-def test_snapshot_carries_the_caps_and_targets_that_go_with_the_state(cfg):
+def test_snapshot_carries_the_caps_and_targets_that_go_with_the_state(cfg, monkeypatch):
     """"I need a few well-defined states, WITH QUOTA CAPS AND TARGETS." The cap
     lives in pace.json and the target in system_settings.toml — two stores, which
-    is exactly why one view has to carry both."""
+    is exactly why one view has to carry both.
+
+    BOTH SIGNALS ARE PINNED, not read from the host. The first version of this
+    test asserted ``weekly_target_pct is None`` on a fresh project — but that
+    value comes from the INSTALL's ``system_settings.toml`` (via
+    ``operator_redrive._system_settings_path``), not from this test's tmp_path.
+    It passed nowhere the install had a target set and failed on the real host,
+    which had 81.0. A test whose result depends on host config is measuring the
+    host, so both signals are now supplied explicitly.
+    """
+    from bot_squad_worker import operator_redrive as ord_
+
     pace.set_drive_state(cfg, "proj", "one_task", set_by="test")
+
+    # (a) both signals PRESENT — the verdict is computed, not passed through
+    monkeypatch.setattr(ord_, "weekly_quota_target_pct", lambda _cfg: 20.0)
+    monkeypatch.setattr(ord_, "_burn_signal", lambda _c, _s: {"spend_pct": 35.0})
     q = automation.snapshot(cfg, "proj")["quota"]
     assert q["max_in_progress"] == 1, "one_task IS a cap of one"
-    # No target set and no quota anchor on a fresh project: an EXPLICIT unknown,
-    # never a 0 that reads like a real measurement.
+    assert q["weekly_target_pct"] == 20.0
+    assert q["spend_pct"] == 35.0
+    assert q["verdict"] == "over", "35% spent against a 20% target is over pace"
+    assert set(q) == {"max_in_progress", "weekly_target_pct", "spend_pct", "verdict"}
+
+    # (b) both ABSENT — an EXPLICIT unknown, never a 0 that reads like a real
+    # measurement, and no verdict invented from half a signal.
+    monkeypatch.setattr(ord_, "weekly_quota_target_pct", lambda _cfg: None)
+    monkeypatch.setattr(ord_, "_burn_signal", lambda _c, _s: {"spend_pct": None})
+    q = automation.snapshot(cfg, "proj")["quota"]
     assert q["weekly_target_pct"] is None
     assert q["spend_pct"] is None
     assert q["verdict"] is None
-    assert set(q) == {"max_in_progress", "weekly_target_pct", "spend_pct", "verdict"}
+
+    # (c) HALF a signal is still no verdict — the case that would tempt a
+    # surface into reporting "on pace" from a target with nothing to measure.
+    monkeypatch.setattr(ord_, "weekly_quota_target_pct", lambda _cfg: 20.0)
+    monkeypatch.setattr(ord_, "_burn_signal", lambda _c, _s: {"spend_pct": None})
+    q = automation.snapshot(cfg, "proj")["quota"]
+    assert q["weekly_target_pct"] == 20.0
+    assert q["spend_pct"] is None
+    assert q["verdict"] is None
 
 
 def test_snapshot_quota_survives_an_unreadable_signal(cfg, monkeypatch):

@@ -103,6 +103,29 @@ def test_body_line_that_looks_like_status_does_not_win(tmp_path):
     assert seen == 1
 
 
+def test_missing_status_in_frontmatter_ignores_body_lookalike(tmp_path):
+    # Operator-found gap (mutation testing): the T-0038 test above passes
+    # on first-match-wins alone, since the real status is found before the
+    # closing fence is ever reached — it never actually exercises the
+    # fence. This fixture has NO status field in frontmatter at all, so the
+    # only way to stay correct is to stop scanning at the closing `---`
+    # rather than reading past it into the body. Without that fence, the
+    # body's `status: open` gets misread as the real status — a malformed
+    # ticket silently miscounted as a real `open` one, exactly the defect
+    # class this tool exists to catch.
+    p = _write(
+        tmp_path, "T-0500-demo.md",
+        "---\nid: T-0500\ntitle: malformed, no status field\n---\n\n"
+        "## Progress\n\nstatus: open\n",
+    )
+    assert bc.status_of(p) is None
+
+    by, seen = bc.census(str(tmp_path))
+    assert by[bc.NO_STATUS] == ["T-0500"]
+    assert "open" not in by
+    assert seen == 1
+
+
 def test_census_buckets_multiple_statuses(tmp_path):
     _write(tmp_path, "T-0010-a.md", "---\nid: T-0010\nstatus: open\n---\n\nbody\n")
     _write(tmp_path, "T-0011-b.md", "---\nid: T-0011\nstatus: open\n---\n\nbody\n")

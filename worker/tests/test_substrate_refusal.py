@@ -23,8 +23,11 @@ apart (the same construction lint.yml's mirror gate uses).
 from __future__ import annotations
 
 import importlib.util
+import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -202,16 +205,145 @@ def test_ordinary_bug():
 '''
 
 
+def _run_child_hard_kill(argv: list, *, cwd: Path,
+                          timeout: float) -> subprocess.CompletedProcess:
+    """Run a child that can itself spawn a full pytest, with a HARD kill on
+    timeout (T-1024; the T-0212 idiom already shipped in routines.py/deploy.py).
+
+    A bare ``timeout=`` on ``subprocess.run`` is not the fix: on expiry it
+    kills only the immediate child, and a grandchild still holding the
+    stdout/stderr pipe leaves ``communicate()`` blocked past the stated
+    timeout anyway. Leading its own process group (``start_new_session=True``)
+    lets a timed-out run's ``killpg`` reach every descendant, not just the
+    direct child — so THIS is what makes a contended-host hang actually end.
+    """
+    proc = subprocess.Popen(
+        argv, cwd=str(cwd), text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,  # own process group -> killpg reaches children
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
 def _run_pytest(tmp_path: Path, test_source: str) -> str:
     (tmp_path / "conftest.py").write_text(_TMP_CONFTEST)
     (tmp_path / "test_sample.py").write_text(test_source)
-    proc = subprocess.run(
+    proc = _run_child_hard_kill(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_sample.py"],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
+        cwd=tmp_path, timeout=120,
     )
     return proc.stdout + proc.stderr
+
+
+# --- T-1024: prove the group-kill actually fires, not just that a timeout ---
+# --- argument is present -----------------------------------------------------
+
+_HANG_GRANDCHILD_SLEEP_S = 10
+_HANG_OUTER_TIMEOUT_S = 3
+
+_HANG_TEST_SOURCE = f'''
+import subprocess, sys, time
+
+# Spawned at COLLECTION TIME (module level), not inside a test function, so
+# it is already alive no matter how early the outer timeout fires relative to
+# pytest's own startup. No stdout/stderr redirection: this inherits the
+# CURRENT process's fds, which are the pipe the wrapper below reads via
+# communicate() — killing only the pytest pid leaves this holding it open.
+subprocess.Popen([sys.executable, "-c",
+                   "import time; time.sleep({_HANG_GRANDCHILD_SLEEP_S})"])
+
+
+def test_hangs_forever():
+    # The measured defect: on a contended host the test itself never returns,
+    # so the kill has to come from the wrapper's timeout, not from pytest
+    # finishing on its own.
+    time.sleep(60)
+'''
+
+
+def _run_child_single_pid_kill(argv: list, *, cwd: Path,
+                                timeout: float) -> subprocess.CompletedProcess:
+    """NEGATIVE CONTROL ONLY — reproduces the PRE-T-1024 shape: the same idiom
+    ``subprocess.run(timeout=...)`` uses internally (kill the direct child,
+    then block in ``communicate()`` again until the pipes actually close).
+    No process group, no killpg. Used only to prove ``_run_child_hard_kill``'s
+    group-kill is load-bearing, never as a real call site.
+    """
+    proc = subprocess.Popen(argv, cwd=str(cwd), text=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()  # single pid only — a grandchild is untouched
+        out, err = proc.communicate()  # blocks until every pipe holder exits
+        raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err)
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+def test_hard_kill_bounds_a_hanging_grandchild(tmp_path):
+    """PROVE THE GUARD CAN FAIL (T-1024): construct the real hang — a nested
+    pytest whose collection spawns a grandchild holding the stdout pipe open,
+    then itself never returns — and confirm ``_run_child_hard_kill`` bounds
+    the wait near ITS OWN timeout, not near the grandchild's full sleep.
+    """
+    (tmp_path / "test_sample.py").write_text(_HANG_TEST_SOURCE)
+    start = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_child_hard_kill(
+            # -s: pytest's default fd-capture redirects fd 1/2 during
+            # collection, so the grandchild would inherit ITS capture
+            # destination instead of our pipe and the hang would not
+            # reproduce — confirmed empirically, not assumed.
+            [sys.executable, "-m", "pytest", "-q", "-s", "-p", "no:cacheprovider",
+             "test_sample.py"],
+            cwd=tmp_path, timeout=_HANG_OUTER_TIMEOUT_S,
+        )
+    elapsed = time.monotonic() - start
+    assert elapsed < _HANG_GRANDCHILD_SLEEP_S - 3, (
+        f"took {elapsed:.1f}s — killpg did not reach the grandchild, so this "
+        "waited for its full sleep instead of being bounded by the timeout")
+
+
+def test_a_single_pid_kill_does_not_bound_the_same_hang(tmp_path):
+    """The mutation: drop the process-group kill (``_run_child_single_pid_kill``,
+    the pre-T-1024 shape) into the IDENTICAL hang. If this does NOT run out
+    the grandchild's full sleep, the test above proves nothing — a group kill
+    would look load-bearing by coincidence rather than by mechanism.
+    """
+    (tmp_path / "test_sample.py").write_text(_HANG_TEST_SOURCE)
+    start = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_child_single_pid_kill(
+            # -s: pytest's default fd-capture redirects fd 1/2 during
+            # collection, so the grandchild would inherit ITS capture
+            # destination instead of our pipe and the hang would not
+            # reproduce — confirmed empirically, not assumed.
+            [sys.executable, "-m", "pytest", "-q", "-s", "-p", "no:cacheprovider",
+             "test_sample.py"],
+            cwd=tmp_path, timeout=_HANG_OUTER_TIMEOUT_S,
+        )
+    elapsed = time.monotonic() - start
+    assert elapsed > _HANG_GRANDCHILD_SLEEP_S - 3, (
+        f"took only {elapsed:.1f}s — the negative control did not reproduce "
+        "the hang, so it cannot show the fix's group-kill is load-bearing")
 
 
 def test_missing_substrate_gets_a_banner_and_a_trailer(tmp_path):

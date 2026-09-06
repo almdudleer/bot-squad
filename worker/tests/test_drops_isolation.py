@@ -30,6 +30,7 @@ liveness consumer that happens to sort late.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -78,6 +79,42 @@ def test_the_next_test_sees_a_pristine_counter() -> None:
     assert dict(OB.DROPS) == {"record": 0, "drain": 0, "mirror": 0}
 
 
+def _run_child_hard_kill(argv: list, *, cwd, env=None,
+                          timeout: float) -> subprocess.CompletedProcess:
+    """Run a child pytest with a HARD kill on timeout (T-1024; the T-0212
+    idiom from routines.py / deploy.py). A bare ``timeout=`` on
+    ``subprocess.run`` only kills the direct child on expiry — a grandchild
+    still holding the stdout/stderr pipe leaves ``communicate()`` blocked past
+    the stated timeout anyway. Leading its own process group
+    (``start_new_session=True``) lets a timed-out run's ``killpg`` reach every
+    descendant.
+    """
+    proc = subprocess.Popen(
+        argv, cwd=str(cwd), env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,  # own process group -> killpg reaches children
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
 def test_the_polluter_running_first_no_longer_breaks_the_reader() -> None:
     """THE regression test: the ticket's reproduction, in two files not a hundred.
 
@@ -100,11 +137,10 @@ def test_the_polluter_running_first_no_longer_breaks_the_reader() -> None:
         "T-0774's reproduction pair has been renamed; re-point this test at the "
         "file that leaks into outbound_log.DROPS and the one that reads it")
 
-    proc = subprocess.run(
+    proc = _run_child_hard_kill(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
          str(polluter), str(reader)],
-        cwd=str(_WORKER_ROOT), env=_subprocess_env(), capture_output=True, text=True,
-        timeout=300,
+        cwd=_WORKER_ROOT, env=_subprocess_env(), timeout=300,
     )
 
     assert proc.returncode == 0, (
@@ -124,10 +160,9 @@ def test_that_subprocess_check_can_actually_go_red(tmp_path: Path) -> None:
     failing = tmp_path / "test_t0774_control.py"
     failing.write_text("def test_must_fail():\n    assert False\n", encoding="utf-8")
 
-    proc = subprocess.run(
+    proc = _run_child_hard_kill(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(failing)],
-        cwd=str(_WORKER_ROOT), env=_subprocess_env(), capture_output=True, text=True,
-        timeout=300,
+        cwd=_WORKER_ROOT, env=_subprocess_env(), timeout=300,
     )
 
     assert proc.returncode != 0

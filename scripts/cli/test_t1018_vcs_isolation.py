@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import signal
 import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
@@ -34,6 +35,42 @@ _loader = SourceFileLoader("bsq_mod", str(_BSQ_PATH))
 bsq = importlib.util.module_from_spec(
     importlib.util.spec_from_loader("bsq_mod", _loader))
 _loader.exec_module(bsq)
+
+
+def _run_child_hard_kill(argv: list, *, cwd, env=None,
+                          timeout: float) -> subprocess.CompletedProcess:
+    """Run ``verify-isolated`` with a HARD kill on timeout (T-1024; the T-0212
+    idiom from routines.py / deploy.py). A bare ``timeout=`` on
+    ``subprocess.run`` only kills the direct child on expiry — a grandchild
+    still holding the stdout/stderr pipe leaves ``communicate()`` blocked past
+    the stated timeout anyway. Leading its own process group
+    (``start_new_session=True``) lets a timed-out run's ``killpg`` reach every
+    descendant.
+    """
+    proc = subprocess.Popen(
+        argv, cwd=str(cwd), env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,  # own process group -> killpg reaches children
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
 def _said(capsys) -> str:
@@ -187,10 +224,10 @@ def test_verify_isolated_REFUSES_when_TMPDIR_points_inside_a_repo(tmp_path):
 
     env = dict(os.environ)
     env["TMPDIR"] = str(scratch)
-    proc = subprocess.run(
+    proc = _run_child_hard_kill(
         [sys.executable, str(_BSQ_PATH), "verify-isolated", "--",
          sys.executable, "-c", "print('CHILD RAN')"],
-        cwd=str(outer), env=env, capture_output=True, text=True)
+        cwd=outer, env=env, timeout=60)
     out = proc.stdout + proc.stderr
     assert "AMBIENT GIT REPO" in out, out
     assert "CHILD RAN" not in out, "the child ran anyway — the guard is advisory"
@@ -202,10 +239,10 @@ def test_verify_isolated_ALLOWS_a_normal_extract_and_says_so(tmp_path):
     TMPDIR left alone must run and must announce the check it passed."""
     outer = tmp_path / "host_repo2"
     _make_repo(outer)
-    proc = subprocess.run(
+    proc = _run_child_hard_kill(
         [sys.executable, str(_BSQ_PATH), "verify-isolated", "--",
          sys.executable, "-c", "print('CHILD RAN')"],
-        cwd=str(outer), env=dict(os.environ), capture_output=True, text=True)
+        cwd=outer, env=dict(os.environ), timeout=60)
     out = proc.stdout + proc.stderr
     assert "no git repo at or above the extract" in out, out
     assert "CHILD RAN" in out, out

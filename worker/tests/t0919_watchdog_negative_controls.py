@@ -16,8 +16,10 @@ The harness has a built-in positive control in two layers:
      scratch copy, every mutation would come back green, because the real tree
      is not mutated. So a RED is itself proof the scratch copy was executed.
 """
+import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -110,13 +112,49 @@ def fresh_scratch() -> Path:
     return SCRATCH
 
 
+def _run_child_hard_kill(argv: list, *, cwd, env=None,
+                          timeout: float) -> subprocess.CompletedProcess:
+    """Run a child pytest with a HARD kill on timeout (T-1024; the T-0212
+    idiom from routines.py / deploy.py). A bare ``timeout=`` on
+    ``subprocess.run`` only kills the direct child on expiry — a grandchild
+    still holding the stdout/stderr pipe leaves ``communicate()`` blocked past
+    the stated timeout anyway. Leading its own process group
+    (``start_new_session=True``) lets a timed-out run's ``killpg`` reach every
+    descendant.
+    """
+    proc = subprocess.Popen(
+        argv, cwd=str(cwd), env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,  # own process group -> killpg reaches children
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
 def run_test(test: str, timeout: int = 120) -> tuple[str, str]:
     """-> (verdict, detail). verdict in {GREEN, RED, RED(hang)}"""
     try:
-        r = subprocess.run(
+        r = _run_child_hard_kill(
             [str(PY), "-m", "pytest", f"tests/test_deploy.py::{test}",
              "-q", "-p", "no:cacheprovider", "--no-header", "-x"],
-            cwd=str(SCRATCH), capture_output=True, text=True, timeout=timeout,
+            cwd=SCRATCH, timeout=timeout,
             env={"PATH": "/usr/bin:/bin", "PYTHONPATH": ".", "HOME": "/tmp"},
         )
     except subprocess.TimeoutExpired:

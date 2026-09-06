@@ -31,6 +31,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import signal
 import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
@@ -302,11 +303,46 @@ def sandbox(tmp_path_factory):
     return d
 
 
+def _run_child_hard_kill(argv: list, *, cwd, env=None,
+                          timeout: float) -> subprocess.CompletedProcess:
+    """Run a child that itself spawns a full pytest (``verify-isolated`` does),
+    with a HARD kill on timeout (T-1024; the T-0212 idiom from routines.py /
+    deploy.py). A bare ``timeout=`` on ``subprocess.run`` only kills the direct
+    child on expiry — a grandchild still holding the stdout/stderr pipe leaves
+    ``communicate()`` blocked past the stated timeout anyway. Leading its own
+    process group (``start_new_session=True``) lets a timed-out run's
+    ``killpg`` reach every descendant.
+    """
+    proc = subprocess.Popen(
+        argv, cwd=str(cwd), env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,  # own process group -> killpg reaches children
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
 def _run_verify(sandbox, cmd):
-    proc = subprocess.run(
+    proc = _run_child_hard_kill(
         [sys.executable, str(_BSQ_PATH), "verify-isolated", "--"] + list(cmd),
-        cwd=str(sandbox / "repo"), env=dict(os.environ),
-        capture_output=True, text=True)
+        cwd=sandbox / "repo", env=dict(os.environ), timeout=120)
     return proc.returncode, proc.stdout + proc.stderr
 
 

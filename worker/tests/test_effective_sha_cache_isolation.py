@@ -45,6 +45,7 @@ control that only exercises one of them proves half a fix:
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import textwrap
@@ -296,6 +297,42 @@ _LEAK_PAIR = '''
 '''
 
 
+def _run_child_hard_kill(argv: list, *, cwd, env=None,
+                          timeout: float) -> subprocess.CompletedProcess:
+    """Run a child pytest with a HARD kill on timeout (T-1024; the T-0212
+    idiom from routines.py / deploy.py). A bare ``timeout=`` on
+    ``subprocess.run`` only kills the direct child on expiry — a grandchild
+    still holding the stdout/stderr pipe leaves ``communicate()`` blocked past
+    the stated timeout anyway. Leading its own process group
+    (``start_new_session=True``) lets a timed-out run's ``killpg`` reach every
+    descendant.
+    """
+    proc = subprocess.Popen(
+        argv, cwd=str(cwd), env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,  # own process group -> killpg reaches children
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
 def test_the_leak_is_real_without_the_conftest_fixture(tmp_path: Path) -> None:
     """POSITIVE CONTROL (T-0740): the same leak/victim pair, run where
     ``tests/conftest.py`` cannot reach it, MUST go red.
@@ -317,11 +354,10 @@ def test_the_leak_is_real_without_the_conftest_fixture(tmp_path: Path) -> None:
     d.mkdir()
     (d / "test_leak_pair.py").write_text(textwrap.dedent(_LEAK_PAIR), encoding="utf-8")
 
-    proc = subprocess.run(
+    proc = _run_child_hard_kill(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
          str(d / "test_leak_pair.py")],
-        cwd=str(tmp_path), env=_subprocess_env(), capture_output=True, text=True,
-        timeout=300,
+        cwd=tmp_path, env=_subprocess_env(), timeout=300,
     )
 
     assert proc.returncode != 0, (

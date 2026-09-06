@@ -219,6 +219,48 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _iso_to_epoch(ts: Any) -> float | None:
+    """Epoch seconds for a ``_now_iso`` timestamp, or ``None`` when it cannot
+    be parsed. T-1014: an unparseable timestamp must read as UNKNOWN, never
+    fall through to a value that renders as "just now"."""
+    try:
+        return (datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+                .replace(tzinfo=timezone.utc).timestamp())
+    except (TypeError, ValueError):
+        return None
+
+
+def age_phrase(ts: Any, now: float) -> str:
+    """T-1014: how old the cited event is, for an alert that may fire long
+    after it.
+
+    An alert gated by ``DEFAULT_ALERT_COOLDOWN_SEC`` can be HELD for up to
+    three hours and then fire the instant the timer expires, so this message is
+    routinely written about the past and read as the present. Measured
+    2026-09-06: a 429 at 17:09:30Z was announced at 20:03:20Z — 2h53m50s
+    later, four seconds after the cooldown expired, with no 429 in between —
+    and the sentence said the throttle was happening NOW. (This renders that
+    as "2h53m ago": ages TRUNCATE, so the phrase is always a lower bound and
+    never rounds an event up into looking older than it is.)
+
+    The age is the only thing that separates a live condition from a deferred
+    edge, so an age we cannot compute SAYS SO. Omitting it is not neutral: a
+    timestamp with no age beside it reads as recent.
+    """
+    at = _iso_to_epoch(ts)
+    if at is None:
+        return "age unknown, timestamp unreadable"
+    secs = int(now - at)
+    if secs < 0:
+        # clock skew or a future stamp — do not render it as an age
+        return "timestamped in the future"
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    return f"{secs // 3600}h{(secs % 3600) // 60:02d}m ago"
+
+
 # ---------------------------------------------------------------------------
 # Transcript parsing (pure, unit-testable)
 # ---------------------------------------------------------------------------
@@ -994,8 +1036,15 @@ def _fire_alerts(
     if rl.get("last_at") and rl.get("last_at") != last_seen and cooldown_ok(qfired, "throttle:urgent", now):
         _alert_project(
             cfg, slug, operator_sids,
-            f"🚫 RATE LIMITED — a session hit a 429 at {rl.get('last_at')} "
-            f"(429 count {rl.get('count')}). Quota is being throttled NOW.",
+            # T-1014: the age, and no present tense. The cooldown that stops
+            # this alert spamming is the same thing that makes it fire late,
+            # so "NOW" was a claim the sender could not support. `count` is
+            # LIFETIME — it has never been reset and is not a window — so it
+            # says which it is rather than letting the reader supply one.
+            f"🚫 RATE LIMITED — most recent 429 at {rl.get('last_at')} "
+            f"({age_phrase(rl.get('last_at'), now)}). "
+            f"{rl.get('count')} 429s recorded since this counter began "
+            f"(lifetime total, not a window).",
             urgent=alert_urgent("throttle", "urgent"),
         )
         qlast["throttle_seen"] = rl.get("last_at")

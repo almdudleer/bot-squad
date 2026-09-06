@@ -1086,3 +1086,82 @@ def test_an_unchanged_compact_phase_does_not_force_a_write(tmp_path, monkeypatch
     T._fire_alerts(None, "bot-squad", [rec], {}, [], now=1000.0)
 
     assert "S-demo.json" not in written
+
+
+# ---------------------------------------------------------------------------
+# T-1014 — the alert's tense. The 3h cooldown that stops this alert spamming is
+# the same thing that makes it fire late: measured 2026-09-06, a 429 at
+# 17:09:30Z was announced at 20:03:20Z, four seconds after the cooldown expired,
+# with no 429 in the 2h53m between — and the sentence said "throttled NOW".
+# ---------------------------------------------------------------------------
+
+def test_age_phrase_renders_the_measured_case():
+    """The real incident, to the second, so a future edit that changes the
+    rendering has to change this number deliberately."""
+    at = "2026-09-06T17:09:30Z"
+    fired = T._iso_to_epoch("2026-09-06T20:03:20Z")
+    assert T.age_phrase(at, fired) == "2h53m ago"
+
+
+def test_age_phrase_scales_down_without_lying_about_precision():
+    base = T._iso_to_epoch("2026-09-06T17:09:30Z")
+    assert T.age_phrase("2026-09-06T17:09:30Z", base) == "0s ago"
+    assert T.age_phrase("2026-09-06T17:09:30Z", base + 45) == "45s ago"
+    assert T.age_phrase("2026-09-06T17:09:30Z", base + 300) == "5m ago"
+    assert T.age_phrase("2026-09-06T17:09:30Z", base + 3600) == "1h00m ago"
+
+
+def test_age_phrase_says_UNKNOWN_rather_than_omitting_itself():
+    """The load-bearing negative control. An omitted age is not neutral — a
+    timestamp with nothing beside it reads as recent, which is the exact
+    misreading this ticket exists to stop. So an unreadable stamp must produce
+    WORDS, not an empty string."""
+    for bad in ("not-a-timestamp", "", None, 17_09_30, "2026-09-06 17:09:30"):
+        phrase = T.age_phrase(bad, 1_788_725_000.0)
+        assert phrase, f"empty phrase for {bad!r}"
+        assert "unknown" in phrase
+
+
+def test_age_phrase_refuses_to_render_a_FUTURE_stamp_as_an_age():
+    """Clock skew must not come out as a plausible small age — 'timestamped in
+    the future' is a symptom, '0s ago' would be a wrong reassurance."""
+    phrase = T.age_phrase("2026-09-06T17:09:30Z",
+                          T._iso_to_epoch("2026-09-06T17:09:00Z"))
+    assert "future" in phrase and "ago" not in phrase
+
+
+def test_age_phrase_parses_the_PRODUCERS_format_not_a_hand_typed_one():
+    """Composed from _now_iso rather than a literal: the two functions share a
+    format contract, and a hand-typed string would keep passing after the
+    producer's format changed."""
+    produced = T._now_iso()
+    assert T._iso_to_epoch(produced) is not None
+    assert "unknown" not in T.age_phrase(produced, T._iso_to_epoch(produced))
+
+
+def test_rate_limited_alert_states_the_age_and_never_the_present_tense(
+    tmp_path, fake_session, monkeypatch,
+):
+    """The shipped defect, end to end: the alert may not claim the throttle is
+    happening now, because the sender cannot know that — the edge it fires on
+    may have been held for hours."""
+    cfg = _make_cfg(tmp_path)
+    calls = _capture_human_tg(monkeypatch)
+    iso_values = iter(f"2026-07-05T20:{i:02d}:00Z" for i in range(60))
+    monkeypatch.setattr(T, "_now_iso", lambda: next(iso_values))
+
+    lines = [_assistant((2, 70000, 100), 500)]
+    _write_transcript(fake_session["home"], fake_session["uuid"], lines)
+    T.sample(cfg, "proj")                      # baseline, no 429
+
+    lines.append(json.dumps({"error": "rate_limit", "apiErrorStatus": 429}))
+    _write_transcript(fake_session["home"], fake_session["uuid"], lines)
+    T.sample(cfg, "proj")
+
+    alerts = [c for c in calls if "RATE LIMITED" in c["text"]]
+    assert len(alerts) == 1
+    text = alerts[0]["text"]
+    assert "NOW" not in text                   # the claim that was unsupported
+    assert "ago" in text                       # the claim that replaces it
+    # and the counter says which kind of number it is
+    assert "lifetime total" in text and "not a window" in text

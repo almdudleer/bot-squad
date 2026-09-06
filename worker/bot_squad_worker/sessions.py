@@ -887,8 +887,11 @@ def _find_session_md(sessions_dir: Path, sid: str, claude_uuid: str | None) -> P
 # churn:
 #
 # 1. :func:`session_md_lock` — the SAME ``<file>.lock`` flock convention
-#    ``mdlock`` uses, so worker threads, the API and the shell hook mutually
-#    exclude. Held over the whole read→merge→write of every session-md write.
+#    ``mdlock`` uses, so the worker's scheduler threads and the SessionStart
+#    hook (a separate process) mutually exclude, and any future writer gets
+#    the same exclusion for free by spelling the lockfile the same way. (The
+#    API only READS session mds today — measured, not assumed.) Held over the
+#    whole read→merge→write of every session-md write.
 # 2. :class:`SessionMeta` — a read remembers the snapshot it came from, so a
 #    write applies only the keys THAT READER CHANGED onto a FRESH read of the
 #    md. A concurrent machine's fields are never resurrected or erased, even

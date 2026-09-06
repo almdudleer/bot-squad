@@ -8054,6 +8054,22 @@ def cmd_task_digest(args) -> None:
     print(res["text"])
 
 
+def cmd_task_aging(args) -> None:
+    """T-0950 redesign: on-demand gated-status ticket-age picture. Ask, don't
+    get told — to_accept/totest no longer auto-page (blocked_on_user still
+    does); this is how that backlog age is still seen."""
+    slug = resolve_slug()
+    params: dict = {"slug": slug}
+    statuses = getattr(args, "status", None)
+    if statuses:
+        params["statuses"] = statuses
+    res = post("deadline_aging_report", params)
+    if getattr(args, "json", False):
+        print(json.dumps(res, ensure_ascii=False, indent=1))
+        return
+    print(res["text"])
+
+
 def cmd_doc_new(args) -> None:
     slug = resolve_slug()
     payload = {"slug": slug, "category": args.category, "title": args.title}
@@ -8987,6 +9003,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="short backlog digest (counts + P1/P2 headlines) for the TG chat")
     tnd.add_argument("--json", action="store_true", help="raw JSON output ({text, counts})")
     tnd.set_defaults(func=cmd_task_digest)
+    # task aging (T-0950 redesign) — pull-only gated-status age picture:
+    # to_accept/totest no longer auto-page (blocked_on_user still does), so
+    # this is how anyone asks for that backlog picture instead of being sent it.
+    tna = tn_sub.add_parser(
+        "aging",
+        help="on-demand gated-status ticket-age digest (to_accept/totest — pull, not paged)")
+    tna.add_argument(
+        "--status", action="append", choices=sorted(("blocked_on_user", "to_accept", "totest")),
+        help="restrict to one gated status (repeatable; default: all three)")
+    tna.add_argument("--json", action="store_true", help="raw JSON output ({text, total, breaches})")
+    tna.set_defaults(func=cmd_task_aging)
 
     # docs (T-0172 docs system): new / list / link / sync. `doc` + `docs` both work.
     dn = sub.add_parser("doc", aliases=["docs"], help="project docs (T-0172): new / list / link / sync")

@@ -3762,6 +3762,44 @@ def _action_task_digest(params: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, **_task_chat.compose_digest(cfg, slug)}
 
 
+_DEADLINE_AGING_ALLOWED = {"slug", "statuses"}
+
+
+def _action_deadline_aging_report(params: dict[str, Any]) -> dict[str, Any]:
+    """On-demand gated-status ticket-age picture (T-0950 redesign, 2026-09-06
+    operator steer). The sweep still auto-pages ``blocked_on_user`` breaches;
+    ``to_accept``/``totest`` are pull-only now — his own words were that most
+    tickets carry no deadline in his mental model and scope already resolves
+    via priority/status, so paging on backlog age reported nothing was wrong,
+    forever. This is how that backlog age is still SEEN — asked for via
+    `bsq task aging`, never sent unsolicited. Read-only; touches no sidecar.
+
+    Required params: slug. Optional: statuses (list of gated status names;
+    default all three). Returns {ok, slug, total, breaches, text}.
+    """
+    extra = set(params) - _DEADLINE_AGING_ALLOWED
+    if extra:
+        raise ActionError(f"deadline_aging_report got unexpected params: {sorted(extra)}")
+    if "slug" not in params:
+        raise ActionError("deadline_aging_report missing required param: slug")
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"deadline_aging_report: unknown project slug {slug!r}")
+    from bot_squad_worker import status_deadlines as _sd
+
+    wanted = None
+    statuses = params.get("statuses")
+    if statuses is not None:
+        if not isinstance(statuses, list) or not all(isinstance(s, str) for s in statuses):
+            raise ActionError("deadline_aging_report: statuses must be a list of strings")
+        unknown = set(statuses) - _sd.GATED_STATUSES
+        if unknown:
+            raise ActionError(f"deadline_aging_report: not a gated status: {sorted(unknown)}")
+        wanted = frozenset(statuses)
+    return _sd.aging_report(cfg, slug, statuses=wanted)
+
+
 _ASSIGNMENT_WRITE_RESULT_REQUIRED = {"slug", "assignment_id", "content", "sid"}
 # T-0464: optional ``kind`` selects the assignment implementer (task default,
 # routine for routine-spawned sessions) — the ONE write-result seam serves both.
@@ -6307,6 +6345,9 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "ticket_author_note": _action_ticket_author_note,
     # T-0589: on-demand short backlog digest for the TG conversation surface.
     "task_digest": _action_task_digest,
+    # T-0950 redesign: on-demand gated-status ticket-age picture (pull-only —
+    # to_accept/totest no longer auto-page; see status_deadlines.aging_report).
+    "deadline_aging_report": _action_deadline_aging_report,
     # T-0463: assignment-interface write-result primitive (F1.1-d).
     "assignment_write_result": _action_assignment_write_result,
     # T-0464: Routines — declare + list (firing tick = routines.routine_tick).
@@ -6521,6 +6562,10 @@ ACTION_MODES: dict[str, str] = {
     # single coordinator read, like telemetry_get. Sessions reach it via
     # `bsq task digest` (the coordinator socket).
     "task_digest": "coordinator_only",
+    # T-0950 redesign: read-only scan of the shared install data dir
+    # (backlog/) — same category as task_digest. Sessions reach it via
+    # `bsq task aging` (the coordinator socket).
+    "deadline_aging_report": "coordinator_only",
     # T-0463: writes the shared install data dir (artifacts/) — single
     # coordinator writer, like task_progress_add. Dev sessions reach it via the
     # API / coordinator socket.

@@ -74,6 +74,30 @@ outside the window) still pages promptly, while a backlog catch-up drains as
 readable hourly digests instead of a half-hour siren burst. The header
 already carries the true total on every page, so throttling the SEND never
 hides the size of the problem — it only paces how often he is asked to look.
+
+AUTO-PAGE SCOPE (T-0950 reopen, stakeholder verdict 2026-09-06T17:21Z)
+------------------------------------------------------------------------
+The page-cadence fix above was already live in the running coordinator
+BEFORE his reopen landed — it fixed a real bug, but it did not fix his
+complaint, which rejects the mechanism, not its rate. His own words:
+"Мне стали приходить какие-то дикие сообщения постоянно причём. У нас же
+нет дедлайна у большинства тикетов, не понял, зачем это. Скоуп у нас
+резолвится через приоритеты и статусы хорошо" — most tickets carry no
+deadline in his mental model, and scope already resolves fine through
+priority + status. A `totest`/`to_accept` ticket aged past its deadline is
+his own backlog, managed by him on his own schedule — paging him about it is
+a report that nothing is wrong, and at steady backlog depth (100+ tickets,
+weeks old) it never stops firing.
+
+`blocked_on_user` is different in kind, not degree: it means the SYSTEM
+CANNOT PROCEED without him — a block, not a deadline — and silence there
+costs him work rather than saving him noise. So per the operator's steer,
+:data:`AUTO_PAGE_STATUSES` narrows the PUSH half of this module to
+`blocked_on_user` only. `to_accept`/`totest` keep the exact same age/deadline
+math (still exercised by every test written against :data:`GATED_STATUSES`)
+but are pull-only now — see :func:`aging_report`, reachable on demand via the
+`deadline_aging_report` action (`bsq task aging`) and never sent
+unsolicited. The reading survives; the interruption doesn't.
 """
 from __future__ import annotations
 
@@ -102,6 +126,14 @@ _ENV_OVERRIDE: dict[str, str] = {
 }
 
 GATED_STATUSES = frozenset(DEFAULT_DEADLINE_SEC)
+
+# T-0950 redesign (operator steer, 2026-09-06T23:11Z, following his 17:21Z
+# reopen): the ONLY status whose breach auto-pages. `blocked_on_user` means
+# the system cannot proceed without him; `to_accept`/`totest` are backlog he
+# manages via priority/status, not deadline pressure — see the module
+# docstring's "AUTO-PAGE SCOPE". Deadline math + tests still cover all of
+# GATED_STATUSES; this only narrows the PUSH sweep.
+AUTO_PAGE_STATUSES = frozenset({"blocked_on_user"})
 
 #: Minimum gap between two PAGES for the same project (never between sweeps —
 #: see the module docstring's "PAGE CADENCE vs SWEEP CADENCE"). 1h by default:
@@ -356,6 +388,12 @@ def deadline_check_tick_one(cfg: Any, slug: str, now: Optional[float] = None) ->
     seen: set[str] = set()
     for r in rows:
         seen.add(r["id"])
+        if r["status"] not in AUTO_PAGE_STATUSES:
+            # T-0950 redesign: to_accept/totest are pull-only now (see
+            # aging_report) — `seen` still tracks them so a resolved ticket's
+            # stale sidecar entry (from before this redesign) still gets
+            # garbage-collected below, but they never generate a page.
+            continue
         epoch, since_iso, source = _since(r)
         if epoch is None:
             continue  # no usable timestamp at all — nothing to measure against
@@ -419,3 +457,46 @@ def deadline_check_tick(cfg: Any) -> dict:
         except Exception:  # noqa: BLE001 — one bad project never kills the sweep
             log.exception("status_deadlines: tick failed for %s", slug)
     return out
+
+
+def aging_report(cfg: Any, slug: str, statuses: Optional[frozenset[str]] = None,
+                  now: Optional[float] = None) -> dict:
+    """On-demand, read-only view of gated-status ticket age — the PULL half
+    of the T-0950 redesign (operator steer, 2026-09-06). ``blocked_on_user``
+    still pages automatically via :func:`deadline_check_tick_one`;
+    ``to_accept``/``totest`` no longer do (see the module docstring's
+    "AUTO-PAGE SCOPE"), so this is how that backlog picture is seen — asked
+    for, never sent. It shares the deadline/fallback math with the sweep but
+    touches NOTHING stateful: no sidecar read/write, no dedup, no
+    ``_notify`` — calling it twice in a row returns the same answer.
+
+    ``statuses`` restricts which gated statuses are considered (default: all
+    of :data:`GATED_STATUSES`). Returns ``{ok, slug, total, breaches, text}``
+    — ``breaches`` is the FULL unfiltered list (oldest-first); ``text`` reuses
+    :func:`_compose_message`'s cap+overflow rendering so a large backlog still
+    reads as a digest rather than a wall of lines, without losing any row from
+    the returned data the way a push's sidecar-marking would.
+    """
+    if now is None:
+        now = time.time()
+    wanted = statuses if statuses is not None else GATED_STATUSES
+    rows = _scan_backlog(cfg, slug)
+    breaches: list[dict] = []
+    for r in rows:
+        if r["status"] not in wanted:
+            continue
+        epoch, since_iso, source = _since(r)
+        if epoch is None:
+            continue
+        deadline = deadline_sec(r["status"])
+        if deadline is None or (now - epoch) < deadline:
+            continue
+        breaches.append({**r, "age_sec": now - epoch, "since_iso": since_iso,
+                          "since_source": source})
+    breaches.sort(key=lambda b: b["age_sec"], reverse=True)
+    if not breaches:
+        return {"ok": True, "slug": slug, "total": 0, "breaches": [],
+                "text": "⏳ nothing past deadline right now."}
+    text, _shown = _compose_message(breaches)
+    return {"ok": True, "slug": slug, "total": len(breaches),
+            "breaches": breaches, "text": text}

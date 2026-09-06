@@ -240,7 +240,8 @@ def composer_wait_enabled() -> bool:
 
 def composer_free(buf: str, *, sid: str | None = None,
                   now: float | None = None, cfg: Any = None,
-                  slug: str | None = None) -> bool:
+                  slug: str | None = None,
+                  pane_id: str | None = None) -> bool:
     """:func:`composer_ready` AND nothing in the composer worth waiting for.
 
     T-0930 (stakeholder, 2026-08-30, verbatim: «только не надо ее компактить,
@@ -267,6 +268,23 @@ def composer_free(buf: str, *, sid: str | None = None,
     """
     if not composer_ready(buf, sid=sid, now=now):
         return False
+
+    # T-0962: what LOOKS like his half-typed text is very often Claude Code's
+    # own faint GHOST — the dim replay of the last message delivered to this
+    # pane. It is not his, and there is nothing to wait for. Worse, the ghost
+    # REFRESHES on every delivery, so the T-0954 staleness escape below can
+    # never fire for a session that receives mail: the ten-minute clock
+    # restarts each time. Measured live on operator p513, whose observer state
+    # read `kind: typing, text: "check mail"` while nobody was at the keyboard.
+    # Needs the pane, not the buffer, because the faint attribute only survives
+    # `capture-pane -e`; callers that cannot supply one keep the old behaviour.
+    if pane_id:
+        from bot_squad_worker import input_mux
+        if input_mux._composer_is_ghost(pane_id) is True:
+            log.info("recycle: %s's composer holds only Claude Code's own "
+                     "faint suggestion — the box is empty, not busy (T-0962)",
+                     sid)
+            return True
 
     if cfg is not None and slug and sid and composer_wait_enabled():
         from bot_squad_worker import composer_watch
@@ -960,7 +978,7 @@ def _do_claude_compact(cfg: Any, slug: str, rec: dict, now: float) -> bool:
     if not pane:
         return False
     if not composer_free(_capture_pane(pane), sid=sid, now=now, cfg=cfg,
-                         slug=slug):
+                         slug=slug, pane_id=pane):
         return False
     try:
         _send_compact(sid)
@@ -1127,7 +1145,7 @@ def _maybe_finalize(cfg: Any, slug: str, rec: dict, compact: dict, now: float) -
             pane = _pane_for(sid)
             if not pane or not composer_free(_capture_pane(pane), sid=sid,
                                              cfg=cfg, slug=slug,
-                                             now=now):
+                                             now=now, pane_id=pane):
                 return False  # typing/mid-turn — retry next tick, never force
             try:
                 _send_compact(sid)
@@ -1226,7 +1244,7 @@ def _maybe_compact_stay_ceiling(sid: str, meta: dict, md_path, level: str, now: 
                                          idle_timeout.idle_timeout_sec()):
         return False  # already compacted-and-stayed this cache window
     if not pane or not composer_free(_capture_pane(pane), sid=sid, now=now,
-                                     cfg=cfg, slug=slug):
+                                     cfg=cfg, slug=slug, pane_id=pane):
         return False
 
     # T-0954: the ceiling squeezes through the SAME handoff -> ready -> compact
@@ -1339,20 +1357,30 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
     # triggers can never double-compact the same session. Worker sessions
     # (dev/TL/operator) are not exempt and fall through to the unchanged flow
     # below.
+    # A handoff already in flight → drive its finalize half (independent of the
+    # cooldown; the phase dict is its own guard). This is checked BEFORE the
+    # exempt routing below, because whoever armed a sequence must be able to
+    # finish it: an arm made while a session was NOT exempt (a role morph, an
+    # md rewrite, a different code version) otherwise strands forever, since the
+    # exempt branch returns to a state machine that keeps its state elsewhere.
+    #
+    # Measured 2026-09-03 (T-0954): a user-conversation session was armed at
+    # 12:18:07, wrote its 8382-byte checkpoint at 12:19:45 and said HANDOFF
+    # WRITTEN — and no /compact ever followed, because every later tick took the
+    # exempt branch above this line and nothing looked at `phase: writing`
+    # again. The stakeholder saw it as «сказал готов к компакту, но сам себе в
+    # голову не выстрелил».
+    fired = rec.get("alert_fired_at") or {}
+    rec["alert_fired_at"] = fired
+    compact = rec.get("compact") or {}
+    if compact.get("phase") == "writing":
+        return _maybe_finalize(cfg, slug, rec, compact, now)
+
     if recycle_gate.user_session_exempt(role=role, window=window, meta=meta):
         if md_path is None:
             return False
         return _maybe_compact_stay_ceiling(sid, meta, md_path, level, now, pane,
                                            cfg=cfg, slug=slug, rec=rec)
-
-    fired = rec.get("alert_fired_at") or {}
-    rec["alert_fired_at"] = fired
-
-    # A handoff already in flight → drive its finalize half (independent of the
-    # cooldown; the phase dict is its own guard).
-    compact = rec.get("compact") or {}
-    if compact.get("phase") == "writing":
-        return _maybe_finalize(cfg, slug, rec, compact, now)
 
     # Otherwise decide whether to START a compact this tick.
     if not (compact_due(level, fired, now) and compact_safe(rec.get("activity", ""))):
@@ -1364,7 +1392,7 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
     if not pane:
         return False
     if not composer_free(_capture_pane(pane), sid=sid, now=now, cfg=cfg,
-                         slug=slug):
+                         slug=slug, pane_id=pane):
         return False
 
     # Handoff mode + a resolvable destination → ARM the write-it-down flow.

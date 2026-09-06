@@ -603,7 +603,8 @@ def budding_check(cfg: Any, slug: str) -> dict:
             # human's half-typed text («только не надо ее компактить, когда у
             # меня текст во вводе»). A suggestion can always wait a tick.
             if not _autocompact.composer_free(
-                    _autocompact._capture_pane(pane.pane_id), sid=sid, now=now):
+                    _autocompact._capture_pane(pane.pane_id), sid=sid, now=now,
+                    pane_id=pane.pane_id):
                 continue
         except Exception:  # noqa: BLE001 — fail CLOSED: skip this tick
             log.debug("budding_check: liveness gates errored for %s", sid,

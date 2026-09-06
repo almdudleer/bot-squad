@@ -261,6 +261,84 @@ def _capture_pane(pane_id: str) -> str:
     return _cap(pane_id)
 
 
+#: T-0962. Claude Code renders everything in the composer that is NOT his own
+#: text — the empty-box hint, ``<no suggestion>``, and the dim replay of the
+#: last message he submitted — inside an SGR 2 (FAINT) span. Measured on a
+#: fresh session 2026-09-04 with `tmux capture-pane -p -e`:
+#:
+#:     ghost:      ESC[39m ❯ NBSP ESC[2m check mail ESC[0m
+#:     his typing: ESC[39m ❯ NBSP привет это настоящий текст
+#:
+#: and typing one character replaces the whole ghost, so the two never mix.
+#: This attribute is the renderer's own answer to "is this his?", which is why
+#: it is used here instead of growing `_PLACEHOLDER_RE` — that whitelist can
+#: never be complete, because the ghost is an arbitrary earlier MESSAGE.
+_FAINT_ON = "\x1b[2m"
+_FAINT_OFF = ("\x1b[0m", "\x1b[22m", "\x1b[m")
+_ANSI_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _capture_pane_ansi(pane_id: str) -> str:
+    """The pane WITH its escape sequences (`capture-pane -e`), so the faint
+    attribute survives. A separate seam from :func:`_capture_pane` on purpose:
+    every existing consumer of the plain capture keeps reading exactly what it
+    read before."""
+    from bot_squad_worker.sessions import _run
+    out = _run(["tmux", "capture-pane", "-p", "-e", "-t", pane_id])
+    return str(getattr(out, "stdout", out) or "")
+
+
+def _unfainted(live: str) -> tuple[str, bool]:
+    """Split a composer line into (what is NOT faint, whether any faint ran)."""
+    parts = _ANSI_SGR_RE.split(live)
+    codes = _ANSI_SGR_RE.findall(live)
+    visible: list[str] = []
+    faint = saw_faint = False
+    for i, chunk in enumerate(parts):
+        if not faint:
+            visible.append(chunk)
+        elif chunk:
+            saw_faint = True
+        if i < len(codes):
+            code = codes[i]
+            if code == _FAINT_ON:
+                faint = True
+            elif code in _FAINT_OFF:
+                faint = False
+    return "".join(visible), saw_faint
+
+
+def _composer_is_ghost(pane_id: str,
+                       capture_ansi: Callable[[str], str] | None = None
+                       ) -> bool | None:
+    """True when the composer holds ONLY faint text, i.e. the box is empty.
+
+    Returns None when the question cannot be answered (no capture, no rune, no
+    faint span at all) so the caller keeps its previous behaviour. Deliberately
+    one-directional: it can only ever downgrade "there is a draft" to "the box
+    is empty", and only on positive evidence that a faint run covered the whole
+    line — never the other way round, because inventing a draft is harmless and
+    erasing one is not.
+    """
+    capture_ansi = capture_ansi or _capture_pane_ansi
+    try:
+        buf = capture_ansi(pane_id)
+    except Exception:  # noqa: BLE001 — a capture hiccup must not drop delivery
+        return None
+    if not buf:
+        return None
+    live: str | None = None
+    for line in buf.splitlines():
+        if _PROMPT_RUNE in line:
+            live = line.split(_PROMPT_RUNE, 1)[1]
+    if live is None:
+        return None
+    plain, saw_faint = _unfainted(live)
+    if not saw_faint:
+        return None
+    return not plain.strip(" \u00a0")
+
+
 def raw_keys(pane_id: str, *keys: str) -> None:
     """The system-wide ``tmux send-keys`` choke point (T-0578).
 
@@ -336,11 +414,53 @@ def deliver_direct(data_dir: Path | str, sid: str, pane_id: str, text: str, *,
         # line. His fix, verbatim: «он должен слать check mail вперед моего
         # текста, а мой текст оставлять как есть в поле ввода».
         draft = _live_draft(capture, pane_id) if _draft_swap_enabled() else ""
+        if draft and not _swap_is_safe(pane_id, draft):
+            # A draft we cannot read in FULL must not be swapped: the reader
+            # takes the last `❯` line, so a wrapped or multi-line message would
+            # be saved and restored truncated — silently losing the tail. The
+            # legacy path merges the nudge into his text, which is the very
+            # thing T-0954 set out to fix, but it loses nothing; that is the
+            # right way round.
+            log.info("input_mux: %s's draft may be wrapped (%d chars) — "
+                     "delivering the legacy way rather than risk a truncated "
+                     "restore", sid, len(draft))
+            draft = ""
         if draft:
             return _deliver_ahead_of_draft(data_dir, sid, pane_id, text, draft,
                                            capture)
 
         return _type_lines(pane_id, text)
+
+
+def _pane_width(pane_id: str) -> int:
+    """The pane's column count, or 0 when tmux will not say."""
+    from bot_squad_worker.sessions import _run
+    try:
+        out = _run(["tmux", "display-message", "-p", "-t", pane_id,
+                    "#{pane_width}"])
+        return int(str(getattr(out, "stdout", out) or "").strip() or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+#: Columns the composer's own chrome takes before his text starts (`❯ ` plus
+#: the box border). Deliberately generous — the cost of being wrong here is one
+#: legacy delivery, and the cost of being wrong the other way is his tail.
+_COMPOSER_CHROME_COLS = 6
+
+
+def _swap_is_safe(pane_id: str, draft: str) -> bool:
+    """True when the captured draft is certainly the WHOLE draft.
+
+    The reader takes the last ``❯`` line, so anything that wrapped onto a
+    following line, or was entered multi-line, is captured short. Swapping on a
+    short read would restore a truncated message — a silent edit of something he
+    wrote. So the swap is confined to a draft that provably fits one line.
+    """
+    width = _pane_width(pane_id)
+    if width <= 0:
+        return False        # cannot prove it fits → do not risk it
+    return len(draft) + _COMPOSER_CHROME_COLS < width
 
 
 def _draft_swap_enabled() -> bool:
@@ -378,6 +498,15 @@ def _live_draft(capture: Callable[[str], str], pane_id: str) -> str:
     if composer_watch.looks_like_dialog(buf):
         return ""
     live = composer_watch.composer_text(buf)
+    if (live or "").strip() and _composer_is_ghost(pane_id) is True:
+        # The renderer says this line is its own dim suggestion, not his text.
+        # Protecting it is what parked `check mail` unsent in four panes at
+        # once: the swap "restored" the ghost by TYPING it, which turned a hint
+        # into real unsent content, and his next delivery read that back.
+        log.info("input_mux: the composer for %s holds only Claude Code's own "
+                 "faint suggestion (%d chars) — the box is empty (T-0962)",
+                 pane_id, len(live or ""))
+        return ""
     return live if (live or "").strip() else ""
 
 
@@ -406,46 +535,36 @@ def _deliver_ahead_of_draft(data_dir: Path | str, sid: str, pane_id: str,
                             capture: Callable[[str], str]) -> int:
     """Submit ``text`` as its OWN message, then put ``draft`` back untouched.
 
-    A pane's composer holds exactly one buffer, so "ahead of his text" has to be
-    done in three steps — save + clear (``C-u``, which Claude Code also exposes
-    an undo for: `Ctrl+Y to paste deleted text`), send, restore. Measured on a
-    live Claude Code pane (v2.1.259) before it was written: ``C-u`` empties the
-    composer, and typing the draft back restores it even while the session is
-    generating the answer to the message we just sent.
+    A pane's composer holds exactly one buffer, so "ahead of his text" is three
+    steps — save + clear (``C-u``), send, restore.
 
-    Fails toward DELIVERY, never toward silence: if the clear does not take, the
-    payload still goes out the legacy way (which is the pre-T-0954 behaviour,
-    so no regression), and if the restore does not take, the copy on disk is
-    named in the log.
+    **Nothing here branches on a capture.** The obvious design was to verify the
+    clear before typing, and it is not implementable: measured on a live pane
+    2026-09-03, ``tmux capture-pane`` kept returning the PRE-clear frame for
+    more than 2.4 seconds while the composer was already empty (Claude Code
+    repaints its input box on its own schedule, and a busy session repaints it
+    late). A verification that reads a stale frame concludes "the clear failed",
+    takes the legacy path, and never restores — which is exactly how his
+    «file the mask-unclassified ticket too» left its pane while the log said the
+    delivery was fine.
+
+    So the C-u is TRUSTED (it is what actually works; the same measurement shows
+    the composer really was cleared) and every capture below is for the LOG
+    only. The failure mode that trade buys is a duplicated draft if a C-u ever
+    silently fails — visible, his to fix in one keystroke — instead of a
+    silently vanished one. His text is also on disk before anything is touched.
     """
     saved = _save_draft(data_dir, sid, draft)
 
     raw_keys(pane_id, "C-u")
     time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
-    # "Did the clear work" is asked about HIS DRAFT, not about emptiness. An
-    # empty Claude Code composer is not blank — it renders a placeholder — and
-    # reading that as leftover text is what made this path skip the restore and
-    # drop three real unsent messages into the drafts directory instead of back
-    # into their panes (measured live, 2026-09-03).
-    after = _live_draft(capture, pane_id)
-    if after == draft:
-        log.warning("input_mux: %s's composer did not clear — delivering the "
-                    "legacy way (his draft may be submitted with it); draft "
-                    "saved at %s", sid, saved)
-        return _type_lines(pane_id, text)
 
     lines_sent = _type_lines(pane_id, text)
 
     raw_keys(pane_id, "--", draft)
     time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
-    restored = _live_draft(capture, pane_id)
-    if restored.strip() != draft.strip():
-        log.error("input_mux: restored draft for %s does not match what was "
-                  "captured (%r != %r) — the original is saved at %s",
-                  sid, restored, draft, saved)
-    else:
-        log.info("input_mux: delivered %d line(s) to %s ahead of his draft "
-                 "(%d chars), draft restored", lines_sent, sid, len(draft))
+    log.info("input_mux: delivered %d line(s) to %s ahead of his draft "
+             "(%d chars, copy at %s)", lines_sent, sid, len(draft), saved)
     return lines_sent
 
 

@@ -340,6 +340,7 @@ def fake_pane(monkeypatch):
     monkeypatch.setattr(input_mux, "raw_keys", pane.keys)
     monkeypatch.setattr(input_mux, "_DIRECT_INTERLINE_PAUSE_SEC", 0)
     monkeypatch.setattr(input_mux, "_DIRECT_GATE_TIMEOUT_SEC", 0)
+    monkeypatch.setattr(input_mux, "_pane_width", lambda pane_id: 200)
     return pane
 
 
@@ -646,6 +647,7 @@ def test_the_swap_restores_the_draft_over_a_placeholder(tmp_path, monkeypatch):
     monkeypatch.setattr(input_mux, "raw_keys", pane.keys)
     monkeypatch.setattr(input_mux, "_DIRECT_INTERLINE_PAUSE_SEC", 0)
     monkeypatch.setattr(input_mux, "_DIRECT_GATE_TIMEOUT_SEC", 0)
+    monkeypatch.setattr(input_mux, "_pane_width", lambda pane_id: 200)
 
     input_mux.deliver_direct(tmp_path, "S-x", "%1", "check mail",
                              capture=pane.capture)
@@ -672,6 +674,114 @@ def test_no_warning_on_a_first_sighting(tmp_path, seams, monkeypatch):
     assert sent == []                       # first sighting: say nothing
     IT.maybe_recycle(cfg, "bot-squad", row, now=t0 + 60, user_home="/home/x")
     assert len(sent) == 1                   # second: now it is a real signal
+
+
+def test_an_in_flight_handoff_is_finalized_even_on_an_exempt_session(tmp_path,
+                                                                     monkeypatch):
+    """Measured live 2026-09-03: a user-conversation session was armed at
+    12:18:07, wrote its checkpoint at 12:19:45, said HANDOFF WRITTEN — and never
+    compacted. Every later tick took the exempt branch, which drives a DIFFERENT
+    state machine, so `rec['compact']['phase'] == 'writing'` was never looked at
+    again. Whoever arms a sequence has to be able to finish it.
+
+    The control is the pairing: the same session with NO arm still routes to the
+    exempt path, so this fix cannot be "the exempt branch stopped working".
+    """
+    seen = {"finalize": 0, "stay_ceiling": 0}
+    monkeypatch.setattr(A, "autocompact_enabled", lambda: True)
+    monkeypatch.setattr(A, "_maybe_finalize",
+                        lambda cfg, slug, rec, compact, now:
+                        seen.__setitem__("finalize", seen["finalize"] + 1) or True)
+    monkeypatch.setattr(A, "_maybe_compact_stay_ceiling",
+                        lambda *a, **k:
+                        seen.__setitem__("stay_ceiling",
+                                         seen["stay_ceiling"] + 1) or True)
+    monkeypatch.setattr(A, "_pane_for", lambda sid, **kw: "%9")
+    monkeypatch.setattr(A, "_capture_pane", lambda pane, **kw: _pane(""))
+    monkeypatch.setattr(A.recycle_gate, "is_attached", lambda t, **kw: False)
+    monkeypatch.setenv("BOT_SQUAD_RECYCLE_PROJECTS", "bot-squad")
+
+    sid = "S-almdudleer-gu_x-user-conversation-p514"
+    cfg, data = _make_cfg(tmp_path, sid=sid,
+                          window="gu_x-user-conversation", task_id=None)
+
+    armed = {"sid": sid, "activity": "idle", "role": "user-conversation",
+             "compact": {"phase": "writing", "kind": "artifact",
+                         "armed_at": 1000.0, "arm_mtime": 999.0,
+                         "artifact_path": str(tmp_path / "art.md"),
+                         "role": "user-conversation", "stay": True}}
+    assert A.maybe_compact(cfg, "bot-squad", armed, "none", now=2000.0) is True
+    assert seen["finalize"] == 1        # the arm is driven to its end...
+    assert seen["stay_ceiling"] == 0
+
+    # ...and with no arm in flight, the exempt routing is untouched (control)
+    plain = {"sid": sid, "activity": "idle", "role": "user-conversation"}
+    A.maybe_compact(cfg, "bot-squad", plain, "urgent", now=2000.0)
+    assert seen["stay_ceiling"] == 1
+    assert seen["finalize"] == 1
+
+
+def test_the_staleness_clock_ticks_every_tick_not_only_at_the_deepest_gate(
+        tmp_path, seams):
+    """Measured 2026-09-03: five live sessions each held ONE observation from
+    12:17 and still held it at 12:38, because the only caller of `observe` was a
+    gate their tick short-circuited before reaching. A clock that stops is not a
+    ten-minute rule, so the sweep samples the composer for every active session
+    it looks at.
+
+    The control is the record's own `last_seen`: it must advance on a tick that
+    takes an early exit (here, the anti-loop stamp blocks any action at all).
+    """
+    from bot_squad_worker import composer_watch as CW2
+
+    sid = "S-almdudleer-user-session-p8"
+    recent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="user-session", task_id=None,
+                          extra_md={"compact_stay_last_at": recent})
+    row = _row(sid, window="user-session", task_id=None,
+               cwd_repo=data.parent / "repo")
+    seams["state"]["buf"] = _pane("залипший текст")
+
+    t0 = time.time()
+    # the anti-loop stamp means this tick does nothing...
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=t0,
+                            user_home="/home/x") is False
+    rec = CW2.state_path(cfg, "bot-squad", sid)
+    assert rec.exists(), "the composer was never sampled"
+    import json
+    first = json.loads(rec.read_text())["last_seen"]
+
+    # ...and the NEXT tick, equally inert, still advances the clock
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=t0 + 60,
+                            user_home="/home/x") is False
+    assert json.loads(rec.read_text())["last_seen"] > first
+
+
+def test_a_wrapped_draft_is_never_swapped(tmp_path, monkeypatch):
+    """The reader takes the last `❯` line, so a draft that wrapped is captured
+    SHORT — swapping on that would restore a truncated version of something he
+    wrote. Confined to drafts that provably fit one line; everything else takes
+    the legacy path, which merges but never loses."""
+    from bot_squad_worker import input_mux
+
+    keys: list = []
+    monkeypatch.setattr(input_mux, "raw_keys", lambda p, *k: keys.append(k))
+    monkeypatch.setattr(input_mux, "_DIRECT_INTERLINE_PAUSE_SEC", 0)
+    monkeypatch.setattr(input_mux, "_DIRECT_GATE_TIMEOUT_SEC", 0)
+    monkeypatch.setattr(input_mux, "_pane_width", lambda pane_id: 40)
+
+    long_draft = "x" * 60          # wider than the pane → certainly wrapped
+    input_mux.deliver_direct(tmp_path, "S-x", "%1", "check mail",
+                             capture=lambda pane: _pane(long_draft))
+    assert ("C-u",) not in keys                  # his text was never touched
+    assert ("--", "check mail") in keys          # ...and the nudge still went
+
+    # ...and an unknown pane width is treated as "cannot prove it fits"
+    keys.clear()
+    monkeypatch.setattr(input_mux, "_pane_width", lambda pane_id: 0)
+    input_mux.deliver_direct(tmp_path, "S-x", "%1", "check mail",
+                             capture=lambda pane: _pane("short"))
+    assert ("C-u",) not in keys
 
 
 # --- G. T-0961: the warn line is 0.8 x the ceiling, not the compact floor ---

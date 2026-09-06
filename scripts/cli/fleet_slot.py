@@ -152,6 +152,15 @@ Usage::
     fleet_slot.py admit --note "worker suite (containerless)"     # ticket only
     fleet_slot.py status [--json]
 
+    # An occupation that spans the GAPS between your commands (T-1021) — the
+    # case no `run` can cover, because during the gap there is no process to
+    # point at:
+    tok=$(fleet_slot.py declare --kind build --for 1800 --note "T-1004 two builds + the gap")
+    fleet_slot.py run --kind build --under "$tok" -- docker build ...   # build 1
+    fleet_slot.py extend "$tok" --for 1800        # you are still alive; renew
+    fleet_slot.py run --kind build --under "$tok" -- docker build ...   # build 2
+    fleet_slot.py end "$tok"                      # the explicit BUILD END
+
     # For a caller that spawns and supervises its own child (deploy.py):
     tok=$(fleet_slot.py acquire --kind build --note "staging deploy")
     fleet_slot.py adopt "$tok" --pgid 12345      # hand liveness to the work
@@ -227,9 +236,31 @@ def _waiters_dir(sd: Path) -> Path:
     return sd / "waiters"
 
 
+def _declarations_dir(sd: Path) -> Path:
+    """Declared windows live in their OWN directory, and that is load-bearing.
+
+    T-1021. There are two live copies of this module on the box — the install's
+    (``/home/www/bot-squad/scripts/cli/fleet_slot.py``, which the worker loads
+    by absolute path) and the clone's — and they share ONE registry under
+    ``$BOT_SQUAD/data/_worker/fleet_slots``. A declaration written into
+    ``holders/`` would be read by an OLD copy, whose :func:`reap` resolves
+    liveness from the pgid, find that pgid dead **during the gap the
+    declaration exists to cover**, and DELETE the record — an old copy
+    silently erasing a new copy's reservation and logging it as a reclaim.
+
+    In a directory the old copy never lists, an old copy is exactly as blind to
+    a declared window as it is today: it fails open, which is where it already
+    is, and it cannot destroy the record. Nothing regresses while the two
+    copies differ, and the fix takes fleet-wide the moment the install's copy
+    is refreshed.
+    """
+    return sd / "declarations"
+
+
 def _ensure(sd: Path) -> None:
     _holders_dir(sd).mkdir(parents=True, exist_ok=True)
     _waiters_dir(sd).mkdir(parents=True, exist_ok=True)
+    _declarations_dir(sd).mkdir(parents=True, exist_ok=True)
 
 
 def _config(sd: Path) -> dict:
@@ -288,6 +319,41 @@ def containerless_slots(sd: Path) -> int | None:
         return max(1, int(raw))
     except (TypeError, ValueError):
         return 4
+
+
+#: Longest window a lane may DECLARE in one lease, in seconds.
+#:
+#: T-1021. A declared window is held on a LEASE, not on a process group, so the
+#: number that bounds it is the only thing standing between "a reservation that
+#: spans a gap" and "a lane that died with the fleet's daemon pool in its
+#: pocket". A declaration with no ceiling is prose with a token attached — it
+#: reproduces, inside the arbiter, exactly the unenforceable announcement this
+#: ticket is about. An hour covers the measured worst case with headroom: the
+#: longest hold on record is a 14.01-minute uncached ``npm ci`` + ``vite``
+#: build, and the specimen that produced this ticket is TWO of those plus the
+#: analysis gap between them. Longer than that is not refused, it is RENEWED —
+#: see :func:`extend`, where a live owner proves liveness by asking again.
+DEFAULT_MAX_DECLARATION = 3600.0
+
+
+def max_declaration_s(sd: Path) -> float:
+    env = os.environ.get("BOT_SQUAD_FLEET_MAX_DECLARATION_S")
+    raw = env if env not in (None, "") else _config(sd).get(
+        "max_declaration_s", DEFAULT_MAX_DECLARATION)
+    try:
+        return max(1.0, float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_DECLARATION
+
+
+class DeclarationLapsed(RuntimeError):
+    """``--under`` named a window that is not live: expired, ended, or unknown.
+
+    Raised rather than silently degrading to an ordinary queued run. A lane
+    that believes it is inside its own declared window and is NOT has the
+    fleet's picture wrong in the dangerous direction — it will behave as the
+    exclusive occupant of a pool that peers can now enter. It has to be told.
+    """
 
 
 #: The operator's hand-made stopgap semaphore (19:04Z): one lock file per slot,
@@ -839,8 +905,89 @@ def reap(sd: Path) -> tuple[list[dict], list[dict]]:
     return live_h, live_w
 
 
+def reap_declarations(sd: Path) -> list[dict]:
+    """Live declared windows; lapsed leases are dropped ON THE RECORD.
+
+    Call INSIDE the registry lock, like :func:`reap`.
+
+    **Liveness here is a LEASE, not a process group, and that is the whole
+    point of the mechanism.** A declared window exists precisely to cover the
+    interval in which the owner has no process running — the gap between two
+    builds, where a per-run slot releases, the arbiter reads free, and a peer
+    lands in the middle of somebody's measurement. A pgid cannot express that
+    interval: during the gap there is nothing alive to point at. So the owner
+    proves liveness the only way an idle owner can, by asking again
+    (:func:`extend`), and a lane that dies stops asking and frees the pool
+    within one lease rather than holding it until a human notices.
+
+    The lapse is appended to ``reclaims.log`` for the same reason a stale
+    holder's is: a window that silently stopped existing teaches the next
+    reader that the arbiter is unreliable, and the owner of a lapsed window
+    needs to be able to find out that it lapsed.
+    """
+    live = []
+    now = time.time()
+    for rec in _read_records(_declarations_dir(sd)):
+        try:
+            expires = float(rec.get("expires_at") or 0)
+        except (TypeError, ValueError):
+            expires = 0.0
+        if expires > now:
+            live.append(rec)
+        else:
+            _log_reclaim(sd, rec, "declared window lease expired (never extended)")
+            try:
+                os.unlink(rec["_path"])
+            except OSError:
+                pass
+    return live
+
+
+#: Which run kinds a declared window of each kind already reserves. A window is
+#: a reservation over a POOL, so it covers exactly the kinds that contend for
+#: that pool — the same two-pool split the rest of the module enforces.
+_DECLARATION_COVERS = {
+    "build": ("container", "build"),
+    "container": ("container",),
+    "containerless": ("containerless",),
+}
+
+
+def covering_declaration(declarations: list[dict], token: str | None,
+                         kind: str) -> dict | None:
+    """The live declaration ``token`` names, if it covers ``kind``; else None."""
+    if not token:
+        return None
+    for d in declarations:
+        if d.get("token") != token:
+            continue
+        if kind in _DECLARATION_COVERS.get(str(d.get("kind")), ()):
+            return d
+        return None
+    return None
+
+
+def _declaration_reason(d: dict) -> str:
+    """Say the VALUE, not just the verdict: which lane, and when it lapses.
+
+    A waiter that is told only "blocked" cannot tell a declared window from a
+    running build, and the difference is the whole finding — during a declared
+    gap the pool looks idle, so a waiter reading a bare refusal against a quiet
+    host concludes the arbiter is wrong and routes around it.
+    """
+    left = float(d.get("expires_at") or 0) - time.time()
+    return (f"DECLARED {d.get('kind')} window: "
+            f"{d.get('note') or d.get('lane') or d.get('token')} "
+            f"(lane {d.get('lane') or '-'}, token {d.get('token')}, "
+            f"lease expires in {left:.0f}s). The pool may look IDLE — a declared "
+            f"window covers the gaps between the owner's commands, which is what "
+            f"it is for.")
+
+
 def _grantable(kind: str, holders: list[dict], waiters: list[dict],
-               token: str, n_slots: int, n_cl: int | None) -> tuple[bool, str]:
+               token: str, n_slots: int, n_cl: int | None,
+               declarations: list[dict] | None = None,
+               under: str | None = None) -> tuple[bool, str]:
     """Whether ``token`` may take a slot now, and the reason either way.
 
     Two INDEPENDENT pools, because they are two different resources:
@@ -856,18 +1003,37 @@ def _grantable(kind: str, holders: list[dict], waiters: list[dict],
     The reason is returned either way so a waiter can PRINT WHY it is waiting
     rather than blocking silently, which is the single missing property that
     made lanes route around the old lock.
+
+    **A DECLARED WINDOW COUNTS AS A HOLDER** (T-1021). An announced exclusive
+    occupation used to hold nothing here, so the arbiter read free and would
+    admit a peer straight into someone else's window. Folding declarations into
+    the holder set is the fix, and it is deliberately the whole of the fix:
+    there is no second policy to keep in step with this one. ``under`` excludes
+    the caller's OWN window, so a lane does not queue behind itself — without
+    that, the first command an owner ran inside its own window would deadlock.
     """
+    declarations = declarations or []
+    mine = covering_declaration(declarations, under, kind) if under else None
+    if under and mine is None:
+        return False, (f"--under {under}: no live declared window with that token "
+                       f"covers {kind} work. It expired, was ended, or never existed.")
+    holders = list(holders) + [d for d in declarations
+                               if not (mine and d.get("token") == mine.get("token"))]
     if kind == "containerless":
-        mine = [h for h in holders if h.get("kind") == "containerless"]
+        cl = [h for h in holders if h.get("kind") == "containerless"]
         if n_cl is None:
-            return True, f"{len(mine)} containerless run(s), unbounded"
-        if len(mine) >= n_cl:
-            return False, f"{len(mine)}/{n_cl} containerless slots held"
-        return True, f"{len(mine)}/{n_cl} containerless slots held"
+            return True, f"{len(cl)} containerless run(s), unbounded"
+        if len(cl) >= n_cl:
+            decl = next((h for h in cl if h.get("declared")), None)
+            extra = f" — including {_declaration_reason(decl)}" if decl is not None else ""
+            return False, f"{len(cl)}/{n_cl} containerless slots held{extra}"
+        return True, f"{len(cl)}/{n_cl} containerless slots held"
 
     daemon = [h for h in holders if h.get("kind") in ("container", "build")]
     build = next((h for h in daemon if h.get("kind") == "build"), None)
     if build is not None:
+        if build.get("declared"):
+            return False, _declaration_reason(build)
         return False, (f"build in progress: {build.get('note') or build.get('lane') or build.get('token')}"
                        f" (pgid {build.get('pgid')}, "
                        f"{round(time.time() - float(build.get('since') or 0))}s elapsed)")
@@ -883,11 +1049,17 @@ def _grantable(kind: str, holders: list[dict], waiters: list[dict],
 
     if kind == "build":
         if daemon:
+            decl = next((h for h in daemon if h.get("declared")), None)
+            if decl is not None:
+                return False, _declaration_reason(decl)
             return False, (f"{len(daemon)} container slot(s) still held; a build "
                            f"drains the pool before it starts")
         return True, "pool empty"
 
     if len(daemon) >= n_slots:
+        decl = next((h for h in daemon if h.get("declared")), None)
+        if decl is not None:
+            return False, _declaration_reason(decl)
         return False, f"{len(daemon)}/{n_slots} container slots held"
     return True, f"{len(daemon)}/{n_slots} container slots held"
 
@@ -928,12 +1100,20 @@ def admit(note: str | None = None, lane: str | None = None,
 
 def acquire(kind: str, *, pgid: int, lane: str | None, note: str | None,
             wait: float, sd: Path | None = None,
-            on_wait=None) -> tuple[str, dict]:
+            on_wait=None, under: str | None = None,
+            declare_for: float | None = None) -> tuple[str, dict]:
     """Block until a slot is granted; return ``(token, admission_readings)``.
 
     ``pgid`` is what liveness will be read from. A caller that has not spawned
     its work yet passes its OWN pgid and calls :func:`adopt` once the child
     exists — the slot is then held by the work, not by the supervisor.
+
+    ``under`` names the caller's own declared window, so it is not queued
+    behind itself. ``declare_for`` turns the grant into a DECLARED WINDOW held
+    on a lease of that many seconds instead of a slot held on a process group
+    — the queueing, the FIFO barrier and the admission ticket are identical,
+    which is the point: a window is granted by the same arbiter, under the same
+    policy, as the run it stands in for.
     """
     kind = normalise_kind(kind)
     sd = sd or state_dir()
@@ -946,6 +1126,16 @@ def acquire(kind: str, *, pgid: int, lane: str | None, note: str | None,
         "note": note or "", "since": now, "host_pid": os.getpid(),
         "cwd": os.getcwd(),
     }
+    if declare_for is not None:
+        cap = max_declaration_s(sd)
+        if declare_for > cap:
+            raise ValueError(
+                f"declared window of {declare_for:.0f}s exceeds the cap of "
+                f"{cap:.0f}s. Declare within the cap and EXTEND — a lease you "
+                f"renew proves you are alive; one you cannot is prose with a "
+                f"token attached.")
+        if declare_for <= 0:
+            raise ValueError("a declared window needs a positive --for <seconds>")
     wpath = _waiters_dir(sd) / f"{token}.json"
     deadline = now + wait
     last_reason = ""
@@ -955,15 +1145,35 @@ def acquire(kind: str, *, pgid: int, lane: str | None, note: str | None,
         while True:
             with _Registry(sd):
                 holders, waiters = reap(sd)
+                decls = reap_declarations(sd)
                 n = slots(sd)
+                if under and covering_declaration(decls, under, kind) is None:
+                    raise DeclarationLapsed(
+                        f"--under {under}: no live declared window with that "
+                        f"token covers {kind} work. It expired, was ended, or "
+                        f"never existed. NOT MEASURED — the run did not start, "
+                        f"and you are NOT the exclusive occupant you think you "
+                        f"are: peers may already be in this pool.")
                 ok, reason = _grantable(kind, holders, waiters, token, n,
-                                        containerless_slots(sd))
+                                        containerless_slots(sd),
+                                        declarations=decls, under=under)
                 if ok:
                     hrec = dict(rec)
                     hrec["since"] = time.time()
                     hrec["waited_s"] = round(time.time() - now, 1)
                     hrec.pop("_path", None)
-                    _write_record(_holders_dir(sd) / f"{token}.json", hrec)
+                    if declare_for is not None:
+                        hrec["declared"] = True
+                        hrec["declared_for_s"] = float(declare_for)
+                        hrec["expires_at"] = hrec["since"] + float(declare_for)
+                        hrec["renewals"] = 0
+                        hrec["pgid"] = None
+                        dest = _declarations_dir(sd) / f"{token}.json"
+                    else:
+                        dest = _holders_dir(sd) / f"{token}.json"
+                    if under:
+                        hrec["under"] = under
+                    _write_record(dest, hrec)
                     try:
                         os.unlink(wpath)
                     except OSError:
@@ -971,7 +1181,10 @@ def acquire(kind: str, *, pgid: int, lane: str | None, note: str | None,
                     adm = admission_readings(sd)
                     adm.update({"kind": kind, "note": note or "",
                                 "lane": rec["lane"], "token": token,
-                                "granted": True, "slot": True,
+                                "granted": True,
+                                "slot": declare_for is None,
+                                "declared_for_s": declare_for,
+                                "under": under,
                                 "waited_s": hrec["waited_s"]})
                     _record_admission(sd, adm)
                     return token, adm
@@ -1036,11 +1249,76 @@ def release(token: str, sd: Path | None = None) -> bool:
             raise
 
 
+def declare(kind: str, *, for_s: float, lane: str | None, note: str | None,
+            wait: float = 0.0, sd: Path | None = None,
+            on_wait=None) -> tuple[str, dict]:
+    """Reserve a window the arbiter holds ACROSS the gaps between commands.
+
+    T-1021. Measured on HEAD, in an isolated state dir, on 2026-09-06: an
+    occupation composed the way this module's own docstring documents it — one
+    ``run`` per command — released its slot between commands, the arbiter
+    printed ``0/2 container+build … (free)`` during the gap, and a peer build
+    was GRANTED 4.2s into it. A pure announcement to inboxes did the same at
+    1.1s. The occupation held only where its owner hand-composed the whole
+    window into one long-lived process, which is a property of that lane's
+    shell script and not of the gate.
+
+    So this verb exists for the window no composition can cover: one with an
+    AGENT in the gap, which must read the first result and decide before
+    starting the second. There is no process to point at while it thinks.
+    """
+    return acquire(kind, pgid=os.getpgrp(), lane=lane, note=note, wait=wait,
+                   sd=sd, on_wait=on_wait, declare_for=float(for_s))
+
+
+def extend(token: str, for_s: float, sd: Path | None = None) -> dict | None:
+    """Renew a live window's lease; None when there is nothing live to renew.
+
+    **It will not resurrect a lapsed window, and that refusal is the point.**
+    Once a lease expires the arbiter has told every peer the pool is free and a
+    peer may already be inside it. Re-creating the record would restore the
+    owner's belief in an exclusivity that no longer exists — the arbiter would
+    be wrong in the direction that gets two builds interleaved. A lapsed window
+    is re-DECLARED, through the queue, like any other claim.
+    """
+    sd = sd or state_dir()
+    path = _declarations_dir(sd) / f"{token}.json"
+    with _Registry(sd):
+        live = {d.get("token"): d for d in reap_declarations(sd)}
+        if token not in live:
+            return None
+        rec = live[token]
+        rec.pop("_path", None)
+        cap = max_declaration_s(sd)
+        for_s = min(float(for_s), cap)
+        rec["expires_at"] = time.time() + for_s
+        rec["declared_for_s"] = for_s
+        rec["renewals"] = int(rec.get("renewals") or 0) + 1
+        rec["last_extended_at"] = time.time()
+        _write_record(path, rec)
+        return rec
+
+
+def end_declaration(token: str, sd: Path | None = None) -> bool:
+    """Release a declared window early. The explicit BUILD END, in the arbiter."""
+    sd = sd or state_dir()
+    path = _declarations_dir(sd) / f"{token}.json"
+    with _Registry(sd):
+        try:
+            os.unlink(path)
+            return True
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                return False
+            raise
+
+
 def snapshot(sd: Path | None = None) -> dict:
     sd = sd or state_dir()
     _ensure(sd)
     with _Registry(sd):
         holders, waiters = reap(sd)
+        declarations = reap_declarations(sd)
         n = slots(sd)
     now = time.time()
 
@@ -1053,15 +1331,27 @@ def snapshot(sd: Path | None = None) -> dict:
             "waited_s": rec.get("waited_s"),
         }
 
+    def _fmt_decl(rec):
+        d = _fmt(rec)
+        d["expires_in_s"] = round(float(rec.get("expires_at") or now) - now, 1)
+        d["declared_for_s"] = rec.get("declared_for_s")
+        d["renewals"] = rec.get("renewals")
+        return d
+
+    # A declared window OCCUPIES ITS POOL. Counting it here is what stops the
+    # arbiter reporting an idle-looking gap as free (T-1021): the pool is not
+    # free, its owner is between commands.
     return {
         "state_dir": str(sd),
         "slots": n,
         "containerless_slots": containerless_slots(sd),
-        "containerless_held": sum(1 for h in holders
+        "containerless_held": sum(1 for h in holders + declarations
                                   if h.get("kind") == "containerless"),
         "holders": [_fmt(h) for h in holders],
         "waiters": [_fmt(w) for w in waiters],
-        "build_held": any(h.get("kind") == "build" for h in holders),
+        "declarations": [_fmt_decl(d) for d in declarations],
+        "build_held": any(h.get("kind") == "build"
+                          for h in holders + declarations),
         "legacy_slots": legacy_report(sd),
         "readings": admission_readings(sd),
         # Say what was CHECKED, not only what was concluded. An honest report
@@ -1071,7 +1361,12 @@ def snapshot(sd: Path | None = None) -> dict:
             "/proc/<pid>/stat field 5; dead groups are reclaimed and appended to "
             "reclaims.log. TWO INDEPENDENT POOLS: container+build share the daemon "
             "pool (a build is exclusive and drains it); containerless has its own "
-            "pool and a build does NOT block it. The only ENFORCED health reading is "
+            "pool and a build does NOT block it. A DECLARED WINDOW counts as a "
+            "holder of its pool and is held on a renewable LEASE rather than a "
+            "process group, because the interval it exists to cover — the gap "
+            "between an owner's commands — is exactly the interval with no "
+            "process to point at; a lapsed lease is reclaimed on the record. "
+            "The only ENFORCED health reading is "
             "D-state — /proc/diskstats field 12 and docker-ps latency were both "
             "tested and rejected for admission control (field 12 stayed 18-39 while "
             "D-state went 3->89; docker ps answered in 204ms at load 80). Reservations "
@@ -1154,7 +1449,13 @@ def _cmd_run(args) -> int:
         return 75
     try:
         token, adm = acquire(args.kind, pgid=os.getpgrp(), lane=args.lane,
-                             note=args.note, wait=args.wait, sd=sd, on_wait=_on_wait)
+                             note=args.note, wait=args.wait, sd=sd,
+                             on_wait=_on_wait, under=getattr(args, "under", None))
+    except DeclarationLapsed as exc:
+        print(f"fleet-slot: {exc}", file=sys.stderr, flush=True)
+        print(_ask_hint(args.kind, args.note, 0.0, what="refused"),
+              file=sys.stderr, flush=True)
+        return 75
     except TimeoutError as exc:
         print(f"fleet-slot: {exc}", file=sys.stderr, flush=True)
         print(_ask_hint(args.kind, args.note, time.time() - t0),
@@ -1234,7 +1535,8 @@ def _cmd_status(args) -> int:
     # Count each pool against ITS OWN ceiling. Summing both against the daemon
     # ceiling printed "4/2", which reads as an overshoot of a limit that was
     # never exceeded — a status line that manufactures an incident.
-    daemon = sum(1 for h in snap["holders"] if h["kind"] in ("container", "build"))
+    daemon = sum(1 for h in snap["holders"] + snap.get("declarations", [])
+                 if h["kind"] in ("container", "build"))
     cl = snap.get("containerless_held", 0)
     cl_cap = snap.get("containerless_slots")
     print(f"fleet slots: {daemon}/{snap['slots']} container+build, "
@@ -1244,10 +1546,15 @@ def _cmd_status(args) -> int:
     for h in snap["holders"]:
         print(f"  HOLD  {h['kind']:<10} {h['age_s']:>7.1f}s  pgid {h['pgid']:<8} "
               f"{h['lane'] or '-'}  {h['note'] or '-'}")
+    for d in snap.get("declarations", []):
+        print(f"  DECL  {d['kind']:<10} {d['age_s']:>7.1f}s  lease {d['expires_in_s']:>6.0f}s "
+              f"{d['lane'] or '-'}  {d['note'] or '-'}")
+        print(f"        token {d['token']} — the owner may be BETWEEN commands; "
+              f"an idle-looking pool is not a free one")
     for i, w in enumerate(snap["waiters"], 1):
         print(f"  WAIT#{i} {w['kind']:<10} {w['age_s']:>7.1f}s  pgid {w['pgid']:<8} "
               f"{w['lane'] or '-'}  {w['note'] or '-'}")
-    if not snap["holders"] and not snap["waiters"]:
+    if not snap["holders"] and not snap["waiters"] and not snap.get("declarations"):
         print("  (free)")
     for ls in snap.get("legacy_slots") or []:
         state = "HELD" if ls["held"] else "free"
@@ -1263,8 +1570,9 @@ def _cmd_status(args) -> int:
 def _cmd_acquire(args) -> int:
     try:
         token, _adm = acquire(args.kind, pgid=args.pgid or os.getpgrp(),
-                              lane=args.lane, note=args.note, wait=args.wait)
-    except TimeoutError as exc:
+                              lane=args.lane, note=args.note, wait=args.wait,
+                              under=getattr(args, "under", None))
+    except (TimeoutError, DeclarationLapsed) as exc:
         print(f"fleet-slot: {exc}", file=sys.stderr)
         return 75
     print(token)
@@ -1279,6 +1587,61 @@ def _cmd_release(args) -> int:
     return 0 if release(args.token) else 1
 
 
+def _cmd_declare(args) -> int:
+    sd = state_dir()
+    hinted = [False]
+
+    def _on_wait(reason, pos, waited):
+        print(f"fleet-slot: WAITING to declare ({args.kind}) — {reason}; "
+              f"queue position {pos}", file=sys.stderr, flush=True)
+        if waited >= _ASK_AFTER and not hinted[0]:
+            hinted[0] = True
+            print(_ask_hint(args.kind, args.note, waited), file=sys.stderr, flush=True)
+
+    try:
+        token, _adm = declare(args.kind, for_s=args.for_s, lane=args.lane,
+                              note=args.note, wait=args.wait, sd=sd,
+                              on_wait=_on_wait)
+    except ValueError as exc:
+        print(f"fleet-slot: {exc}", file=sys.stderr)
+        return 2
+    except TimeoutError as exc:
+        print(f"fleet-slot: {exc}", file=sys.stderr)
+        print(_ask_hint(args.kind, args.note, args.wait), file=sys.stderr)
+        return 75
+    print(token)
+    print(f"fleet-slot: DECLARED a {normalise_kind(args.kind)} window, lease "
+          f"{args.for_s:.0f}s — {args.note or '(no note)'}", file=sys.stderr)
+    print(f"fleet-slot: run your own work with --under {token}, keep the window "
+          f"alive with `extend {token} --for <s>`, and END IT EXPLICITLY with "
+          f"`end {token}`. Unextended, it lapses in {args.for_s:.0f}s and the "
+          f"lapse is written to reclaims.log.", file=sys.stderr)
+    return 0
+
+
+def _cmd_extend(args) -> int:
+    rec = extend(args.token, args.for_s)
+    if rec is None:
+        print(f"fleet-slot: {args.token} is NOT a live declared window — it "
+              f"lapsed, was ended, or never existed. It is NOT resurrected: the "
+              f"arbiter has already told peers this pool is free and one may be "
+              f"in it. Re-declare through the queue.", file=sys.stderr)
+        return 75
+    left = float(rec["expires_at"]) - time.time()
+    print(f"fleet-slot: extended {args.token} — lease now {left:.0f}s "
+          f"(renewal #{rec['renewals']})", file=sys.stderr)
+    return 0
+
+
+def _cmd_end(args) -> int:
+    if end_declaration(args.token):
+        print(f"fleet-slot: ended declared window {args.token}", file=sys.stderr)
+        return 0
+    print(f"fleet-slot: no live declared window {args.token} (already lapsed "
+          f"or ended)", file=sys.stderr)
+    return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="fleet-slot",
@@ -1291,6 +1654,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--lane", default=None, help="owning SID (default $BOT_SQUAD_SID)")
     r.add_argument("--note", default=None, help="what this run is, shown to waiters")
     r.add_argument("--wait", type=float, default=DEFAULT_WAIT)
+    r.add_argument("--under", default=None, metavar="TOKEN",
+                   help="run inside YOUR OWN declared window, so you do not "
+                        "queue behind yourself; refused if that window lapsed")
     r.add_argument("--disk-series", action="store_true",
                    help="also sample /proc/diskstats field 12 (evidence only — "
                         "the metric is disqualified for admission control)")
@@ -1316,6 +1682,8 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--note", default=None)
     a.add_argument("--wait", type=float, default=DEFAULT_WAIT)
     a.add_argument("--pgid", type=int, default=None)
+    a.add_argument("--under", default=None, metavar="TOKEN",
+                   help="take this slot inside YOUR OWN declared window")
     a.set_defaults(fn=_cmd_acquire)
 
     ad = sub.add_parser("adopt", help="hand a held slot's liveness to a process group")
@@ -1326,6 +1694,31 @@ def build_parser() -> argparse.ArgumentParser:
     rl = sub.add_parser("release", help="release a held slot by token")
     rl.add_argument("token")
     rl.set_defaults(fn=_cmd_release)
+
+    dc = sub.add_parser(
+        "declare",
+        help="reserve a window the arbiter holds ACROSS the gaps between your "
+             "commands (held on a renewable lease, not on a process group)")
+    dc.add_argument("--kind", choices=kinds, default="build")
+    dc.add_argument("--for", dest="for_s", type=float, required=True,
+                    metavar="SECONDS",
+                    help="lease length; renew with `extend` rather than asking "
+                         "for a longer one")
+    dc.add_argument("--lane", default=None)
+    dc.add_argument("--note", default=None,
+                    help="what this window is — shown to every peer it refuses")
+    dc.add_argument("--wait", type=float, default=DEFAULT_WAIT)
+    dc.set_defaults(fn=_cmd_declare)
+
+    ex = sub.add_parser("extend", help="renew a declared window's lease")
+    ex.add_argument("token")
+    ex.add_argument("--for", dest="for_s", type=float, required=True,
+                    metavar="SECONDS")
+    ex.set_defaults(fn=_cmd_extend)
+
+    en = sub.add_parser("end", help="release a declared window (the explicit END)")
+    en.add_argument("token")
+    en.set_defaults(fn=_cmd_end)
     return p
 
 

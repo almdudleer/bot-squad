@@ -169,6 +169,15 @@ TYPES: dict[str, MsgType] = {
         "drive_stopped", URGENT,
         "the project's drive ran out of work — nothing is being taken until you look",
     ),
+    # T-0950: a ticket in blocked_on_user/to_accept/totest past its
+    # per-status deadline — the audit's "reopened at 11:40, nobody took it"
+    # failure, recurring in every status the pickup band doesn't cover.
+    # URGENT because a parked ticket nobody is answering IS work stopped
+    # unless a human acts. Emitter: `status_deadlines.deadline_check_tick`.
+    "ticket_deadline": MsgType(
+        "ticket_deadline", URGENT,
+        "a ticket has sat in blocked_on_user/to_accept/totest past its deadline",
+    ),
     # --- LOG: a record to read when he chooses to ----------------------------
     "deploy_status": MsgType(
         "deploy_status", LOG,

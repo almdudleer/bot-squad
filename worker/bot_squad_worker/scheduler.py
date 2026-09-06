@@ -25,6 +25,7 @@ from bot_squad_worker.jobs import (
     constant_team_tick,
     drive_stop_tick,
     task_lifecycle_tick,
+    ticket_deadline_tick,
     deploy_monitor_one,
     budding_check_tick,
     drift_check_tick,
@@ -555,6 +556,25 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         seconds=60,
         args=[cfg],
         id="task_lifecycle",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+    )
+
+    # ticket_deadline_tick: T-0950 — page the stakeholder once a ticket has sat
+    # in blocked_on_user/to_accept/totest past its per-status deadline. 300s
+    # cadence: unlike task_lifecycle_tick's per-transition notice, latency here
+    # only bounds "how promptly a breach is caught", not correctness — the
+    # ticket has already been silently waiting for a day or more by the time
+    # any of these deadlines is even reached. max_instances=1 + coalesce;
+    # idempotent (a stay already alerted never re-fires). Kill switch:
+    # BOT_SQUAD_TICKET_DEADLINES=0.
+    sched.add_job(
+        ticket_deadline_tick,
+        "interval",
+        seconds=300,
+        args=[cfg],
+        id="ticket_deadline",
         max_instances=1,
         coalesce=True,
         replace_existing=True,

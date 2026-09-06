@@ -33,6 +33,7 @@ from bot_squad_worker.jobs import (
     heartbeat,
     idle_timeout_tick,
     wait_resume_tick,
+    work_state_freshness_tick,
     ticket_watch_tick,
     input_flush_tick,
     oauth_refresh,
@@ -89,6 +90,25 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         executors={"default": ThreadPoolExecutor(max_workers=30)},
     )
 
+    # T-0942: adopt `operator-state.md` as `work-state.md` BEFORE any job runs.
+    # It has to be synchronous and here, not only on the 15-minute tick: after
+    # the rename, `assignment.role_artifact` resolves an operator's artifact to
+    # the NEW name, and `recovery.gather` decides "this crashed session has
+    # forward-state to boot from" by that path existing. A worker that started
+    # ticking before the rename landed would look at a project whose whole state
+    # is still under the old name, see no artifact, and respawn a crashed
+    # operator FRESH — losing the pointer to the very doc this ticket exists to
+    # keep. Idempotent, non-destructive (the old file is never deleted), and a
+    # failure on one project must not stop the scheduler coming up.
+    for _slug in cfg.projects:
+        try:
+            from bot_squad_worker import work_state as _work_state
+            _work_state.migrate(cfg.data_dir, _slug)
+        except Exception:  # pragma: no cover - defensive
+            import logging
+            logging.getLogger(__name__).exception(
+                "scheduler: work-state migration failed for %s", _slug)
+
     sched.add_job(
         heartbeat,
         "interval",
@@ -141,6 +161,22 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
         max_instances=1,
         coalesce=True,
         replace_existing=True,
+    )
+    # work_state_freshness (T-0942): keep the project's work-state doc from
+    # going stale unnoticed. ALSO runs the one-time operator-state.md ->
+    # work-state.md migration per project, which is why it fires at boot rather
+    # than 15 minutes in — a worker that restarts into the new code should have
+    # the doc under its new name before anything reads it.
+    sched.add_job(
+        work_state_freshness_tick,
+        "interval",
+        minutes=15,
+        args=[cfg],
+        id="work_state_freshness",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc),
     )
     # oauth_refresh: v1 placeholder — checks claude binary reachable.
     # Full token-rotation port from cctv-backend deferred to a later spec.

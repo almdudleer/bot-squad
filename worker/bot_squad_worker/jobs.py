@@ -1266,6 +1266,28 @@ def drift_check_tick(cfg: Config) -> None:
             log.exception("drift_check_tick: unhandled error for project %s", slug)
 
 
+def work_state_freshness_tick(cfg: Config) -> None:
+    """T-0942: per-project work-state freshness pass.
+
+    The TOP-UP half, for a role-holder that never compacts. The load-bearing
+    halves are the compact routing (`assignment.role_artifact`) and the
+    read-time claim change (`autocompact.boot_prompt_from_artifact`) — see
+    :mod:`bot_squad_worker.work_state`. Runs at 15-minute cadence rather than
+    60s on purpose: it can nudge a given session at most once per stale
+    episode, so a faster tick buys nothing and only widens the window in which
+    it could become the next drift-checker. Per-project errors are caught so
+    one bad project never kills the sweep.
+    """
+    from bot_squad_worker import work_state as _work_state
+
+    for slug in cfg.projects:
+        try:
+            _work_state.migrate(cfg.data_dir, slug)
+            _work_state.freshness_sweep(cfg, slug)
+        except Exception:
+            log.exception("work_state_freshness_tick: unhandled error for project %s", slug)
+
+
 def budding_check_tick(cfg: Config) -> None:
     """T-0932: per-project gradual-budding pass.
 

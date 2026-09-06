@@ -26,6 +26,9 @@ Verbs:
   bsq compact [--sid SID]           send /compact to a session (self by default)
   bsq compact-save "<state>"        task-LESS handoff: forward-state -> your role artifact
                                     (task-bound? use `bsq ticket context <id>` instead — T-0863)
+  bsq work-state                    the project's work-state doc + its staleness verdict (T-0942)
+  bsq work-state write --file F --base-rev N
+                                    REPLACE it under the concurrency lock (any role may)
   bsq msg-route list/set/clear      where each automated message TYPE is delivered (T-0799)
   bsq drive off/on/status           operator-only: your own drive continuity toggle (T-0655)
   bsq model set/clear/status         durable per-session agent/model override (T-0678)
@@ -3032,8 +3035,11 @@ def cmd_compact_save(args) -> None:
 
     The "write everything down" half of the universal compact — call this when
     the system asks you to hand off before being relaunched fresh. The worker
-    resolves your role artifact (operator = state-doc, other task-less roles =
-    a per-assignment file) from your session md, so you don't pass an id.
+    resolves your role artifact from your session md, so you don't pass an id:
+    a PROJECT-LEVEL role (operator or user-conversation) resolves to the one
+    shared work-state doc — written through the concurrency lock, revisioned and
+    snapshotted (T-0942) — and any other task-less role to its per-assignment
+    file.
 
     T-0863: if you are bound to a TASK this is the wrong verb and the worker
     says so — your forward-state belongs in that ticket's `## Context`
@@ -3047,25 +3053,79 @@ def cmd_compact_save(args) -> None:
           f"({res.get('bytes_written')} bytes, role {res.get('role')})")
 
 
-def cmd_operator_state(args) -> None:
-    """T-0473: read the operator's FUTURE-FOCUSED state-doc (transparency, DoD-3).
+def cmd_work_state(args) -> None:
+    """T-0473/T-0942: read the project's WORK-STATE doc — with its staleness verdict.
 
-    The operator's continuity artifact is a project-management state document
-    (priorities / what's happening / delivered / next / tracked-issues — NOT an
-    event log) at ``artifacts/operator-state.md``. A fresh operator boots from it.
-    This verb READS it (or, with ``--template``, prints the scaffold to fill +
-    save via ``bsq compact-save``)."""
+    One future-focused project-management document per project (priorities /
+    what's happening / delivered / next / tracked-issues — NOT an event log) at
+    ``artifacts/work-state.md``, written by whichever session holds a
+    project-level role. Pre-T-0942 it was ``operator-state.md`` and only an
+    operator-role session's compact could reach it, which is how the seat's doc
+    sat five weeks stale while the session actually holding the seat wrote a
+    per-role file instead.
+
+    The STALENESS BANNER prints to stderr before the doc, on purpose: piping
+    the doc somewhere must not silently drop the one line saying it is history.
+    """
     slug = resolve_slug()
-    res = post("operator_state_doc", {"slug": slug})
+    res = post("work_state_doc", {"slug": slug})
     if getattr(args, "template", False):
         sys.stdout.write(res.get("template", ""))
         return
+    st = res.get("staleness") or {}
+    if getattr(args, "rev", False):
+        print(res.get("rev", 0))
+        return
+    banner = res.get("banner") or ""
+    if banner:
+        sys.stderr.write(banner + "\n\n")
     if res.get("exists"):
+        sys.stderr.write(
+            f"[rev {res.get('rev')} · written {st.get('age_human')} ago by "
+            f"{st.get('updated_by') or 'an unrecorded session'} · "
+            f"{'STALE' if st.get('stale') else 'current'}]\n"
+            f"[to replace it: bsq work-state write --file <f> --base-rev "
+            f"{res.get('rev')}]\n\n")
         sys.stdout.write(res.get("content", ""))
     else:
-        print(f"operator state-doc not created yet → {res.get('path')}")
-        print("seed it: `bsq operator-state --template` to see the schema, then "
-              "`bsq compact-save \"<filled state-doc>\"`.")
+        print(f"work-state doc not created yet → {res.get('path')}")
+        print("seed it: `bsq work-state --template` to see the schema, then "
+              "`bsq work-state write --file <f> --base-rev 0`.")
+
+
+def cmd_work_state_write(args) -> None:
+    """T-0942: REPLACE the project's work-state doc, under the concurrency lock.
+
+    Any live session may write it — «в него должна иметь право и юзер-сессия
+    писать» — so ``--base-rev`` is what keeps two holders from silently
+    clobbering each other: pass the rev you READ, and a write based on a rev
+    that has since moved is REFUSED with the current one rather than merged or
+    overwritten. Re-read, merge, write again.
+
+    Text comes from ``--file`` or stdin, never argv: this is a whole document,
+    and shell-quoting one is the friction that produces a one-line state doc.
+    """
+    slug = resolve_slug()
+    sid = require_sid(getattr(args, "sid", None))
+    if args.file:
+        text = Path(args.file).read_text(encoding="utf-8")
+    elif not sys.stdin.isatty():
+        text = sys.stdin.read()
+    else:
+        die("no text: pass --file <path> or pipe the whole work-state doc on "
+            "stdin. Read the current one (and its rev) with `bsq work-state`.")
+    params = {"slug": slug, "sid": sid, "content": text}
+    if args.base_rev is not None:
+        params["base_rev"] = args.base_rev
+    res = post("work_state_write", params)
+    print(f"work-state written → {res.get('path')} "
+          f"(rev {res.get('base_rev')} → {res.get('rev')}, "
+          f"{res.get('bytes_written')} bytes)")
+    if res.get("snapshot"):
+        print(f"  previous version: {res['snapshot']}")
+    if res.get("blind_over"):
+        print(f"  ⚠️ overwrote a doc last written by {res['blind_over']} "
+              f"without a base-rev check")
 
 
 def cmd_operator_pause(args) -> None:
@@ -8224,13 +8284,36 @@ def build_parser() -> argparse.ArgumentParser:
                     help="inbound message reference/snippet for the boot prompt")
     us.set_defaults(func=cmd_user_session)
 
-    # operator-state (T-0473) — read the operator's future-focused state-doc
-    os_ = sub.add_parser(
-        "operator-state",
-        help="read the operator's state-doc (transparency); --template prints the scaffold")
-    os_.add_argument("--template", action="store_true",
-                     help="print the fillable schema scaffold instead of the current doc")
-    os_.set_defaults(func=cmd_operator_state)
+    # work-state (T-0473 doc, T-0942 name + write half) — the project's ONE
+    # work-state doc. `operator-state` stays registered as an alias: it is in
+    # role contracts, runbooks and muscle memory, and this ticket is about the
+    # doc having one home, not about breaking the verb that reads it.
+    for _ws_name, _ws_help in (
+        ("work-state", "read the project's work-state doc + its staleness "
+                       "verdict; `write` replaces it under the lock"),
+        ("operator-state", "alias of `work-state` (T-0942 renamed the doc)"),
+    ):
+        ws = sub.add_parser(_ws_name, help=_ws_help)
+        ws.add_argument("--template", action="store_true",
+                        help="print the fillable schema scaffold instead of the current doc")
+        ws.add_argument("--rev", action="store_true",
+                        help="print just the current rev. NOT a substitute for "
+                             "reading: `--base-rev $(bsq work-state --rev)` "
+                             "immediately before a write defeats the check, "
+                             "because the rev you pass must be the one whose "
+                             "TEXT you edited")
+        ws.set_defaults(func=cmd_work_state)
+        ws_sub = ws.add_subparsers(dest="ws_sub")
+        wsw = ws_sub.add_parser(
+            "write",
+            help="REPLACE the work-state doc (--file/stdin; --base-rev is the "
+                 "rev you read, and a stale one is refused)")
+        wsw.add_argument("--file", help="read the new doc from this path")
+        wsw.add_argument("--base-rev", dest="base_rev", type=int, default=None,
+                         help="the rev of the text you EDITED; refused if the "
+                              "doc has moved on since (re-read, merge, retry)")
+        wsw.add_argument("--sid", help="session SID (default: derived from tmux)")
+        wsw.set_defaults(func=cmd_work_state_write)
 
     # operator (T-0522) — user-facing toggle for the operator re-drive (T-0474):
     # pause / resume / status (paused-vs-driving).

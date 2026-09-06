@@ -123,8 +123,14 @@ describe("ObservabilityView", () => {
     expect(html).not.toContain("Scheduler");
     expect(html).not.toContain("configured initiatives");
 
-    // Operator state-doc absent → degrade notice (not a markdown body).
-    expect(html).toContain("hasn&#x27;t written a state-doc yet");
+    // Work-state doc absent → degrade notice (not a markdown body). T-0942
+    // renamed it and widened who writes it, so the copy no longer says "the
+    // operator hasn't" — the doc is the PROJECT's and any project-level role
+    // holder writes it.
+    expect(html).toContain("Nobody has written the work-state doc yet");
+    // The PATH still reads as the legacy name here on purpose: this fixture has
+    // `exists: false`, and the api falls back to `operator-state.md` when
+    // `work-state.md` is not on disk yet, which is the pre-migration state.
     expect(html).toContain("artifacts/operator-state.md");
 
     // The backlog counts section stays dead (T-0588a) — the board below IS
@@ -146,7 +152,85 @@ describe("ObservabilityView", () => {
     });
     expect(html).toContain("Ship the transparency surface.");
     expect(html).toContain("20 / 13");
-    expect(html).not.toContain("hasn&#x27;t written a state-doc yet");
+    expect(html).not.toContain("Nobody has written the work-state doc yet");
+  });
+
+  // T-0942 — A DATE IS NOT A WARNING.
+  //
+  // The board used to render a five-week-old work-state doc exactly like a
+  // fresh one: same card, same body, a relative timestamp in small grey type.
+  // On 2026-09-06 an operator booted from a doc last written 2026-07-31 and
+  // acted on it as current fact, and the reason generalises past the boot
+  // prompt — nothing on any read surface SAID it was stale. So the payload now
+  // carries a verdict and this surface has to spend it.
+  test("a stale doc is called stale, and names its age and last writer", () => {
+    const html = renderView({
+      ...REAL_DERIVED,
+      operator_state: {
+        exists: true,
+        content: "## Priorities\n\nA July release is in flight.",
+        updated_at: 1_785_000_000,
+        path: "artifacts/work-state.md",
+        updated_by: "S-almdudleer-operator-p533",
+        rev: 4,
+        age_seconds: 37 * 24 * 3600,
+        stale: true,
+        stale_after_hours: 24,
+      },
+    });
+    expect(html).toContain("This doc is stale");
+    expect(html).toContain("read it as history");
+    expect(html).toContain("S-almdudleer-operator-p533");
+    expect(html).toContain("rev 4");
+    // The body is still rendered — it is the only record there is. The warning
+    // frames it; it does not replace it.
+    expect(html).toContain("A July release is in flight.");
+  });
+
+  test("a CURRENT doc gets no warning — or the warning stops meaning anything", () => {
+    const html = renderView({
+      ...REAL_DERIVED,
+      operator_state: {
+        exists: true,
+        // NOT a ticket id: the markdown renderer turns T-NNNN into an <a>, so a
+        // literal "Ship T-0942." never appears in the output. Pinning a string
+        // the producer does not emit is a test of my model, not of the surface.
+        content: "## Priorities\n\nShip the work-state doc.",
+        updated_at: 1_785_000_000,
+        path: "artifacts/work-state.md",
+        updated_by: "S-almdudleer-operator-p640",
+        rev: 9,
+        age_seconds: 600,
+        stale: false,
+        stale_after_hours: 24,
+      },
+    });
+    expect(html).not.toContain("This doc is stale");
+    expect(html).not.toContain("read it as history");
+    expect(html).toContain("Ship the work-state doc.");
+    expect(html).toContain("S-almdudleer-operator-p640");
+    // The AGE must come from the same source as the verdict. This fixture has a
+    // stale MTIME and a current verdict — the shape a copied data dir produces —
+    // and the card must not render "42d ago" next to no warning.
+    expect(html).toContain("10m ago");
+    expect(html).not.toContain("42d ago");
+  });
+
+  // An older api does not send the verdict fields at all. Absent must read as
+  // "no verdict", never as "stale" — a board that cried stale against every
+  // pre-T-0942 server would be the same defect pointed the other way.
+  test("a pre-T-0942 payload with no verdict fields renders no warning", () => {
+    const html = renderView({
+      ...REAL_DERIVED,
+      operator_state: {
+        exists: true,
+        content: "## Priorities\n\nold server, no verdict.",
+        updated_at: 1_700_000_000,
+        path: "artifacts/operator-state.md",
+      },
+    });
+    expect(html).not.toContain("This doc is stale");
+    expect(html).toContain("old server, no verdict.");
   });
 });
 

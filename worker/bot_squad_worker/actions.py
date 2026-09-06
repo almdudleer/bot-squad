@@ -4076,6 +4076,29 @@ def _action_compact_write_state(params: dict[str, Any]) -> dict[str, Any]:
     task_bound = bool(task_id) and task_id != "~"
     assignment_id = task_id if task_bound else (role or sid)
     kind = "task" if task_bound else (role or "compact")
+
+    # T-0942: when the destination IS the project work-state doc, the write goes
+    # through the locked+revisioned writer, not the bare Artifact handle. This is
+    # the NON-VOLITIONAL half of the fix: a compact happens whether or not a
+    # session chooses to keep the doc current, so routing operator AND
+    # user-conversation compacts here is what actually stops the five-week gap.
+    # `allow_blind` because a finalizing session has no base_rev to CAS against
+    # and its context is cleared the moment it answers — see work_state.write.
+    from bot_squad_worker import work_state
+    if art.path.name == work_state.WORK_STATE_ARTIFACT:
+        res = work_state.write(cfg.data_dir, slug, content, sid=sid, role=role,
+                               allow_blind=True)
+        return {
+            "ok": True,
+            "role": role,
+            "assignment_id": assignment_id,
+            "artifact_path": res["path"],
+            "bytes_written": res["bytes_written"],
+            "rev": res["rev"],
+            "snapshot": res["snapshot"],
+            "blind_over": res["blind_over"],
+        }
+
     art.write(compose_result_body(assignment_id, kind, content, sid=sid))
 
     body = art.read()
@@ -4088,47 +4111,120 @@ def _action_compact_write_state(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-_OPERATOR_STATE_DOC_REQUIRED = {"slug"}
-_OPERATOR_STATE_DOC_ALLOWED = _OPERATOR_STATE_DOC_REQUIRED
+_WORK_STATE_DOC_REQUIRED = {"slug"}
+_WORK_STATE_DOC_ALLOWED = _WORK_STATE_DOC_REQUIRED
 
 
-def _action_operator_state_doc(params: dict[str, Any]) -> dict[str, Any]:
-    """Read the operator's state-doc — the read-only transparency primitive
-    (T-0473, M2-F2.1; M11-T4 consumes it later).
+def _action_work_state_doc(params: dict[str, Any]) -> dict[str, Any]:
+    """Read the project's WORK-STATE doc (T-0473 schema, T-0942 name + verdict).
 
-    The operator's role artifact is a FUTURE-FOCUSED project-management state
-    document at the well-known path ``artifacts/operator-state.md`` (written via
-    ``compact_write_state``). This action only READS it (never writes) and always
-    returns the fillable schema template, so a fresh operator can boot from the
-    doc or seed it from the scaffold.
+    Registered under both ``work_state_doc`` and the pre-T-0942
+    ``operator_state_doc``: the doc is no longer the operator's, it is the
+    PROJECT's, and whichever session holds a project-level role writes it.
+
+    The read carries a STALENESS VERDICT, not just a date. That is the whole
+    point of the change on the read side: the doc has always had an ``updated:``
+    line in its frontmatter, and on 2026-09-06 an operator booted from a body
+    five weeks older than that line and acted on it as current fact. A date is
+    not a warning; ``staleness`` + ``banner`` are.
 
     Required params: slug
-    Returns: {ok, path, exists, content, template}
+    Returns: {ok, path, read_from, exists, content, rev, staleness, banner,
+              template}
     """
-    extra = set(params) - _OPERATOR_STATE_DOC_ALLOWED
+    extra = set(params) - _WORK_STATE_DOC_ALLOWED
     if extra:
-        raise ActionError(f"operator_state_doc got unexpected params: {sorted(extra)}")
-    missing = _OPERATOR_STATE_DOC_REQUIRED - set(params)
+        raise ActionError(f"work_state_doc got unexpected params: {sorted(extra)}")
+    missing = _WORK_STATE_DOC_REQUIRED - set(params)
     if missing:
-        raise ActionError(f"operator_state_doc missing required params: {sorted(missing)}")
+        raise ActionError(f"work_state_doc missing required params: {sorted(missing)}")
 
     cfg = _get_config()
     slug = params["slug"]
     if cfg.projects.get(slug) is None:
-        raise ActionError(f"operator_state_doc: unknown project slug {slug!r}")
+        raise ActionError(f"work_state_doc: unknown project slug {slug!r}")
 
-    from bot_squad_worker.assignment import (
-        _ARTIFACTS_SUBDIR, OPERATOR_STATE_ARTIFACT, Artifact,
-        operator_state_template)
+    from bot_squad_worker import work_state
+    from bot_squad_worker.assignment import operator_state_template
 
-    art = Artifact(cfg.data_dir / slug / _ARTIFACTS_SUBDIR / OPERATOR_STATE_ARTIFACT)
+    work_state.migrate(cfg.data_dir, slug)
+    res = work_state.read(cfg.data_dir, slug)
     return {
         "ok": True,
-        "path": str(art.path),
-        "exists": art.exists(),
-        "content": art.read(),
+        "path": res["path"],
+        "read_from": res["read_from"],
+        "exists": bool(res["content"].strip()),
+        "content": res["content"],
+        "rev": res["rev"],
+        "staleness": res["staleness"],
+        "banner": res["banner"],
         "template": operator_state_template(slug),
     }
+
+
+_WORK_STATE_WRITE_REQUIRED = {"slug", "sid", "content"}
+_WORK_STATE_WRITE_ALLOWED = _WORK_STATE_WRITE_REQUIRED | {"base_rev"}
+
+
+def _action_work_state_write(params: dict[str, Any]) -> dict[str, Any]:
+    """Full-replace the project's work-state doc, under the lock, with CAS.
+
+    T-0942. ANY live session of the project may call this — that is the explicit
+    widening the stakeholder asked for («в него должна иметь право и юзер-сессия
+    писать»), and the only caller refused is one with no session md, because an
+    unattributable full-replace of the project's state is worse than a refused
+    one.
+
+    ``base_rev`` is the revision the caller READ. Mismatch is refused, not
+    merged and not overwritten: the lock alone would serialize two writers and
+    still lose the first one's content silently, which is the same defect class
+    as the doc nobody wrote. The refusal returns the current rev + content so
+    the caller merges without a second read.
+
+    Required params: slug, sid, content. Optional: base_rev.
+    Returns: {ok, path, rev, base_rev, bytes_written, snapshot}
+    """
+    extra = set(params) - _WORK_STATE_WRITE_ALLOWED
+    if extra:
+        raise ActionError(f"work_state_write got unexpected params: {sorted(extra)}")
+    missing = _WORK_STATE_WRITE_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"work_state_write missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    sid = params["sid"]
+    content = params["content"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"work_state_write: unknown project slug {slug!r}")
+    if not isinstance(content, str) or not content.strip():
+        raise ActionError("work_state_write: empty content")
+
+    base_rev = params.get("base_rev")
+    if base_rev is not None:
+        try:
+            base_rev = int(base_rev)
+        except (TypeError, ValueError):
+            raise ActionError(f"work_state_write: base_rev must be an int, got {base_rev!r}")
+
+    from bot_squad_worker import sessions as _sessions
+    from bot_squad_worker import work_state
+
+    meta = _sessions._read_session_metadata(
+        _sessions._session_file(cfg.data_dir, slug, sid))
+    if not work_state.may_write(meta):
+        raise ActionError(
+            f"work_state_write: no session md for sid {sid!r} — the work-state "
+            f"doc records WHO wrote it, and an unattributable full-replace of "
+            f"the project's state is refused. Write from a registered session.")
+    role = _sessions._role_of(meta)
+
+    work_state.migrate(cfg.data_dir, slug)
+    try:
+        return work_state.write(cfg.data_dir, slug, content,
+                                sid=sid, role=role, base_rev=base_rev)
+    except work_state.WorkStateConflict as e:
+        raise ActionError(str(e)) from e
 
 
 # ---------------------------------------------------------------------------
@@ -6193,8 +6289,12 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     # T-0467: universal-compact "write everything down" — role-agnostic save of
     # a session's forward-state into its role artifact (F1.4).
     "compact_write_state": _action_compact_write_state,
-    # T-0473: read-only operator state-doc transparency primitive (M2-F2.1).
-    "operator_state_doc": _action_operator_state_doc,
+    # T-0473: the project work-state doc (M2-F2.1). T-0942 renamed it and added
+    # the write half; the old action name stays registered so an un-updated
+    # caller (a `bsq` from before the deploy, the API) keeps working.
+    "work_state_doc": _action_work_state_doc,
+    "work_state_write": _action_work_state_write,
+    "operator_state_doc": _action_work_state_doc,
     # T-0522: user-facing operator re-drive pause toggle (wraps T-0474 helpers).
     "operator_pause": _action_operator_pause,
     "operator_resume": _action_operator_resume,
@@ -6407,6 +6507,9 @@ ACTION_MODES: dict[str, str] = {
     # — single coordinator writer, like assignment_write_result. Sessions reach
     # it via `bsq compact-save` (the coordinator socket).
     "compact_write_state": "coordinator_only",
+    # T-0942: reads/writes the shared install data dir (artifacts/work-state.md) —
+    "work_state_doc": "coordinator_only",
+    "work_state_write": "coordinator_only",
     # T-0473: reads the shared install data dir (artifacts/operator-state.md) —
     # single coordinator reader, like compact_write_state. The operator reaches
     # it via `bsq operator-state`.

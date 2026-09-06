@@ -106,7 +106,12 @@ def test_compact_write_state_operator_writes_the_state_doc(tmp_path, monkeypatch
     })
     assert out["ok"] is True
     assert out["role"] == "operator"
-    art = data_dir / "bot-squad" / "artifacts" / "operator-state.md"
+    # T-0942: the destination is the PROJECT's work-state doc, not a
+    # role-lineage file. Keyed to the operator role, this file was written only
+    # by a session whose role derived to "operator" — and the session actually
+    # holding the operator seat was a `user-conversation` one, so the seat's doc
+    # sat five weeks stale while its holder compacted into a per-role file.
+    art = data_dir / "bot-squad" / "artifacts" / "work-state.md"
     assert out["artifact_path"] == str(art)
     assert "T-0467 in flight" in art.read_text()
 
@@ -169,8 +174,10 @@ def test_operator_state_doc_reports_not_yet_created(tmp_path, monkeypatch):
     import bot_squad_worker.actions as ACT
     _cfg, data_dir = _make_cfg(tmp_path, monkeypatch, sid="S-x-p1",
                                window="operator", task_id=None)
+    # T-0942 renamed the doc; the OLD ACTION NAME stays registered because a
+    # `bsq` (or api) from before the deploy still calls it.
     out = ACT.dispatch("operator_state_doc", {"slug": "bot-squad"})
-    art = data_dir / "bot-squad" / "artifacts" / "operator-state.md"
+    art = data_dir / "bot-squad" / "artifacts" / "work-state.md"
     assert out["exists"] is False
     assert out["path"] == str(art)
     assert out["content"] == ""
@@ -621,7 +628,7 @@ def test_resolve_target_routes_a_taskless_session_to_its_role_artifact(tmp_path)
     t = A._resolve_compact_target(_target_cfg(tmp_path), "bot-squad",
                                   {"sid": "S-x-p1", "role": "operator", "task_id": "~"})
     assert t["kind"] == "artifact"
-    assert t["artifact_path"].endswith("/artifacts/operator-state.md")
+    assert t["artifact_path"].endswith("/artifacts/work-state.md")  # T-0942
 
 
 def test_resolve_target_refuses_to_resurrect_the_task_sidecar(tmp_path):
@@ -854,7 +861,7 @@ def test_action_compact_arms_artifact_handoff_for_a_taskless_session(
 
     assert res["kind"] == "artifact"
     assert calls and calls[0][0] == sid
-    assert "operator-state.md" in calls[0][1]
+    assert "work-state.md" in calls[0][1]  # T-0942 renamed the destination
 
     from bot_squad_worker import telemetry as T
     import types

@@ -292,10 +292,36 @@ def for_routine(data_dir: Path | str, slug: str, routine_id: str) -> RoutineAssi
 
 # --- role artifact: the role-agnostic compact destination (T-0467) --------
 
-# Fixed filename for the operator's role artifact (the state-doc). T-0473 owns
-# its SCHEMA (priorities / happening / delivered / next / tracked-issues) and the
-# read-only transparency exposure; T-0467 only wires the resolver to this path so
-# every role-artifact lives under ``artifacts/`` for mechanism consistency.
+# Fixed filename for the PROJECT's work-state doc. T-0473 owns its SCHEMA
+# (priorities / happening / delivered / next / tracked-issues) and the read-only
+# transparency exposure; T-0467 only wires the resolver to this path so every
+# role-artifact lives under ``artifacts/`` for mechanism consistency.
+#
+# T-0942 RENAMED IT operator-state.md -> work-state.md, AND THE RENAME IS THE
+# FIX, not cosmetics. Keyed to the operator ROLE, this file was written only by
+# a session whose role derived to "operator"; the session actually holding the
+# operator seat was a `user-conversation` one, whose compact routed to
+# ``role-user-conversation-<window>.md`` instead. Both files existed on the live
+# install, and their mtimes are the whole diagnosis: the per-role file was
+# current (2026-09-04) while the seat's own doc had sat at 2026-07-31 for five
+# weeks, across 38 operator spawns each told it was their only memory.
+#
+# That is not a discipline failure. It is a ROUTING failure that looks like one
+# — the sessions were writing, faithfully, into the wrong file — so the fix is
+# this routing change, not an enforcement campaign. Stakeholder, watching it
+# happen: «мб operator state doc должен быть work state doc, и в него должна
+# иметь право и юзер-сессия писать. Правда понадобится concurrency lock.»
+#
+# Concurrency, migration, staleness and the CAS write live in
+# :mod:`bot_squad_worker.work_state`; this module only resolves the path.
+from bot_squad_worker.work_state import (  # noqa: E402  (path constants only)
+    PROJECT_ROLES as WORK_STATE_ROLES,
+    WORK_STATE_ARTIFACT,
+)
+
+#: Pre-T-0942 name. Still exported: `routes_transparency` and any worker that
+#: has not restarted still read it, and `work_state.write` keeps it in step for
+#: one release so a rollback does not strand the content.
 OPERATOR_STATE_ARTIFACT = "operator-state.md"
 
 _ARTIFACTS_SUBDIR = "artifacts"
@@ -340,7 +366,7 @@ def operator_state_template(slug: str | None = None) -> str:
     full-replaces ``artifacts/operator-state.md`` and stamps the provenance
     header.
     """
-    head = f"# Operator state — {slug}" if slug else "# Operator state"
+    head = f"# Work state — {slug}" if slug else "# Work state"
     lines = [
         head,
         "",
@@ -354,15 +380,17 @@ def operator_state_template(slug: str | None = None) -> str:
 
 
 _OPERATOR_HOW_TO = (
-    "You are working the OPERATOR role. Your continuity artifact is a "
-    "FUTURE-FOCUSED project-management state document at "
-    "``artifacts/operator-state.md`` — priorities / what's happening now / "
-    "delivered / next / tracked-issues, NOT an event log. Keep it current: update "
-    "it on every MAJOR change (an initiative starts/ships, priorities shift, a "
-    "blocker appears) and flush it on autocompact, by full-replacing it via "
-    "``bsq compact-save \"<the whole state-doc>\"``. A fresh operator boots from "
-    "this doc ALONE and continues — so write what your successor needs to keep "
-    "going, not what happened."
+    "You are working the OPERATOR role. Your continuity artifact is the "
+    "PROJECT's work-state document at ``artifacts/work-state.md`` — "
+    "priorities / what's happening now / delivered / next / tracked-issues, NOT "
+    "an event log. It is shared: whoever holds a project-level role writes it, "
+    "under a concurrency lock (T-0942). Keep it current: update it on every "
+    "MAJOR change (an initiative starts/ships, priorities shift, a blocker "
+    "appears) and flush it on autocompact, by full-replacing it via "
+    "``bsq work-state write --file <f> --base-rev <the rev you read>`` (or "
+    "``bsq compact-save`` at the compact seam). A fresh holder boots from this "
+    "doc ALONE — so write what your successor needs to keep going, not what "
+    "happened, and CHECK ITS AGE before you believe the copy you booted from."
 )
 
 
@@ -377,19 +405,31 @@ def role_compact_guidance(role: str | None) -> str:
     (T-0467) so a role writes its artifact in the RIGHT shape.
 
     The generic handoff just says "write everything down" — fine for a dev whose
-    artifact is a free-form forward-state. The **operator**, though, must write
-    the FUTURE-FOCUSED state-doc schema (T-0473), so its compact carries the
-    section list even from a degraded context. Every other role → ``""`` (the
-    caller appends nothing, keeping the handoff byte-identical).
+    artifact is a free-form forward-state. A **project-level role**, though,
+    compacts into the shared work-state doc and must write the FUTURE-FOCUSED
+    schema (T-0473), so its compact carries the section list even from a
+    degraded context. Every other role → ``""`` (the caller appends nothing,
+    keeping the handoff byte-identical).
+
+    T-0942 widened this from ``operator`` to :data:`WORK_STATE_ROLES`. It has to
+    move with the routing: a ``user-conversation`` session now compacts INTO the
+    work-state doc, and sending it there with the generic "write everything
+    down" prompt is how a schema'd shared document becomes one session's
+    free-form handover note.
     """
-    if (role or "").strip() == "operator":
+    if (role or "").strip() in WORK_STATE_ROLES:
         sects = "\n".join(f"  - {t}: {hint}" for t, hint in OPERATOR_STATE_SECTIONS)
         return (
-            "You are the OPERATOR — your artifact is the FUTURE-FOCUSED "
-            "project-management state-doc, NOT an event log. Structure it as:\n"
+            "You hold a PROJECT-LEVEL role, so your artifact is the project's "
+            "shared WORK-STATE doc — the FUTURE-FOCUSED project-management "
+            "state, NOT an event log, and NOT a per-session handover. Structure "
+            "it as:\n"
             f"{sects}\n"
-            "Write where the project IS and where it's GOING so a fresh operator "
-            "continues from this doc alone."
+            "Write where the project IS and where it's GOING so whoever holds "
+            "this role next continues from this doc alone. It is a FULL REPLACE "
+            "of a SHARED file: carry forward everything still true that you did "
+            "not author — dropping another holder's section is a silent "
+            "deletion, not a prune (T-0942)."
         )
     return ""
 
@@ -429,8 +469,15 @@ def role_artifact(
         assignment-RESULT sidecar (T-0463, a different writer) and because
         ``recovery.py`` must keep booting a crashed session from a sidecar
         written before that change — it is a READ path now, not a write one;
-      * an operator → ``artifacts/operator-state.md`` (the state-doc seam; schema
-        = T-0473);
+      * a session holding a PROJECT-LEVEL role (:data:`WORK_STATE_ROLES` —
+        ``operator`` and ``user-conversation``) → the project's ONE work-state
+        doc, ``artifacts/work-state.md`` (schema = T-0473). T-0942: both roles
+        land here because the seat is what has state, not the lineage — routing
+        `user-conversation` to a per-role file is what left the operator seat's
+        doc unwritten for five weeks while the session holding it compacted
+        faithfully into ``role-user-conversation-*.md``. Concurrent holders are
+        arbitrated by :mod:`bot_squad_worker.work_state` (flock + CAS on `rev`),
+        not by giving each one its own file;
       * any other role with no task → a stable per-assignment
         ``artifacts/role-<role>-<window-base>.md`` (the SID minus its ``-pNNN``
         pane tail) so no transient role is left without a compact destination
@@ -446,8 +493,8 @@ def role_artifact(
     if tid and tid != "~":
         return Artifact(artifacts / f"{tid}.md")
     role = (role or "").strip()
-    if role == "operator":
-        return Artifact(artifacts / OPERATOR_STATE_ARTIFACT)
+    if role in WORK_STATE_ROLES:
+        return Artifact(artifacts / WORK_STATE_ARTIFACT)
     if role:
         return Artifact(artifacts / f"role-{_safe_component(role)}-{_safe_component(_window_base(sid or ''))}.md")
     return None

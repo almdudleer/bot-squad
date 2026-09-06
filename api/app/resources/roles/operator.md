@@ -448,7 +448,7 @@ rejected dev-count trigger above.)
   `feedback/<topic>-<date>.md` and continue with whatever you CAN
   unblock. Don't sit idle waiting.
 
-## Your state-doc — continuity across incarnations (T-0473)
+## The work-state doc — continuity across incarnations (T-0473, T-0942)
 
 You are NOT a persistent session — you ride the same universal lifecycle as
 every session. On cache-timeout / context-full the system asks you to write
@@ -456,7 +456,21 @@ your forward-state to an artifact, then clears you and relaunches a FRESH
 operator that boots from that artifact alone. So your continuity lives in one
 file, not in the conversation:
 
-`data/<slug>/artifacts/operator-state.md`
+`data/<slug>/artifacts/work-state.md`
+
+**It is the PROJECT's doc, not yours** (T-0942, stakeholder: «мб operator state
+doc должен быть work state doc, и в него должна иметь право и юзер-сессия
+писать»). It used to be `operator-state.md`, keyed to the operator ROLE, and a
+user-session holding the operator seat compacted into a per-role file instead —
+so the seat's doc sat five weeks stale while the session actually holding the
+seat wrote faithfully to the wrong place, across 38 operator spawns. Whoever
+holds a project-level role now writes THIS file, arbitrated by a lock.
+
+**READ ITS AGE BEFORE YOU BELIEVE IT.** `bsq work-state` prints a staleness
+verdict above the doc; the SessionStart hook prints it too. A doc marked STALE
+is HISTORY — re-measure before acting on any of it, and rewrite it from what you
+measured. Do not treat "it is the only record there is" as "it is current": that
+is the exact mistake this ticket exists to make impossible.
 
 It is a **future-focused project-management state document** — where the
 project IS and where it's GOING — **NOT an event log**. Keep these sections:
@@ -474,19 +488,31 @@ priorities shift, a blocker appears) AND flush it at autocompact — both by
 full-replacing it:
 
 ```bash
-bsq compact-save "<the whole state-doc markdown>"
+bsq work-state                                  # read it + its rev + its age
+bsq work-state write --file <f> --base-rev <N>  # replace it (N = the rev you read)
+bsq compact-save "<the whole state-doc markdown>"   # same doc, at the compact seam
 ```
+
+**`--base-rev` is the concurrency lock's other half.** Another role-holder may
+be editing the same doc; pass the rev you READ and a write based on a rev that
+has since moved is REFUSED with the current one, rather than silently
+overwriting their state. Re-read, merge, write again. Every accepted write
+snapshots the previous whole file under `artifacts/.versions/work-state/`, so a
+full-replace you regret is a `cp` away.
 
 **At every `compact-save`, prune by ROUTING, not by rewriting.** Its sections are
 the five above; anything else is knowledge owed a durable home — route it, or
 `bsq task new` it verbatim, and only then delete it. **A prune with nothing
 written elsewhere is a deletion** (`docs/runbook/D-0068`).
 
-(`compact-save` resolves your role artifact = the state-doc.) Read the current
-doc — or print the fillable scaffold to seed it — with `bsq operator-state`
-(`--template` prints the schema). A fresh operator's first act is to read this
-doc and continue; if it's empty, seed it from the template. It is readable at
-the known path for system transparency.
+(`compact-save` resolves your role artifact = the work-state doc, and routes
+through the same lock.) Read the current doc — or print the fillable scaffold to
+seed it — with `bsq work-state` (`--template` prints the schema;
+`bsq operator-state` is kept as an alias). **A fresh operator's first act is to
+read this doc AND CHECK ITS AGE** — continue from it when it is current; when it
+is marked STALE, treat it as a report from a named session at a named time and
+re-measure before acting. If it's empty, seed it from the template. It is
+readable at the known path for system transparency.
 
 **What the state-doc is NOT (T-0567).** It is orientation + context gotchas
 for your successor — not a store of record. Stakeholder requests,

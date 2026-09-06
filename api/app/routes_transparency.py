@@ -27,6 +27,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -59,26 +62,81 @@ def _check_project(request: Request, slug: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Operator state-doc (T-0473) — read-only exposure
+# Work-state doc (T-0473 schema; T-0942 name + staleness) — read-only exposure
 # ---------------------------------------------------------------------------
 
-# Mirrors worker assignment.OPERATOR_STATE_ARTIFACT + _ARTIFACTS_SUBDIR.
+# Mirrors worker work_state.WORK_STATE_ARTIFACT + assignment._ARTIFACTS_SUBDIR.
+# The api reads the data dir directly (no worker round-trip), so these names are
+# duplicated here on purpose — but the FALLBACK to the pre-T-0942 name matters:
+# the api and the worker deploy separately, so for one release either name may
+# be the live one.
+_WORK_STATE_REL = "artifacts/work-state.md"
 _OPERATOR_STATE_REL = "artifacts/operator-state.md"
 
+#: Hours past which the doc is reported stale. Mirrors
+#: ``work_state.stale_after_hours``' default; the api has no worker env.
+_STALE_AFTER_HOURS = 24
 
-def _operator_state(data_dir: Path, slug: str) -> dict:
-    p = data_dir / slug / "artifacts" / "operator-state.md"
+_FM_UPDATED_RE = re.compile(r"^updated:\s*(.+)$", re.MULTILINE)
+_FM_UPDATED_BY_RE = re.compile(r"^(?:updated_by|sid):\s*(.+)$", re.MULTILINE)
+_FM_REV_RE = re.compile(r"^rev:\s*(\d+)\s*$", re.MULTILINE)
+
+
+def _fm_block(content: str) -> str:
+    """The frontmatter block only — so an `updated:` line in the BODY (a state
+    doc quotes timestamps constantly) cannot be mistaken for the doc's own."""
+    if not content.startswith("---\n"):
+        return ""
+    end = content.find("\n---", 4)
+    return content[4:end] if end != -1 else ""
+
+
+def _work_state(data_dir: Path, slug: str) -> dict:
+    """The work-state doc + a STALENESS VERDICT for the board.
+
+    T-0942: the payload used to carry only ``updated_at``, and a date is not a
+    warning — the board rendered a five-week-old doc exactly like a fresh one.
+    ``stale`` / ``age_seconds`` / ``updated_by`` let the UI say which it is.
+    """
+    art = data_dir / slug / "artifacts"
+    p, rel = art / "work-state.md", _WORK_STATE_REL
     if not p.exists():
-        return {"exists": False, "content": None, "updated_at": None,
-                "path": _OPERATOR_STATE_REL}
+        p, rel = art / "operator-state.md", _OPERATOR_STATE_REL
+    empty = {"exists": False, "content": None, "updated_at": None,
+             "path": _WORK_STATE_REL, "updated_by": None, "rev": 0,
+             "age_seconds": None, "stale": False,
+             "stale_after_hours": _STALE_AFTER_HOURS}
+    if not p.exists():
+        return empty
     try:
         content = p.read_text()
         updated_at = p.stat().st_mtime
     except OSError:
-        return {"exists": False, "content": None, "updated_at": None,
-                "path": _OPERATOR_STATE_REL}
+        return empty
+    fm = _fm_block(content)
+    m = _FM_UPDATED_RE.search(fm)
+    written_at = updated_at
+    if m:
+        try:
+            written_at = datetime.strptime(
+                m.group(1).strip(), "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            pass
+    by = _FM_UPDATED_BY_RE.search(fm)
+    rev = _FM_REV_RE.search(fm)
+    age = max(0.0, time.time() - written_at)
     return {"exists": True, "content": content, "updated_at": updated_at,
-            "path": _OPERATOR_STATE_REL}
+            "path": rel,
+            "updated_by": by.group(1).strip() if by else None,
+            "rev": int(rev.group(1)) if rev else 0,
+            "age_seconds": int(age),
+            "stale": age > _STALE_AFTER_HOURS * 3600,
+            "stale_after_hours": _STALE_AFTER_HOURS}
+
+
+#: Pre-T-0942 name, kept so nothing that imports it breaks mid-deploy.
+_operator_state = _work_state
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +421,10 @@ async def get_transparency(
 
     return {
         "slug": slug,
-        "operator_state": _operator_state(data_dir, slug),
+        # T-0942 renamed the doc; the payload key stays `operator_state` for one
+        # release (the web board reads it) and `work_state` is the new name.
+        "operator_state": _work_state(data_dir, slug),
+        "work_state": _work_state(data_dir, slug),
         "sessions": sessions,
         "sessions_scope": sessions_scope,
         "backlog": backlog,

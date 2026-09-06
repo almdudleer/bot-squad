@@ -68,7 +68,9 @@ def test_role_artifact_for_an_operator_is_the_state_doc_seam(tmp_path: Path):
     art = role_artifact(data_dir, "bot-squad", role="operator",
                         sid="S-u-operator-p1", task_id=None)
     assert isinstance(art, Artifact)
-    assert art.path == data_dir / "bot-squad" / "artifacts" / "operator-state.md"
+    # T-0942: renamed to the PROJECT's work-state doc, and `user-conversation`
+    # resolves here too — see tests/test_t0942_work_state_doc.py for why.
+    assert art.path == data_dir / "bot-squad" / "artifacts" / "work-state.md"
 
 
 def test_role_artifact_task_id_wins_over_role(tmp_path: Path):

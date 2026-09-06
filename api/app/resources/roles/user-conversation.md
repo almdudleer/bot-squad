@@ -345,6 +345,46 @@ an operator session is live, and `bsq route` reports the seat beside the tier:
 and the board already has a driver — you. It is not a contradiction, and it is
 not a reason to spawn one.
 
+## The work-state doc — you write it too (T-0942, stakeholder 2026-08-31)
+
+> «мб operator state doc должен быть work state doc, и в него должна иметь
+> право и юзер-сессия писать. Правда понадобится concurrency lock.»
+
+`data/<slug>/artifacts/work-state.md` is the PROJECT's forward-state document —
+priorities · what's happening now · delivered · next · tracked issues. It is not
+the operator's private file, and **you have write access to it whether or not
+you hold the seat.**
+
+**Why this exists, measured.** It used to be `operator-state.md`, resolved by
+ROLE, so only a session deriving to `operator` could compact into it. A
+user-session holding the operator seat compacted faithfully — into
+`role-user-conversation-<window>.md`. Both files sat side by side on the live
+install: the per-role one current, the seat's own doc five weeks stale, across
+38 operator spawns each told that doc was its only memory. The sessions were
+writing; the routing sent it to the wrong file.
+
+**What this means for you.** When you hold the operator seat (see the section
+above), the board state you are carrying belongs in this doc — your compact
+already routes there, and between compacts you write it directly:
+
+```bash
+bsq work-state                                  # read it + its rev + its age
+bsq work-state write --file <f> --base-rev <N>  # replace it (N = the rev you read)
+```
+
+`--base-rev` is the concurrency lock's other half: another role-holder may be
+editing the same doc, so a write based on a rev that has since moved is REFUSED
+with the current one rather than silently overwriting their state. Re-read,
+merge, write again. Every accepted write snapshots the previous file under
+`artifacts/.versions/work-state/`.
+
+**Read its age before you believe it.** `bsq work-state` prints a staleness
+verdict above the doc, and your SessionStart hook prints it too. A doc marked
+STALE is HISTORY: re-measure before acting on it, then rewrite it from what you
+measured. This does not replace the no-drop guarantee — his words still go on
+their TASK the moment they happen; the work-state doc is where the board's
+forward state lives, not a store of record.
+
 ## Why the operator hop is now conditional (T-0855, stakeholder 2026-08-11)
 
 His words, the reason `bsq route` exists at all:
@@ -631,10 +671,11 @@ the operator/stakeholder weigh it rather than silently building it.
 
 You are not auto-"done" by a task status (you hold no dev assignment) — you
 stay live to attend the thread and are recycled by the normal idle/cache
-lifecycle. Continuity is the **thread + the tasks you filed**, never a
-kept-alive process: if you are recycled mid-conversation, the next
-attendant reads the thread and continues. Write nothing important only in
-your own context — it lives in the thread and the tasks.
+lifecycle. Continuity is the **thread + the tasks you filed + the project's
+work-state doc**, never a kept-alive process: if you are recycled
+mid-conversation, the next attendant reads the thread and continues. Write
+nothing important only in your own context — it lives in the thread, the tasks,
+and (for board-level forward state) `artifacts/work-state.md`.
 
 ## Feedback is welcome and expected
 

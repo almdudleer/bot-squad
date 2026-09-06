@@ -888,14 +888,28 @@ export type Analytics = {
 // T-0511 (M11-F11.4): the unified read-only system-transparency surface — the
 // operator state-doc + session tree + backlog + quota, in one read, so a fresh
 // operator/stakeholder can see where the system IS without talking to anyone.
+export type WorkStateDoc = {
+  exists: boolean;
+  content: string | null;
+  updated_at: number | null;
+  path: string;
+  // Present from T-0942 on; absent when talking to an older api.
+  updated_by?: string | null;
+  rev?: number;
+  age_seconds?: number | null;
+  stale?: boolean;
+  stale_after_hours?: number;
+};
+
 export type Transparency = {
   slug: string;
-  operator_state: {
-    exists: boolean;
-    content: string | null;
-    updated_at: number | null;
-    path: string;
-  };
+  // T-0942: the doc is the PROJECT's work-state, not the operator's, and the
+  // payload carries a STALENESS VERDICT rather than only a date. A date is not
+  // a warning: the board rendered a five-week-old doc exactly like a fresh one,
+  // and so did the boot brief that told an operator it was its only memory.
+  // `operator_state` is kept as an alias of `work_state` for one release.
+  operator_state: WorkStateDoc;
+  work_state?: WorkStateDoc;
   sessions: SessionRow[];
   // T-0772: whether `sessions` above was owner-filtered. Absent on a pre-T-0772
   // server; see `SessionsScope`.

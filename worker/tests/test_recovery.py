@@ -128,7 +128,7 @@ def test_gather_selects_crashed_skips_graceful_and_live(monkeypatch, tmp_path):
     (backlog / "T-1.md").write_text("---\nid: T-1\nstatus: in_progress\n---\n# f\n")
     (artifacts / "T-1.md").write_text("# forward-state\n")
     _seed(tmp_path, "S-u-op-p2", status="active", role="operator", pane_id="%2")
-    (artifacts / "operator-state.md").write_text("# op state\n")
+    (artifacts / "work-state.md").write_text("# op state\n")  # T-0942
     _seed(tmp_path, "S-u-graceful-p3", status="suspended", role="dev",
           task_id="T-1", pane_id="%3")
     _seed(tmp_path, "S-u-live-p4", status="active", role="dev", task_id="T-1",
@@ -150,7 +150,7 @@ def test_gather_selects_crashed_skips_graceful_and_live(monkeypatch, tmp_path):
     assert rows["S-u-crashed-p1"]["artifact_path"].endswith("/artifacts/T-1.md")
     # operator (no task) resolves to its state-doc artifact
     assert rows["S-u-op-p2"]["has_artifact"] is True
-    assert rows["S-u-op-p2"]["artifact_path"].endswith("/artifacts/operator-state.md")
+    assert rows["S-u-op-p2"]["artifact_path"].endswith("/artifacts/work-state.md")
 
 
 def test_gather_no_artifact_when_file_absent(monkeypatch, tmp_path):
@@ -258,7 +258,7 @@ def test_boot_reconcile_incident_repro_stale_md_archived_not_respawned(
     cfg = _cfg(tmp_path)
     artifacts = tmp_path / "data" / "p1" / "artifacts"; artifacts.mkdir(parents=True)
     _seed(tmp_path, "S-u-op-p361", status="active", role="operator")
-    (artifacts / "operator-state.md").write_text("# op forward-state\n")
+    (artifacts / "work-state.md").write_text("# op forward-state\n")  # T-0942
     _age_md(tmp_path, "S-u-op-p361", days=5)
 
     spawns, archives = [], []
@@ -326,7 +326,7 @@ def test_boot_reconcile_fresh_crash_on_unpaused_project_still_respawns(
     cfg = _cfg(tmp_path)
     artifacts = tmp_path / "data" / "p1" / "artifacts"; artifacts.mkdir(parents=True)
     _seed(tmp_path, "S-u-op-p2", status="active", role="operator")
-    (artifacts / "operator-state.md").write_text("# op forward-state\n")
+    (artifacts / "work-state.md").write_text("# op forward-state\n")  # T-0942
 
     relaunches = []
     monkeypatch.setattr(S, "live_pane_map", lambda *a, **k: {})

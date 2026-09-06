@@ -327,7 +327,7 @@ def test_start_asks_a_taskless_session_for_its_role_artifact(tmp_path, seams):
     assert len(seams["calls"]["handoff"]) == 1
     got_sid, art, role, relaunch = seams["calls"]["handoff"][0]
     assert got_sid == sid and role == "operator" and relaunch is False
-    assert art.endswith("/artifacts/operator-state.md")
+    assert art.endswith("/artifacts/work-state.md")  # T-0942 renamed the doc
     assert seams["calls"]["compact"] == []
     meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
     assert meta["idle_recycle_mark"].startswith("mtime:")

@@ -108,7 +108,10 @@ def test_registry_lists_only_allowed_actions():
         # T-0467: universal-compact role-agnostic forward-state save (F1.4).
         "compact_write_state",
         # T-0473: read-only operator state-doc transparency primitive (M2-F2.1).
-        "operator_state_doc",
+        # T-0942: the doc is the PROJECT's, not the operator's, and it now has
+        # a WRITE half (locked + CAS). The old name stays registered so a `bsq`
+        # or api from before the deploy keeps resolving.
+        "work_state_doc", "work_state_write", "operator_state_doc",
         # T-0522: user-facing operator re-drive pause toggle (T-0474 follow-up).
         "operator_pause", "operator_resume", "operator_status",
         # T-0783a: which board tickets are takeable / need triage / are excluded.

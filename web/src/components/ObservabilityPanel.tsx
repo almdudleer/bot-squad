@@ -45,6 +45,29 @@ function fmtRel(epoch: number | null): string {
 }
 
 /**
+ * T-0942 — THE AGE SHOWN MUST COME FROM THE SAME SOURCE AS THE VERDICT.
+ *
+ * `updated_at` is the file's MTIME; `stale` is computed server-side from the
+ * doc's own `updated:` frontmatter (mtime is only its fallback). Those two
+ * disagree whenever the data dir has been copied or rsynced — every mtime is
+ * rewritten and the doc reads fresh while its recorded write is weeks old. A
+ * card rendering "42d ago" beside no warning, or "just now" beside a stale
+ * badge, is worse than either alone: it makes the reader distrust the badge,
+ * which is the one part that is right. Caught by a test of the no-warning case
+ * whose fixture had a stale mtime and a current verdict.
+ *
+ * So prefer `age_seconds` — the server's own number, the one the verdict was
+ * computed from — and fall back to the mtime only on a pre-T-0942 payload.
+ */
+function fmtAge(sec: number | null | undefined, epochFallback: number | null): string {
+  if (sec === null || sec === undefined) return fmtRel(epochFallback);
+  if (sec < 60) return "just now";
+  if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)}h ago`;
+  return `${Math.floor(sec / 86400)}d ago`;
+}
+
+/**
  * Collapsible detail section — the expandable half of the panel. Native
  * <details> so the collapsed state needs no React state; the summary reuses
  * the retired page's SectionTitle look.
@@ -360,8 +383,8 @@ export function ObservabilityView({
         sessionsScope={data.sessions_scope}
       />
 
-      {/* 2 — operator state-doc (T-0473) */}
-      <DetailSection title="Operator state-doc">
+      {/* 2 — the project work-state doc (T-0473 schema, T-0942 name + verdict) */}
+      <DetailSection title="Work-state doc">
         {data.operator_state.exists && data.operator_state.content ? (
           <div
             style={{
@@ -376,15 +399,37 @@ export function ObservabilityView({
               style={{ fontSize: "0.72rem", fontFamily: "var(--mc-mono)" }}
             >
               {data.operator_state.path} · updated{" "}
-              {fmtRel(data.operator_state.updated_at)}
+              {fmtAge(data.operator_state.age_seconds, data.operator_state.updated_at)}
+              {data.operator_state.updated_by
+                ? ` · by ${data.operator_state.updated_by}`
+                : null}
+              {typeof data.operator_state.rev === "number"
+                ? ` · rev ${data.operator_state.rev}`
+                : null}
             </div>
+            {/* T-0942: say it, don't leave it to be inferred from a date. */}
+            {data.operator_state.stale ? (
+              <div className="alert alert-warning" style={{ fontSize: "0.8rem" }}>
+                <strong>This doc is stale — read it as history, not as current
+                state.</strong>{" "}
+                Last written {fmtAge(data.operator_state.age_seconds, data.operator_state.updated_at)}
+                {data.operator_state.updated_by
+                  ? ` by ${data.operator_state.updated_by}`
+                  : ""}
+                , past the {data.operator_state.stale_after_hours ?? 24}h
+                freshness bar. Its priorities and its &ldquo;what&rsquo;s
+                happening now&rdquo; may name work that has since shipped or been
+                abandoned.
+              </div>
+            ) : null}
             <Markdown source={data.operator_state.content} slug={slug} />
           </div>
         ) : (
           <div className="alert alert-secondary" style={{ fontSize: "0.85rem" }}>
-            The operator hasn&apos;t written a state-doc yet{" "}
-            (<code>{data.operator_state.path}</code>). It is written on autocompact
-            and on major changes; until then there is no carried state to show.
+            Nobody has written the work-state doc yet{" "}
+            (<code>{data.operator_state.path}</code>). Whichever session holds a
+            project-level role writes it — on autocompact and on major changes;
+            until then there is no carried state to show.
           </div>
         )}
       </DetailSection>

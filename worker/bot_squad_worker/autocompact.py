@@ -580,24 +580,93 @@ def boot_prompt_from_ticket(*, role: str | None, task_id: str,
     )
 
 
+def artifact_staleness(artifact_path: str,
+                       cfg: Any = None, slug: str | None = None) -> dict:
+    """The staleness verdict for a role artifact, for the boot prompt to read.
+
+    Best-effort and never raises: an artifact it cannot read comes back
+    ``{"exists": False, "stale": False}`` and the boot prompt keeps its original
+    wording, which is the right failure direction — a broken probe must not
+    start telling every successor its state is stale."""
+    from bot_squad_worker import work_state
+    try:
+        text = Path(artifact_path).read_text(encoding="utf-8")
+    except (OSError, TypeError):
+        return {"exists": False, "stale": False}
+    try:
+        mv = None
+        if cfg is not None and slug:
+            mv = work_state.project_movement(
+                cfg.data_dir, slug,
+                work_state._parse_iso(work_state.parse_header(text).get("updated")))
+        return work_state.staleness(text, artifact_path, movement=mv)
+    except Exception:
+        log.exception("autocompact: staleness probe failed for %s", artifact_path)
+        return {"exists": bool(text.strip()), "stale": False}
+
+
 def boot_prompt_from_artifact(*, role: str | None, assignment_id: str | None,
-                              artifact_path: str) -> str:
+                              artifact_path: str,
+                              staleness: dict | None = None) -> str:
     """The reload prompt for a fresh incarnation booting from a role artifact.
 
     Factored + reusable: T-0471 (crash recovery) boots an ungracefully-crashed
     session through this SAME recover-from-artifact path.
+
+    T-0942 — THE CLAIM CHANGES WHEN THE ARTIFACT IS STALE, and the ABSENCE of
+    the old sentence is the point, not the added warning. On 2026-09-06 an
+    operator booted through this prompt onto a doc last written 2026-07-31 and
+    acted on it as current: the file's own frontmatter said ``updated:
+    2026-07-30`` two lines above the body, and it changed nothing, because this
+    prompt told it the file was its ONLY memory and to continue from there. A
+    banner bolted onto that sentence would leave a successor holding two
+    contradicting instructions, and it follows the confident one. So the stale
+    branch DROPS "your ONLY memory … continue the work from there" outright and
+    reframes the file as a report from N ago by a named session, with the
+    re-measure as the instruction and the rewrite as this incarnation's job.
+
+    ``staleness`` is injected by callers that have the project context (so the
+    verdict can count what has MOVED since, not just hours); omitted, it is
+    probed from the file.
     """
     who = f"the {role} role" if role else "your role"
     asg = f" for assignment {assignment_id}" if assignment_id else ""
+    st = artifact_staleness(artifact_path) if staleness is None else staleness
+    head = (f"You are a FRESH incarnation continuing {who}{asg}. Your "
+            "predecessor's context was full and has been cleared — NOTHING "
+            "from it survives.")
+    if not st.get("stale"):
+        return (
+            f"{head} Your "
+            "ONLY memory is the role artifact your predecessor wrote at:\n"
+            f"  {artifact_path}\n"
+            "READ THAT FILE FIRST, in full, before doing anything else. It holds the "
+            "complete forward-state (goal, what's done, what's in progress, the exact "
+            "next steps, key paths/decisions/gotchas). Then continue the work from "
+            "there — do not restart already-finished work."
+        )
+    from bot_squad_worker import work_state
+    wrote = st.get("updated_by") or "an unrecorded session"
+    age = st.get("age_human") or "an unknown time"
+    # The rewrite verb depends on WHICH artifact this is: the shared work-state
+    # doc takes `bsq work-state write --base-rev` (it has other writers to
+    # arbitrate against); a per-role artifact is this session's own file and
+    # takes `bsq compact-save`. Naming the wrong one is worse than naming none.
+    is_work_state = str(artifact_path).endswith(work_state.WORK_STATE_ARTIFACT)
+    rewrite = ("`bsq work-state write --file <f> --base-rev <rev>`"
+               if is_work_state else "`bsq compact-save \"<the whole doc>\"`")
     return (
-        f"You are a FRESH incarnation continuing {who}{asg}. Your predecessor's "
-        "context was full and has been cleared — NOTHING from it survives. Your "
-        "ONLY memory is the role artifact your predecessor wrote at:\n"
+        f"{head} The state file you would normally continue from is STALE, so "
+        "it is NOT your memory — it is HISTORY:\n"
         f"  {artifact_path}\n"
-        "READ THAT FILE FIRST, in full, before doing anything else. It holds the "
-        "complete forward-state (goal, what's done, what's in progress, the exact "
-        "next steps, key paths/decisions/gotchas). Then continue the work from "
-        "there — do not restart already-finished work."
+        f"{work_state.staleness_banner(st, rewrite_cmd=rewrite)}\n"
+        f"READ IT FIRST anyway, in full — it is the only record there is — but "
+        f"read it as a report written {age} ago by {wrote}, not as a "
+        "description of now. Before you act on ANY of it, establish what is "
+        "actually true: your inbox, the board, the live sessions, the tree. "
+        "Anything in that file you cannot re-confirm is a claim, not a fact. "
+        f"Then REWRITE it from what you measured ({rewrite}) — you are the "
+        "incarnation that ends the staleness, not another one that passes it on."
     )
 
 
@@ -942,9 +1011,14 @@ def _relaunch_from_artifact(cfg: Any, slug: str, rec: dict, artifact_path: str,
     mechanism it borrowed rather than the caller that ran it is the failure the
     breakdown exists to prevent.
     """
+    # T-0942: the verdict is computed HERE, where cfg/slug are in hand, so it
+    # can count what has moved since — the boot-prompt-side probe can only see
+    # the clock.
+    st = artifact_staleness(artifact_path, cfg=cfg, slug=slug)
     _relaunch(cfg, slug, rec, lambda role, task_id, assignment_id:
               boot_prompt_from_artifact(role=role, assignment_id=assignment_id,
-                                        artifact_path=artifact_path),
+                                        artifact_path=artifact_path,
+                                        staleness=st),
               dispatched_by=dispatched_by)
 
 

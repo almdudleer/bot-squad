@@ -330,6 +330,88 @@ def legacy_slot_mode(sd: Path) -> str:
     return str(_config(sd).get("legacy_slot_mode", "interop"))
 
 
+def fd_holders(path: Path) -> tuple[list[int], int]:
+    """Pids holding an open fd on ``path``, and the uid the scan ran as.
+
+    Attribution AND liveness in one read, and it is the right instrument for
+    the legacy pool specifically, where this module is not the acquirer and so
+    has no registry entry to consult.
+
+    ``/proc/locks`` cannot do this: the broadcast idiom is ``exec 9>file``
+    followed by ``flock -n 9``, and **the ``flock`` binary is a short-lived
+    child that performs the syscall on the inherited fd and exits** — so the
+    recorded pid is the helper, already a corpse, while the live fd sits in the
+    PARENT SHELL. Measured on all three legacy slots: acquirers 1826624,
+    1836423, 1914718 all absent from /proc, live holders 1826622, 1836421,
+    1914715 — two apart, the shell's fork/exec of ``flock``. **The acquirer is
+    a CHILD of the holder, not an ancestor**, so walking descendants of the
+    /proc/locks pid finds an empty set and reads as a leak.
+
+    ⚠⚠ **The scan sees only processes whose /proc is readable BY THIS UID, so
+    under a different uid it silently under-reports — which looks exactly like
+    a leak.** That is why the uid is returned rather than assumed: a pool that
+    force-releases on an under-read takes a live holder's slot, which is worse
+    than the problem it fixes. This module therefore REPORTS and never
+    force-releases a legacy fd.
+    """
+    target = str(path.resolve())
+    holders: list[int] = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return holders, os.getuid()
+    for name in entries:
+        if not name.isdigit():
+            continue
+        fddir = f"/proc/{name}/fd"
+        try:
+            fds = os.listdir(fddir)
+        except OSError:
+            continue  # not ours to read, or gone
+        for fd in fds:
+            try:
+                if os.path.realpath(f"{fddir}/{fd}") == target:
+                    holders.append(int(name))
+                    break
+            except OSError:
+                continue
+    return holders, os.getuid()
+
+
+def legacy_report(sd: Path) -> list[dict]:
+    """Per legacy slot file: is it held, by whom, and under which uid we looked.
+
+    A leak becomes a POSITIVE test — held with no visible fd holder — rather
+    than an inference from a pid that was never the holder. It is still only a
+    SUSPECTED leak, because an unreadable uid produces the same reading.
+    """
+    d = legacy_slot_dir(sd)
+    if d is None:
+        return []
+    out = []
+    for path in sorted(d.glob("containerless-*.lock")):
+        held = True
+        try:
+            fh = open(path, "a+")
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = False          # we got it, so nobody held it
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                held = True
+            finally:
+                fh.close()
+        except OSError:
+            held = True
+        pids, uid = fd_holders(path)
+        out.append({
+            "slot": path.name, "held": held, "fd_holders": pids,
+            "scanned_as_uid": uid,
+            "suspected_leak": bool(held and not pids),
+        })
+    return out
+
+
 def take_legacy_slot(sd: Path):
     """Grab one ``containerless-*.lock`` fd non-blocking; None when none free.
 
@@ -980,6 +1062,7 @@ def snapshot(sd: Path | None = None) -> dict:
         "holders": [_fmt(h) for h in holders],
         "waiters": [_fmt(w) for w in waiters],
         "build_held": any(h.get("kind") == "build" for h in holders),
+        "legacy_slots": legacy_report(sd),
         "readings": admission_readings(sd),
         # Say what was CHECKED, not only what was concluded. An honest report
         # from a query that does not cover the case is still a false report.
@@ -1148,7 +1231,14 @@ def _cmd_status(args) -> int:
     if args.json:
         print(json.dumps(snap, indent=2))
         return 0
-    print(f"fleet slots: {len(snap['holders'])}/{snap['slots']} container slot(s) held"
+    # Count each pool against ITS OWN ceiling. Summing both against the daemon
+    # ceiling printed "4/2", which reads as an overshoot of a limit that was
+    # never exceeded — a status line that manufactures an incident.
+    daemon = sum(1 for h in snap["holders"] if h["kind"] in ("container", "build"))
+    cl = snap.get("containerless_held", 0)
+    cl_cap = snap.get("containerless_slots")
+    print(f"fleet slots: {daemon}/{snap['slots']} container+build, "
+          f"{cl}/{cl_cap if cl_cap is not None else '∞'} containerless"
           + ("  [BUILD — exclusive]" if snap["build_held"] else ""))
     print(f"  state: {snap['state_dir']}")
     for h in snap["holders"]:
@@ -1159,6 +1249,12 @@ def _cmd_status(args) -> int:
               f"{w['lane'] or '-'}  {w['note'] or '-'}")
     if not snap["holders"] and not snap["waiters"]:
         print("  (free)")
+    for ls in snap.get("legacy_slots") or []:
+        state = "HELD" if ls["held"] else "free"
+        note = (" ⚠ SUSPECTED LEAK (or an fd owned by a uid we cannot read)"
+                if ls["suspected_leak"] else "")
+        print(f"  legacy {ls['slot']:<22} {state:<4} fd holders {ls['fd_holders'] or '-'} "
+              f"(scanned as uid {ls['scanned_as_uid']}){note}")
     print(f"  {_admission_line(snap['readings'])}")
     print(f"  checked: {snap['method']}")
     return 0

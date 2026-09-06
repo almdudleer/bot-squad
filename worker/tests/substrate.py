@@ -35,10 +35,21 @@ counts only when `shutil.which` also cannot see the binary. So a genuine
 product bug that raises either one — a wrong module name, a bad argv[0] for a
 tool that IS installed — is left alone and reported as the plain failure it is.
 
-KNOWN LIMIT, stated so nobody over-reads this: it fires on FAILURES only. A
-path lost to `importorskip` or any other skip reports as a skip and this does
-not see it (that loss class is T-0987's). It also cannot see a path that has
-no test at all.
+KNOWN LIMITS, stated so nobody over-reads this.
+
+* It fires on FAILURES only. A path lost to `importorskip` or any other skip
+  reports as a skip and this does not see it (that loss class is T-0987's). It
+  also cannot see a path that has no test at all.
+* **The attributed count is a LOWER BOUND on the environment's damage, not a
+  split of the failures into "environment" and "real".** Measured on the api
+  image at 19:35Z: 6 failed, of which this module attributed 5 to apscheduler
+  and correctly refused to claim the 6th
+  (`test_sweep_capacity_deferral_retries_without_stamping_cooldown`) — which
+  then turned out to reproduce under NEITHER the complete worker venv NOR the
+  worker venv with apscheduler hidden. So it is an artefact of that substrate
+  by some other route, and reading it as a product bug is exactly the mistake
+  this module exists to prevent. The banner says so rather than letting the
+  unlisted remainder read as vindicated.
 """
 from __future__ import annotations
 
@@ -203,6 +214,13 @@ def banner_lines() -> list[str]:
             f"  {', '.join(also)}",
         ]
     lines += [
+        "",
+        "⚠ THAT COUNT IS A LOWER BOUND, NOT A SPLIT. A failure NOT listed above",
+        "is UNATTRIBUTED, not proven real: an incomplete substrate is known to",
+        "produce failures that exist nowhere else (T-0824 measured 22 in the api",
+        "image; T-1002 measured a 6th in test_monitors.py that reproduces under",
+        "neither the worker venv nor apscheduler's absence alone). Reproduce any",
+        "of them on a COMPLETE substrate before filing one as a defect.",
         "",
         "Every code path needing one of those went UNMEASURED. The pass count",
         "below counts only what this substrate could reach — it is not a result",

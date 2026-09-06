@@ -224,6 +224,12 @@ def test_missing_substrate_gets_a_banner_and_a_trailer(tmp_path):
     # 3 tests failed but only 2 are the environment — the banner must not
     # launder the real bug into the substrate count.
     assert "2 failure(s) in this run are THE ENVIRONMENT" in out, out
+    # ...and it must not let the unlisted remainder read as vindicated either.
+    # Measured on the api image: the one failure this module declined to claim
+    # reproduced under NEITHER a complete worker venv NOR apscheduler's absence
+    # alone, so "not attributed" is not "proven real".
+    assert "LOWER BOUND, NOT A SPLIT" in out, out
+    assert "COMPLETE substrate before filing one as a defect" in out, out
 
     # The trailer lands AFTER pytest's own count line, so the caveat travels
     # with whichever line a reader copies into a report.

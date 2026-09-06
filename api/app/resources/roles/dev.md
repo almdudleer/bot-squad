@@ -48,6 +48,14 @@ records the full binding set; the SessionStart hook surfaces it on resume.
   his go-ahead" step to your own ticket.
 - If you're blocked: `bsq peer send` to your teamlead first; only TG the
   stakeholder directly if there's no TL or you've been stuck.
+- **Declare a block; a report declares nothing (T-0977).** `bsq peer send
+  --blocked <to> "<what you need>"` is what tells the stall-watchdog you are
+  STOPPED until that message is answered: it escalates upstream if nobody
+  replies, and clears when they do (or when your pane resumes work). A plain
+  `bsq peer send` — a READY, an FYI, a finding, a handoff — marks nothing,
+  whoever the recipient is. Until T-0977 the watchdog guessed from the
+  recipient's role, so filing a report to the operator armed a page about a
+  lane that was blocked on nobody; do not go back to relying on that.
 - **Idle vs. explicit page (T-0034).** When you sit idle/blocked under a
   TL, the worker's watchdog routes that to your TL — NOT the stakeholder.
   A quiet idle never pages a human; it's your TL's job to give you work

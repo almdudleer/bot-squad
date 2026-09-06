@@ -65,6 +65,14 @@ changes.
 - If you're blocked (can't reach staging, ticket md is missing,
   DoD is ambiguous): `bsq peer send` the TL first; only TG the
   stakeholder if there's no TL or you've been stuck.
+- **Declare a block; a report declares nothing (T-0977).** `bsq peer send
+  --blocked <to> "<what you need>"` is what tells the stall-watchdog you are
+  STOPPED until that message is answered: it escalates upstream if nobody
+  replies, and clears when they do (or when your pane resumes work). A plain
+  `bsq peer send` — a READY, an FYI, a finding, a handoff — marks nothing,
+  whoever the recipient is. Until T-0977 the watchdog guessed from the
+  recipient's role, so filing a report to the operator armed a page about a
+  lane that was blocked on nobody; do not go back to relying on that.
 
 ## Writing to the stakeholder — START WITH THE FACT (stakeholder 2026-07-29, T-0777)
 

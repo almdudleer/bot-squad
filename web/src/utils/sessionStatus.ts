@@ -121,8 +121,9 @@ export const LIVE_STATUSES: ReadonlySet<string> = new Set(["active", "paused"]);
 // signal. The PROJECT-level quick-status (quick_status.py) rolls up to
 // `needs-input` when there's no working session but ≥1 session is either
 // `paused` (Ctrl-C'd, pane still open) OR `awaiting_input` (the PRECISE signal:
-// sid in tg_stall.blocked_sids — the agent peer_send'd the operator and is
-// blocked on a reply). T-0375 dropped the coarse `active_at_prompt` heuristic
+// sid in tg_stall.blocked_sids — T-0977: the agent DECLARED itself blocked on a
+// reply; it used to fire on any peer_send to an operator, i.e. on every
+// report). T-0375 dropped the coarse `active_at_prompt` heuristic
 // (it never decayed → a finished autonomous dev parked at ❯ stuck the pill on
 // needs-input forever). This per-ROW mirror MUST match: paused OR awaiting_input
 // — the row-mirror had drifted, still reading active_at_prompt. Keep in

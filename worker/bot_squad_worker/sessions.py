@@ -1788,7 +1788,9 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
             })
 
     # T-0285: stamp an explicit awaiting-input flag from the tg_stall blocked
-    # markers (the agent peer_send-ed an operator and is waiting on a reply).
+    # markers. T-0977: a marker means the session DECLARED itself blocked (or
+    # stall_sweep found it stuck on a modal) — NOT "it peer_sent an operator",
+    # which was true of every report and badged whole lanes as waiting on him.
     # This is the precise "this one is waiting on you" signal — distinct from
     # the T-0346 paused/idle-at-prompt heuristic. Best-effort; the import is
     # lazy because tg_stall imports sessions back (cycle-safe at call time).
@@ -6634,7 +6636,10 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
                 # DEFAULT_IDLE_SUSPEND_SEC (12h, Ch. III HARD spec) unless the
                 # operator explicitly set [caps].idle_suspend_sec = 0 (OFF).
                 # Spared when it is awaiting TG input (blocked_sids: a real "waiting
-                # on you" signal, not a leak) or its pane is still active. A session
+                # on you" signal, not a leak — T-0977 made that true, by moving
+                # the marker's trigger off "peer_sent an operator", which spared
+                # every lane that had merely filed a report) or its pane is
+                # still active. A session
                 # with no transcript activity signal is spared (age unknowable). The
                 # task binding is preserved as last_task_id below and the task stays
                 # open — reversible, re-dispatchable to a fresh session

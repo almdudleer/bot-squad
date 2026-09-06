@@ -232,7 +232,11 @@ def _report_escalation(cfg: Any, slug: str, sid: str, row: dict,
     # logic once the block ages past its threshold.
     try:
         from bot_squad_worker import tg_stall as _tg_stall
-        _tg_stall.mark_blocked(cfg, slug, sid, text)
+        # T-0977: stamp the origin. This marker is NOT a declared block, so no
+        # `blocked_on` — a peer reply cannot unstick a TUI modal, and the
+        # marker must only clear when the pane actually resumes
+        # (`clear_if_resumed`) or a human clears it explicitly.
+        _tg_stall.mark_blocked(cfg, slug, sid, text, origin="stall_sweep")
     except Exception:
         log.exception("stall_sweep: tg_stall.mark_blocked failed for %s", sid)
     log.warning("stall_sweep: %s -- escalated (%s, %d attempts)",

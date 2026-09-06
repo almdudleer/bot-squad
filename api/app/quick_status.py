@@ -7,8 +7,10 @@ single string per project from its session rows:
                    (active AND NOT active_at_prompt AND NOT awaiting_input)
     needs-input  = no working, at least one `paused` (Ctrl-C'd) OR
                    `awaiting_input` (the worker's PRECISE signal: sid in
-                   tg_stall.blocked_sids — the agent peer_send'd the operator
-                   and is blocked on a reply) — T-0375 Option A
+                   tg_stall.blocked_sids — the agent DECLARED itself blocked on
+                   a reply, `bsq peer send --blocked`) — T-0375 Option A,
+                   T-0977 (it used to fire on any peer_send to an operator, so
+                   a lane filing a report pinned the pill to needs-input)
     idle         = otherwise (only suspended, zero sessions, OR active sessions
                    merely idle-at-prompt but NOT blocked: an autonomous dev
                    parked at ❯ is idle/done + reapable, not awaiting a human)
@@ -74,8 +76,8 @@ def aggregate_project_status(rows: list[dict]) -> dict:
         }
 
     # T-0375 (Option A — supersedes T-0046): needs-input is driven by the
-    # PRECISE awaiting_input signal (sid in tg_stall.blocked_sids — the agent
-    # actually peer_send'd the operator and is blocked on a reply), plus paused
+    # PRECISE awaiting_input signal (sid in tg_stall.blocked_sids — T-0977: the
+    # agent DECLARED itself blocked on a reply), plus paused
     # (Ctrl-C'd) sessions. NOT the coarse `active_at_prompt` heuristic, which
     # never decays: an idle-at-prompt autonomous dev parked at ❯ is idle/done
     # (and reapable), not awaiting a human. See docs/architecture/D-0018.

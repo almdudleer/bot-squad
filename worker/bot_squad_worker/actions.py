@@ -3018,7 +3018,10 @@ def _action_autopilot_status(params: dict[str, Any]) -> dict[str, Any]:
 _PEER_SEND_REQUIRED = {"slug", "from_sid", "to", "text"}
 # T-0157: optional `user` overrides the linux-user scope for role-keyword
 # fan-out (teamlead/dev/all) — cross-user messaging is opt-in.
-_PEER_SEND_ALLOWED = _PEER_SEND_REQUIRED | {"user"}
+# T-0977: `blocked` is the sender DECLARING it is stopped until this message is
+# answered — the stall-watchdog's trigger. Optional and default-off: a message
+# without it is a report/FYI/handoff and marks nothing.
+_PEER_SEND_ALLOWED = _PEER_SEND_REQUIRED | {"user", "blocked"}
 
 # T-0035 (lean Option B): peer_send replies to a UI-shaped SID are mirrored
 # to that user's bound Telegram chat so a stakeholder browsing the UI still
@@ -3189,13 +3192,16 @@ def _action_peer_send(params: dict[str, Any]) -> dict[str, Any]:
     if not result.get("ok", True):
         raise ActionError(f"peer_send: {result.get('error', 'refused')}")
 
-    # T-0155: feed the stall-watchdog — a send to an operator-role session marks
-    # the sender blocked on the stakeholder; an operator's send clears the
-    # recipients' markers. Never let it break the bus write.
+    # T-0155: feed the stall-watchdog. T-0977: the sender's own `blocked`
+    # declaration is what marks it — NOT the recipient's role, which cannot
+    # tell a report from a question and marked on every report. A reply from a
+    # session the block was declared on clears it. Never let it break the bus
+    # write.
     try:
         from bot_squad_worker import tg_stall as _tg_stall
         _tg_stall.on_peer_send(
             cfg, params["slug"], params["from_sid"], result.get("delivered_to", []),
+            blocked=bool(params.get("blocked")), text=params["text"],
         )
     except Exception:  # noqa: BLE001
         log.exception("peer_send: tg_stall hook failed (non-fatal)")

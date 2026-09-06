@@ -7,11 +7,11 @@ gone. TG is now reached two ways:
    ``tg_notify`` action). Easy to remember, fires exactly when the agent
    chooses.
 
-2. **Auto-escalation (this module)** — the safety net for when the agent
-   forgets the verb. When an agent ``peer_send``s a session whose role is
-   ``operator`` (i.e. it is blocked on the stakeholder) and gets no reply,
-   a *stall marker* is written. The worker's ``tick`` then fires a single
-   TG ping iff ALL of:
+2. **Auto-escalation (this module)** — the safety net for a declared block
+   the agent then stops chasing. When an agent ``peer_send``s **declaring
+   itself blocked** (``bsq peer send --blocked``, i.e. the message is a
+   question it is stopped on) and gets no reply, a *stall marker* is
+   written. The worker's ``tick`` then fires a single TG ping iff ALL of:
      - the marker has aged past ``cfg.tg_stall_minutes`` (default 15), AND
      - the agent's tmux window is **not** being watched (no attached client
        has that window active — "I don't have the window open in tmux").
@@ -22,14 +22,31 @@ gone. TG is now reached two ways:
    remote-control footer to resume in the Claude app.
 
 A marker is cleared the moment the block resolves: the stakeholder replies in
-tmux (``user_prompt_submit`` hook), the operator peer_sends the agent back, or
-a TG reply is injected. So "no reply in tmux for 15 minutes" is exactly the
-window in which a marker survives to escalation.
+tmux (``user_prompt_submit`` hook), **one of the sessions the block was
+declared on** peer_sends the agent back, a TG reply is injected, or the agent's
+own pane resumes work (``clear_if_resumed``). So "no reply in tmux for 15
+minutes" is exactly the window in which a marker survives to escalation.
+
+T-0977 — **the trigger is the SENDER'S DECLARED INTENT, never the recipient's
+role.** Until this ticket, ``on_peer_send`` marked whenever any recipient was
+an ``operator``-role session. Sending a *report* to the operator is the
+opposite of asking the human, and the fleet does it constantly: one routine
+handler logged 28 mark/clear pairs in 86 minutes without once being blocked on
+anybody. T-0599 saw the same class and exempted only the human's own sessions —
+the instance, not the class. A role is a proxy for intent; the fix is to stop
+proxying and read the declaration.
 
 Marker file: ``data/<slug>/_worker/tg_stall/<sid>.json``::
 
     {"sid": "...", "slug": "...", "since": 1730000000.0,
-     "text": "blocked: need your call on prod", "escalated": false}
+     "text": "blocked: need your call on prod", "escalated": false,
+     "origin": "declared", "blocked_on": ["S-...-operator-p23"]}
+
+``origin`` is ``"declared"`` (the agent said it is blocked) or ``"stall_sweep"``
+(``stall_sweep`` could not auto-answer a blocking TUI modal). A marker with NO
+``origin`` key predates T-0977 — it was written by the role-proxy trigger, so
+its meaning is unknown and ``tick`` drops it instead of escalating it (see
+``tick``). ``blocked_on`` names the sessions whose reply resolves the block.
 """
 from __future__ import annotations
 
@@ -64,36 +81,66 @@ def _marker_path(cfg: Any, slug: str, sid: str) -> Path:
 # Marker lifecycle
 # ---------------------------------------------------------------------------
 
-def mark_blocked(cfg: Any, slug: str, sid: str, text: str) -> None:
-    """Record that ``sid`` is blocked on the stakeholder.
+def mark_blocked(
+    cfg: Any,
+    slug: str,
+    sid: str,
+    text: str,
+    *,
+    origin: str = "declared",
+    blocked_on: Optional[list[str]] = None,
+) -> None:
+    """Record that ``sid`` is blocked waiting on a reply.
 
     Idempotent while the block stands: an existing, not-yet-escalated marker
     keeps its original ``since`` (the 15-min clock started when the agent
     *first* asked) and only refreshes the text. A previously escalated marker
     is reset to a fresh block.
+
+    T-0977: ``origin`` records WHY the marker exists (``"declared"`` — the
+    agent said so; ``"stall_sweep"`` — a blocking TUI modal it could not
+    auto-answer) and ``blocked_on`` names the SIDs whose reply resolves it.
+    ``blocked_on`` is UNIONED with any already recorded, so a second declaration
+    to a different upstream cannot drop the first one's clear path.
     """
     if not sid:
         return
     p = _marker_path(cfg, slug, sid)
     since = time.time()
     existing = _read(p)
+    waiting_on: list[str] = []
     if existing and not existing.get("escalated"):
         since = float(existing.get("since", since))
+        prior = existing.get("blocked_on")
+        if isinstance(prior, list):
+            waiting_on = [str(x) for x in prior if x]
+    for rsid in (blocked_on or []):
+        if rsid and rsid != sid and rsid not in waiting_on:
+            waiting_on.append(str(rsid))
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(
-        {"sid": sid, "slug": slug, "since": since, "text": text, "escalated": False},
+        {"sid": sid, "slug": slug, "since": since, "text": text,
+         "escalated": False, "origin": origin, "blocked_on": waiting_on},
         indent=2,
     ))
     tmp.replace(p)
-    log.info("tg_stall: marked %s blocked on operator (slug=%s)", sid, slug)
+    log.info("tg_stall: marked %s blocked (origin=%s, waiting on %s, slug=%s)",
+             sid, origin, waiting_on or "-", slug)
 
 
 def blocked_sids(cfg: Any, slug: str) -> set[str]:
     """T-0285: the set of SIDs with an active stall marker — i.e. blocked
-    waiting on the operator (they ``peer_send``-ed an operator-role session and
-    haven't been replied to). Surfaced on the sessions payload as a per-session
+    waiting on a reply. Surfaced on the sessions payload as a per-session
     ``awaiting_input`` flag so the UI can glance "this one is waiting on you".
+
+    T-0977: a marker now means the session DECLARED itself blocked (``bsq peer
+    send --blocked``) or ``stall_sweep`` found it stuck on a modal — no longer
+    "it peer_sent an operator-role session", which was true of every report the
+    fleet filed and made this set read "everyone is waiting on you". Every
+    consumer of this set (the ``awaiting_input`` badge, ``quick_status``'s
+    needs-input pill, the idle-suspend sparing in ``sessions``) inherited that
+    wrong meaning and is corrected by fixing the trigger, not by changing them.
 
     Honors the same ``_MARKER_TTL_SEC`` the GC uses, so a stale marker left by a
     dead session doesn't show forever. Best-effort: any read error → empty set.
@@ -171,53 +218,124 @@ def clear_if_resumed(cfg: Any, slug: str, sid: str, activity_at: Optional[float]
     return clear_blocked(cfg, slug, sid)
 
 
-def on_peer_send(cfg: Any, slug: str, from_sid: str, recipient_sids: list[str]) -> None:
+def _clears_marker(cfg: Any, slug: str, rsid: str, from_sid: str) -> bool:
+    """T-0977: may ``from_sid``'s message to ``rsid`` clear ``rsid``'s marker?
+
+    Yes iff ``from_sid`` is one of the sessions the block was declared ON —
+    i.e. the party that owes the reply actually replied. That is the literal
+    meaning of the marker; the old rule ("the sender's role is operator") was
+    the mirror image of the marking defect this ticket fixes — a proxy for "the
+    human answered" that any unrelated operator broadcast satisfied, clearing
+    markers whose question nobody had read.
+
+    A marker with no ``blocked_on`` is NOT cleared here. Those are
+    ``stall_sweep`` markers ("stuck on a TUI modal nobody could auto-answer")
+    and pre-T-0977 markers: a peer message resolves neither. They clear via
+    ``clear_if_resumed`` (the pane actually resumed — which IS what unstuck
+    means for a modal), a TG reply, or the explicit ``tg_stall_clear`` action.
+    """
+    m = _read(_marker_path(cfg, slug, rsid))
+    if not m:
+        return False
+    waiting_on = m.get("blocked_on")
+    if not isinstance(waiting_on, list) or not waiting_on:
+        return False
+    return from_sid in {str(x) for x in waiting_on}
+
+
+def on_peer_send(
+    cfg: Any,
+    slug: str,
+    from_sid: str,
+    recipient_sids: list[str],
+    *,
+    blocked: bool = False,
+    text: str = "",
+) -> None:
     """React to a ``peer_send`` for the stall-watchdog (best-effort).
 
-    Two effects, resolved from one session-registry read:
-      - **mark**: if any recipient is an ``operator``-role session, ``from_sid``
-        is now blocked on the stakeholder → write/refresh its marker.
-      - **clear**: if the *sender* is the operator (the stakeholder replying),
-        clear each recipient's marker — they just got their answer.
+    Two effects:
+      - **mark**: iff the sender DECLARED itself blocked (``blocked=True``,
+        from ``bsq peer send --blocked``) → write/refresh its marker, recording
+        the recipients as the parties whose reply resolves it.
+      - **clear**: for each recipient that is waiting on a reply *from this
+        sender*, clear its marker — it just got its answer.
+
+    T-0977 — **the mark is the sender's declaration, not the recipient's role.**
+    The old rule marked whenever any recipient was an ``operator``-role
+    session, so a lane *reporting a finding* to the operator armed a page about
+    itself; measured live at 28 mark/clear pairs in 86 minutes for one routine
+    handler that was never blocked on anyone. Direction of information flow is
+    the whole distinction and a role cannot see it: a report and a question have
+    the same recipient. T-0599 diagnosed exactly this and exempted only the
+    human's own sessions — the instance, not the class — which is why the
+    exemption below is now redundant and kept only as a second belt (a
+    hand-launched ``user-session`` window IS the stakeholder and can never be
+    blocked on itself, whatever flag it passes).
+
+    The forgot-to-declare case is NOT covered by guessing from the recipient:
+    it is covered by the intent-free instruments that measure the actual thing —
+    ``stall_sweep`` (a blocking modal), ``idle_timeout`` and ``drift`` (a lane
+    that stopped producing). A proxy that fires on every report buys nothing
+    they do not already cover and costs a page.
 
     Failures are swallowed so the bus write is never affected.
     """
     if not from_sid or not recipient_sids:
         return
+
+    # Clear first, and WITHOUT a session-registry read: whether a reply
+    # resolves a block is answered by the marker's own recorded `blocked_on`,
+    # not by anybody's role.
+    for rsid in recipient_sids:
+        if _clears_marker(cfg, slug, rsid, from_sid):
+            clear_blocked(cfg, slug, rsid)
+
+    if not blocked:
+        return
+
     try:
         from bot_squad_worker import sessions as S
         rows = {r["sid"]: r for r in S.list_sessions(cfg, slug)}
     except Exception:  # noqa: BLE001
-        log.exception("tg_stall: could not list sessions for operator check (slug=%s)", slug)
-        return
+        log.exception("tg_stall: could not list sessions for blocked-declaration check (slug=%s)", slug)
+        rows = {}
 
-    sender_is_operator = rows.get(from_sid, {}).get("role") == "operator"
-    if sender_is_operator:
-        for rsid in recipient_sids:
-            clear_blocked(cfg, slug, rsid)
-        return
-
-    # T-0599: never auto-mark one of the human's own sessions blocked on
-    # itself. A user-conversation session's whole job is a one-way
-    # intake->operator notify (never a question awaiting a reply — see its
-    # role contract), and a hand-launched `user-session` window IS the
-    # stakeholder, who cannot be "blocked on" themselves. Journal-evidenced
-    # false positives (2026-07-05 11:20Z + 19:01Z): a routine FYI / a
-    # closing confirmation each got marked blocked purely because the
-    # recipient's role was operator, with no regard for the sender or intent.
-    # Reuses recycle_gate's existing SSOT for this same "human's own
-    # sessions" class (T-0564/T-0616) rather than inventing a new signal.
+    # T-0599: never mark one of the human's own sessions blocked on itself. A
+    # hand-launched `user-session` window IS the stakeholder, who cannot be
+    # "blocked on" themselves, and a user-conversation session's whole job is a
+    # one-way intake->operator notify. Reuses recycle_gate's existing SSOT for
+    # this "human's own sessions" class (T-0564/T-0616).
     from bot_squad_worker import recycle_gate as _recycle_gate
     sender = rows.get(from_sid, {})
     if _recycle_gate.user_session_exempt(role=sender.get("role"), window=sender.get("window")):
         return
 
-    for rsid in recipient_sids:
-        if rows.get(rsid, {}).get("role") == "operator":
-            # The agent just asked the stakeholder something → it is now
-            # blocked on the stakeholder until a reply clears the marker.
-            mark_blocked(cfg, slug, from_sid, _last_marker_text(cfg, slug, from_sid))
-            return
+    mark_blocked(
+        cfg, slug, from_sid,
+        _declared_marker_text(cfg, slug, from_sid, text),
+        origin="declared",
+        blocked_on=list(recipient_sids),
+    )
+
+
+def _declared_marker_text(cfg: Any, slug: str, sid: str, text: str) -> str:
+    """T-0977: the escalation body for a DECLARED block.
+
+    The declaring message is the description of the block, so use it WHOLE —
+    every live marker read on 2026-09-06 said only "is blocked waiting on your
+    reply", which tells the human nothing about what is blocked or on what.
+    Falls back to an existing marker's text, then to the generic note.
+
+    **No truncation here on purpose.** T-0721 removed a 400-char pre-cut at the
+    escalation site precisely so a long reason arrives in full: the
+    ``_send_stakeholder_dm`` SSOT splits into numbered parts rather than
+    truncating, so a cap here would only re-open that decision one layer
+    earlier. The length is already bounded upstream — T-0827 makes ``peer_send``
+    refuse an over-cap message whole rather than deliver it cut.
+    """
+    body = (text or "").strip()
+    return body or _last_marker_text(cfg, slug, sid)
 
 
 def _last_marker_text(cfg: Any, slug: str, sid: str) -> str:
@@ -467,7 +585,8 @@ def build_escalation_text(cfg: Any, sid: str, text: str, session_name: str) -> s
 def tick(cfg: Any) -> dict:
     """One escalation sweep across all projects. Returns an audit dict."""
     stall_minutes = int(getattr(cfg, "tg_stall_minutes", 15))
-    audit = {"ok": True, "checked": 0, "escalated": 0, "gc": 0, "disabled": False}
+    audit = {"ok": True, "checked": 0, "escalated": 0, "gc": 0, "legacy_dropped": 0,
+             "disabled": False}
     if stall_minutes <= 0:
         audit["disabled"] = True
         return audit
@@ -489,6 +608,29 @@ def tick(cfg: Any) -> dict:
             if age > _MARKER_TTL_SEC:
                 marker.unlink(missing_ok=True)
                 audit["gc"] += 1
+                continue
+            # T-0977 deploy safety: a marker with no `origin` was written by
+            # the pre-T-0977 role-proxy trigger, so it means "this lane
+            # peer_sent an operator" — which is mostly "it filed a report". At
+            # the moment this ships there are live ones (3 read on 2026-09-06,
+            # all from lanes that had sent REPORTS), and the 15-minute fuse on
+            # each is already burning. They cannot be re-classified after the
+            # fact, so they are DROPPED rather than escalated: a dropped true
+            # positive costs a page the agent can re-declare, a kept false
+            # positive is the exact page this ticket exists to stop.
+            #
+            # This is the whole of the deploy story ON PURPOSE. It runs on the
+            # worker's own tick, needs nobody to remember anything, and cannot
+            # evaporate the way an operator-side marker sweep does when the
+            # operator compacts, is recycled, is reaped or crashes.
+            if "origin" not in data:
+                marker.unlink(missing_ok=True)
+                audit["legacy_dropped"] += 1
+                log.info(
+                    "tg_stall: dropped pre-T-0977 marker for %s (slug=%s) — "
+                    "written by the role-proxy trigger, meaning unknown, not escalating",
+                    data.get("sid"), slug,
+                )
                 continue
             if data.get("escalated"):
                 continue

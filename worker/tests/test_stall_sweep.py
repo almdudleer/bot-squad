@@ -133,7 +133,12 @@ def seams(monkeypatch):
     from bot_squad_worker import tg_stall as TG
     monkeypatch.setattr(
         TG, "mark_blocked",
-        lambda cfg, slug, sid, text: calls["escalations"].append((sid, text)),
+        # T-0977: the sweep now stamps `origin="stall_sweep"` and passes no
+        # `blocked_on` — this marker is "stuck on a TUI modal", which no peer
+        # reply resolves, so nothing may peer-clear it.
+        lambda cfg, slug, sid, text, *, origin="declared", blocked_on=None: (
+            calls["escalations"].append((sid, text, origin, blocked_on))
+        ),
     )
     return {"calls": calls, "state": state}
 
@@ -236,7 +241,9 @@ def test_escalates_after_max_attempts_and_stops_sending(tmp_path, seams):
     assert acted is False
     assert len(seams["calls"]["sent_keys"]) == SS._MAX_ATTEMPTS  # not resent
     assert len(seams["calls"]["escalations"]) == 1
-    esc_sid, esc_text = seams["calls"]["escalations"][0]
+    esc_sid, esc_text, esc_origin, esc_blocked_on = seams["calls"]["escalations"][0]
+    assert esc_origin == "stall_sweep"
+    assert esc_blocked_on is None
     assert esc_sid == SID
     assert "auto-answer did not clear it" in esc_text
 

@@ -19,6 +19,7 @@ import bot_squad_worker.tg_stall as TS
 
 DEV = "S-almdudleer-tg-gating-p18"
 OP = "S-almdudleer-operator-p23"
+TL = "S-almdudleer-teamlead-p31"
 
 
 def _make_cfg(tmp_path: Path, *, stall_minutes: int = 15, remote_url: str = ""):
@@ -58,7 +59,11 @@ def fake_roles(monkeypatch):
     import bot_squad_worker.sessions as S
     monkeypatch.setattr(
         S, "list_sessions",
-        lambda cfg, slug: [{"sid": DEV, "role": "dev"}, {"sid": OP, "role": "operator"}],
+        lambda cfg, slug: [
+            {"sid": DEV, "role": "dev"},
+            {"sid": OP, "role": "operator"},
+            {"sid": TL, "role": "teamlead"},
+        ],
     )
 
 
@@ -142,23 +147,111 @@ def test_clear_if_resumed_none_activity_leaves_marker(tmp_path):
 # on_peer_send mark/clear (scenario steps 3, 8)
 # ---------------------------------------------------------------------------
 
-def test_peer_send_to_operator_marks_blocked(tmp_path, fake_roles):
+# T-0977 — THE ASK. The marker means "blocked on a reply". A REPORT filed to
+# the operator is the opposite direction of information flow, and the old
+# trigger could not tell them apart because it read the RECIPIENT'S ROLE, which
+# is identical for both. Measured live 2026-09-06: one routine handler logged 28
+# mark/clear pairs in 86 minutes without being blocked on anybody, and three
+# markers reading "is blocked waiting on your reply" belonged to lanes that had
+# just sent reports.
+#
+# This test is written to FAIL on the pre-fix module: `on_peer_send(DEV, [OP])`
+# wrote a marker there. Verified RED against `git show HEAD:` before the fix
+# landed — the assertion is the absence, so an untested absence would be a
+# green that proves nothing.
+
+def test_peer_send_report_to_operator_marks_NOTHING(tmp_path, fake_roles):
+    """A lane reporting to the operator must arm no page — no flag, no marker."""
     cfg = _make_cfg(tmp_path)
-    TS.on_peer_send(cfg, "bot-squad", DEV, [OP])
+    TS.on_peer_send(cfg, "bot-squad", DEV, [OP], text="READY T-0977 — shipped")
+    assert not TS._marker_path(cfg, "bot-squad", DEV).exists()
+
+
+def test_peer_send_declaring_blocked_marks(tmp_path, fake_roles):
+    """POSITIVE CONTROL for the test above: the instrument CAN still write a
+    marker, so that absence is about the declaration and not about a module
+    that stopped marking altogether."""
+    cfg = _make_cfg(tmp_path)
+    msg = "need your call: drop the live markers or migrate them?"
+    TS.on_peer_send(cfg, "bot-squad", DEV, [OP], blocked=True, text=msg)
+    marker = TS._marker_path(cfg, "bot-squad", DEV)
+    assert marker.exists()
+    data = json.loads(marker.read_text())
+    assert data["origin"] == "declared"
+    assert data["blocked_on"] == [OP]
+    # The declaring message IS the description of the block. Every live marker
+    # read on 2026-09-06 carried only the generic fallback, which told the
+    # human nothing about what was blocked or on what.
+    assert data["text"] == msg
+
+
+def test_declared_block_text_is_not_truncated(tmp_path, fake_roles):
+    """T-0721 removed a 400-char pre-cut so a long reason reaches the human in
+    full (the SSOT splits into numbered parts, it does not truncate). Carrying
+    the declaring message into the marker must not re-open that decision one
+    layer earlier."""
+    cfg = _make_cfg(tmp_path)
+    reason = "Нужен твой выбор по деплою. " + "Вот весь контекст решения. " * 40
+    TS.on_peer_send(cfg, "bot-squad", DEV, [OP], blocked=True, text=reason)
+    stored = json.loads(TS._marker_path(cfg, "bot-squad", DEV).read_text())["text"]
+    assert stored == reason.strip()   # only surrounding whitespace is dropped
+    assert len(stored) > 1000 and "…" not in stored[-4:]
+
+
+def test_declared_block_to_a_non_operator_also_marks(tmp_path, fake_roles):
+    """Intent, not the recipient's role, is the trigger — so a dev genuinely
+    stopped on its TL is marked too. `_route_idle_escalation` then delivers the
+    escalation to that TL over the bus rather than paging the stakeholder
+    (T-0034), so this widening cannot reach him."""
+    cfg = _make_cfg(tmp_path)
+    TS.on_peer_send(cfg, "bot-squad", DEV, [DEV], blocked=True, text="stuck")
     assert TS._marker_path(cfg, "bot-squad", DEV).exists()
 
 
-def test_peer_send_to_non_operator_does_not_mark(tmp_path, fake_roles):
+def test_peer_send_without_declaration_marks_nothing_whoever_the_recipient(
+        tmp_path, fake_roles):
     cfg = _make_cfg(tmp_path)
-    TS.on_peer_send(cfg, "bot-squad", DEV, [DEV])  # dev→dev
+    TS.on_peer_send(cfg, "bot-squad", DEV, [DEV, OP], text="fyi")
     assert not TS._marker_path(cfg, "bot-squad", DEV).exists()
 
 
-def test_operator_reply_clears_marker(tmp_path, fake_roles):
+def test_reply_from_the_party_owing_it_clears_marker(tmp_path, fake_roles):
     cfg = _make_cfg(tmp_path)
-    TS.mark_blocked(cfg, "bot-squad", DEV, "need prod call")
-    TS.on_peer_send(cfg, "bot-squad", OP, [DEV])  # operator replies to dev
+    TS.on_peer_send(cfg, "bot-squad", DEV, [OP], blocked=True, text="need prod call")
+    TS.on_peer_send(cfg, "bot-squad", OP, [DEV], text="do it")
     assert not TS._marker_path(cfg, "bot-squad", DEV).exists()
+
+
+# T-0977 DoD 4 — the clear path carried the same defect in mirror image. It
+# fired on "the sender's role is operator", a proxy for "the human answered"
+# that ANY unrelated operator broadcast satisfied: a question nobody had read
+# was silenced by a message that never looked at it. The block records WHO owes
+# the reply, and only that party clears it.
+
+def test_unrelated_operator_broadcast_does_not_clear_a_block_on_someone_else(
+        tmp_path, fake_roles):
+    cfg = _make_cfg(tmp_path)
+    TS.on_peer_send(cfg, "bot-squad", DEV, [TL], blocked=True, text="need your review")
+    TS.on_peer_send(cfg, "bot-squad", OP, [DEV], text="broadcast: suite lock lifted")
+    assert TS._marker_path(cfg, "bot-squad", DEV).exists()
+    # ...and the party actually owing the reply still clears it.
+    TS.on_peer_send(cfg, "bot-squad", TL, [DEV], text="reviewed, go")
+    assert not TS._marker_path(cfg, "bot-squad", DEV).exists()
+
+
+def test_stall_sweep_marker_is_not_peer_clearable(tmp_path, fake_roles):
+    """A `stall_sweep` marker means "stuck on a TUI modal nobody could
+    auto-answer". No peer message unsticks that, so none may clear it — only
+    the pane actually resuming does."""
+    cfg = _make_cfg(tmp_path)
+    TS.mark_blocked(cfg, "bot-squad", DEV, "stuck on the credits gate",
+                    origin="stall_sweep")
+    marker = TS._marker_path(cfg, "bot-squad", DEV)
+    assert json.loads(marker.read_text())["blocked_on"] == []
+    TS.on_peer_send(cfg, "bot-squad", OP, [DEV], text="hi")
+    assert marker.exists()
+    since = json.loads(marker.read_text())["since"]
+    assert TS.clear_if_resumed(cfg, "bot-squad", DEV, since + 31) is True
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +277,10 @@ def test_peer_send_user_conversation_role_does_not_mark(tmp_path, monkeypatch):
         ],
     )
     cfg = _make_cfg(tmp_path)
-    TS.on_peer_send(cfg, "bot-squad", USERCONV, [OP])
+    # T-0977: pass the declaration explicitly. Without it this test would pass
+    # vacuously — nothing marks any more — and would stop covering the
+    # exemption it exists for.
+    TS.on_peer_send(cfg, "bot-squad", USERCONV, [OP], blocked=True, text="q")
     assert not TS._marker_path(cfg, "bot-squad", USERCONV).exists()
 
 
@@ -201,7 +297,9 @@ def test_peer_send_hand_launched_user_session_window_does_not_mark(tmp_path, mon
         ],
     )
     cfg = _make_cfg(tmp_path)
-    TS.on_peer_send(cfg, "bot-squad", USERSESSION, [OP])
+    # T-0977: declared explicitly, so the exemption is still what is doing the
+    # work here rather than the new default-off trigger.
+    TS.on_peer_send(cfg, "bot-squad", USERSESSION, [OP], blocked=True, text="q")
     assert not TS._marker_path(cfg, "bot-squad", USERSESSION).exists()
 
 
@@ -308,6 +406,53 @@ def test_escalation_routes_to_team_queries_topic(tmp_path, faketg, monkeypatch):
     TS.tick(cfg)
     assert len(faketg.sent) == 1
     assert faketg.sent[0]["topic_id"] == 3131
+
+
+# T-0977 DoD 5 — what happens to markers that are already on disk when this
+# ships. They were written by the role-proxy trigger, so most of them mean "this
+# lane filed a report", their 15-minute fuses are already burning, and nothing
+# on disk can re-classify them after the fact. The worker's own tick drops
+# them: no operator has to remember a sweep, and nothing evaporates when the
+# operator compacts, is recycled, is reaped or crashes.
+
+def _write_legacy_marker(cfg, sid, age_sec):
+    """The EXACT pre-T-0977 on-disk shape — three of these were read live at
+    2026-09-06 15:58Z, all belonging to lanes that had sent reports."""
+    p = TS._marker_path(cfg, "bot-squad", sid)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({
+        "sid": sid, "slug": "bot-squad", "since": time.time() - age_sec,
+        "text": "is blocked waiting on your reply", "escalated": False,
+    }, indent=2))
+    return p
+
+
+def test_tick_drops_pre_t0977_marker_instead_of_escalating(tmp_path, faketg, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    marker = _write_legacy_marker(cfg, DEV, 16 * 60)
+    _stub_pane(monkeypatch, visible=False)
+
+    audit = TS.tick(cfg)
+    assert audit["escalated"] == 0
+    assert audit["legacy_dropped"] == 1
+    assert faketg.sent == []
+    assert not marker.exists()
+
+
+def test_tick_still_escalates_a_declared_marker_of_the_same_age(tmp_path, faketg, monkeypatch):
+    """POSITIVE CONTROL for the test above. Same age, same tick, same stubs —
+    the only difference is the `origin` key. Without this, that zero could just
+    mean the tick no longer escalates anything."""
+    cfg = _make_cfg(tmp_path)
+    TS.mark_blocked(cfg, "bot-squad", DEV, "need prod call",
+                    origin="declared", blocked_on=[OP])
+    _age_marker(cfg, DEV, 16 * 60)
+    _stub_pane(monkeypatch, visible=False)
+
+    audit = TS.tick(cfg)
+    assert audit["escalated"] == 1
+    assert audit["legacy_dropped"] == 0
+    assert len(faketg.sent) == 1
 
 
 def test_tick_pane_gone_drops_marker(tmp_path, faketg, monkeypatch):

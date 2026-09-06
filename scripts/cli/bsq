@@ -9,6 +9,7 @@ Verbs:
   bsq inbox check [--since TS]      drain this session's peer inbox
   bsq inbox wait  [--timeout N]     opt-in long-poll (the bg-watcher mode)
   bsq peer send <to> <text>         peer_send + nudge the recipient pane
+  bsq peer send --blocked <to> <t>  ...and declare yourself stopped until replied to
   bsq tg ping <message>             explicitly DM the stakeholder (T-0155)
   bsq task new <title> --provenance <src>  allocate next T-NNNN + stub (atomic — T-0174; --provenance REQUIRED)
   bsq task digest                   short backlog digest for the TG chat (T-0589)
@@ -1124,10 +1125,19 @@ def cmd_peer_send(args) -> None:
     # sender's own user. Ignored for a literal-SID target (always explicit).
     if getattr(args, "user", None):
         params["user"] = args.user
+    # T-0977: --blocked is THE stall-watchdog trigger. Until that ticket the
+    # watchdog guessed from the recipient's role, so every report filed to the
+    # operator armed a page about a lane that was not blocked on anything.
+    if getattr(args, "blocked", False):
+        params["blocked"] = True
     res = post("peer_send", params)
     delivered = res.get("delivered_to", [])
     _print_recycle_redirect(res)
     print(f"sent to {len(delivered)} inbox(es): {', '.join(delivered) or '(none)'}")
+    if getattr(args, "blocked", False) and delivered:
+        print("marked BLOCKED: you are recorded as stopped until one of the above "
+              "replies. Escalates upstream if nobody does; clears when they reply "
+              "or when your pane resumes work.")
 
     if args.no_signal or not delivered:
         return
@@ -7624,6 +7634,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "to this linux user instead of your own")
     ps.add_argument("--no-signal", action="store_true",
                     help="skip the 'check mail' tmux nudge")
+    ps.add_argument("--blocked", action="store_true",
+                    help="(T-0977) you are STOPPED until this is answered — arms "
+                         "the stall-watchdog, which escalates upstream if nobody "
+                         "replies. Omit it for a report/FYI/handoff: those mark "
+                         "nothing, whoever the recipient is")
     ps.set_defaults(func=cmd_peer_send)
 
     # dispatch (structured operator → TL envelope, T-0144)

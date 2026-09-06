@@ -102,8 +102,10 @@ def test_paused_takes_priority_over_suspended():
 
 # ---------------------------------------------------------------------------
 # T-0375 (Option A, supersedes T-0046): needs-input is driven by the PRECISE
-# awaiting_input signal (sid in tg_stall.blocked_sids — the agent actually
-# peer_send'd the operator), NOT the coarse active_at_prompt heuristic. An
+# awaiting_input signal (sid in tg_stall.blocked_sids — T-0977: the agent
+# DECLARED itself blocked on a reply; it used to fire on any peer_send to an
+# operator, i.e. on every report filed), NOT the coarse active_at_prompt
+# heuristic. An
 # idle-at-prompt autonomous dev parked at ❯ never decays, so it is idle/done
 # (reapable), not needs-input. See docs/architecture/D-0018.
 # ---------------------------------------------------------------------------
@@ -118,8 +120,8 @@ def test_active_at_prompt_not_blocked_is_idle():
 
 
 def test_awaiting_input_yields_needs_input():
-    """A session the worker flagged awaiting_input=True (peer_send'd the
-    operator, blocked on a reply) → needs-input."""
+    """A session the worker flagged awaiting_input=True (T-0977: declared
+    itself blocked on a reply) → needs-input."""
     rows = [_row("active", started_at="2026-05-14T09:00:00Z",
                  active_at_prompt=True, awaiting_input=True)]
     out = aggregate_project_status(rows)

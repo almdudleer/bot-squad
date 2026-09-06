@@ -75,8 +75,10 @@ export function StatusBadge({ row }: { row: SessionRow }) {
 }
 
 // T-0285: explicit "this one is waiting on you" badge, driven by the worker's
-// `awaiting_input` flag (the tg_stall blocked marker — agent peer_send'd an
-// operator and got no reply). Amber, distinct from the activity StatusBadge so
+// `awaiting_input` flag (the tg_stall blocked marker — T-0977: the agent
+// DECLARED itself blocked, `bsq peer send --blocked`, and got no reply; it used
+// to fire on any peer_send to an operator, i.e. on every report filed).
+// Amber, distinct from the activity StatusBadge so
 // a blocked-but-still-"running" pane is glanceable. Renders nothing when not
 // blocked, so callers can drop it inline next to the status with no layout cost.
 export function AwaitingInputBadge({ row }: { row: SessionRow }) {

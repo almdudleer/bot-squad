@@ -124,8 +124,14 @@ _GENERATING_MARK = "esc to interrupt"
 # the placeholder byte for byte.
 _PLACEHOLDER_RE = re.compile(
     r'^(?:Try\s+"[^"]*"|Press up to edit queued messages'
-    r'|Ask anything|Try a command)$'
+    r'|Ask anything|Try a command|<no suggestion>)$'
 )
+
+#: The character Claude Code puts between the ❯ rune and the composer
+#: content. Measured on live pane %513 on 2026-09-04: it is U+00A0 NO-BREAK
+#: SPACE, not an ASCII space.
+_NBSP = "\u00a0"
+_COMPOSER_SEPARATORS = (" ", _NBSP)
 
 
 def composer_text(buf: str) -> str | None:
@@ -145,8 +151,21 @@ def composer_text(buf: str) -> str | None:
             live = stripped[len(PROMPT_RUNE):]
     if live is None:
         return None
-    if live.startswith(" "):
+    # T-0962: strip the ONE chrome separator, in either form. Matching only
+    # the ASCII space meant the NBSP the live renderer actually emits was read
+    # as the first character of his draft, typed back verbatim by the delivery
+    # restore, and re-read one NBSP longer on the next tick. Drafts on disk
+    # grew by exactly one NBSP per delivery (operator p513: 59 -> 87 bytes over
+    # 21 deliveries, monotonic) until the padding pushed his real sentence
+    # across the pane and the payload rode along unsent.
+    if live[:1] in _COMPOSER_SEPARATORS:
         live = live[1:]
+    # Any FURTHER leading NBSP is padding this loop already injected, so drain
+    # it and let a poisoned composer heal in one delivery instead of twenty. A
+    # keyboard does not produce U+00A0 (a pasted one is the only way, and the
+    # cost there is invisible leading padding); his leading ASCII spaces are
+    # his and still survive intact.
+    live = live.lstrip(_NBSP)
     live = live.rstrip()
     if _PLACEHOLDER_RE.match(live.strip()):
         return ""          # the box is EMPTY; that is Claude Code's own hint

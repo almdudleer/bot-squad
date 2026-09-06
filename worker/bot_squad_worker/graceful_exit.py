@@ -405,7 +405,7 @@ def _maybe_arm_exit_handoff(cfg: Any, slug: str, sid: str, meta: dict, md_path,
         return None
 
     if not autocompact.composer_free(autocompact._capture_pane(pane), sid=sid,
-                                     now=now):
+                                     now=now, pane_id=pane):
         return False  # half-typed draft — never inject over it
     try:
         autocompact._inject_context_handoff(sid, str(task_id), relaunch=False)

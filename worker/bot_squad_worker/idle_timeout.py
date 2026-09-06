@@ -929,6 +929,24 @@ def _maybe_recycle_leased(cfg: Any, slug: str, sid: str, row: dict, md_path,
     # used to short-circuit here — pinned (T-0926) and attached (T-0564) — are
     # now INPUTS to that decision rather than blanket no-ops: they downgrade the
     # session to compact-in-place instead of letting its cache expire untouched.
+    # T-0954: SAMPLE the composer every tick, for every active session — not
+    # only when some gate happens to reach `composer_free`. The staleness clock
+    # is "how long has this text been in the way", and a clock that only ticks
+    # when the deepest gate is reached does not tick at all for a session whose
+    # earlier gate short-circuits: measured 2026-09-03, five sessions held a
+    # single observation from 12:17 and were still holding it at 12:38, so the
+    # ten-minute rule could never fire for any of them. One capture per session
+    # per 60s tick is what the rule costs; without it the rule is decoration.
+    composer_obs = None
+    if pane:
+        try:
+            from bot_squad_worker import composer_watch as _cw
+            composer_obs = _cw.observe(cfg, slug, sid,
+                                       autocompact._capture_pane(pane), now)
+        except Exception:  # noqa: BLE001 — an observation never breaks a tick
+            log.debug("idle_timeout: composer sample failed for %s", sid,
+                      exc_info=True)
+
     attached = recycle_gate.is_attached(pane, sid=sid, now=now)
     tasks_alive = False
     if (role or "") in WORKER_ROLES:
@@ -967,7 +985,7 @@ def _maybe_recycle_leased(cfg: Any, slug: str, sid: str, row: dict, md_path,
     # message, and preempting it here would leave the phase armed.
     if not (meta.get("compact_stay_phase") or meta.get("idle_recycle_phase")):
         if _maybe_warn_while_typing(cfg, slug, sid, row, meta, md_path, now,
-                                    pane, user_home):
+                                    pane, user_home, obs=composer_obs):
             return True
 
     stay_phase = meta.get("compact_stay_phase")
@@ -1123,7 +1141,7 @@ def _start_recycle(cfg: Any, slug: str, sid: str, row: dict, meta: dict, md_path
     contract, «то же самое», so its exit is resumable like the attendant's."""
     if not pane or not autocompact.composer_free(
             autocompact._capture_pane(pane), sid=sid, now=now, cfg=cfg,
-            slug=slug):
+            slug=slug, pane_id=pane):
         return False
 
     # T-0470: the stall crossed the window → record the timeout lifecycle event
@@ -1279,7 +1297,7 @@ def _arm_compact_exit(sid: str, meta: dict, md_path, now: float,
     """
     if not pane or not autocompact.composer_free(
             autocompact._capture_pane(pane), sid=sid, now=now, cfg=cfg,
-            slug=slug):
+            slug=slug, pane_id=pane):
         return False
     try:
         autocompact._send_compact(sid)
@@ -1486,7 +1504,7 @@ def cache_warning_due(idle_age: float | None, now_window: int) -> bool:
 
 def _maybe_warn_while_typing(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
                              md_path, now: float, pane: str | None,
-                             user_home: str) -> bool:
+                             user_home: str, *, obs: dict | None = None) -> bool:
     """T-0954: when he is mid-sentence and the deadline is coming, SAY SO.
 
     His alternative to waiting mutely, verbatim:
@@ -1533,8 +1551,13 @@ def _maybe_warn_while_typing(cfg: Any, slug: str, sid: str, row: dict, meta: dic
     if not (cache_warning_due(idle_age, idle_timeout_sec()) or tokens >= warn_at):
         return False
 
-    obs = composer_watch.observe(cfg, slug, sid,
-                                 autocompact._capture_pane(pane), now)
+    # Reuse the tick's OWN sample when it has one: observing twice in a tick
+    # would make the sweep's sample count as the first sighting and this one as
+    # the second, which is exactly the burst the `first_sighting` gate exists to
+    # prevent.
+    if obs is None:
+        obs = composer_watch.observe(cfg, slug, sid,
+                                     autocompact._capture_pane(pane), now)
     if obs["state"] != composer_watch.STATE_TYPING:
         return False
     if obs.get("first_sighting"):
@@ -1613,7 +1636,7 @@ def _maybe_compact_and_stay(cfg: Any, slug: str, sid: str, row: dict, meta: dict
         return False
     if not pane or not autocompact.composer_free(
             autocompact._capture_pane(pane), sid=sid, now=now, cfg=cfg,
-            slug=slug):
+            slug=slug, pane_id=pane):
         return False
 
     tokens = _context_tokens(cfg, slug, sid)
@@ -1721,7 +1744,8 @@ def _finalize_stay_handoff(cfg: Any, slug: str, sid: str, meta: dict, md_path,
     # The draft-preserving transport would keep his text either way — but the
     # rule is that we WAIT, not that we can safely interrupt him.
     ready = autocompact.composer_free(autocompact._capture_pane(pane),
-                                      sid=sid, now=now, cfg=cfg, slug=slug)
+                                      sid=sid, now=now, cfg=cfg, slug=slug,
+                                      pane_id=pane)
 
     if not (wrote_state and ready):
         if not timed_out:
@@ -1860,7 +1884,7 @@ def _maybe_keepalive_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
         return False
     if not pane or not autocompact.composer_free(
             autocompact._capture_pane(pane), sid=sid, now=now, cfg=cfg,
-            slug=slug):
+            slug=slug, pane_id=pane):
         return False
 
     try:
@@ -2152,7 +2176,7 @@ def _maybe_worker_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
         return False
     if not pane or not autocompact.composer_free(
             autocompact._capture_pane(pane), sid=sid, now=now, cfg=cfg,
-            slug=slug):
+            slug=slug, pane_id=pane):
         return False
 
     # T-0948: name the bound ticket's REAL status so the escape the text

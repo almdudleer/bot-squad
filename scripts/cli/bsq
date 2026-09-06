@@ -6161,6 +6161,22 @@ def cmd_ticket_update(args) -> None:
                 f"{tid}: invalid transition {old!r} -> {status!r} — "
                 f"from {old!r} may go to {{{allowed}}}"
             )
+    # T-0950: a REAL transition (old != status — including the first-ever
+    # status write, where `old` stays the "?" sentinel) stamps WHEN this
+    # status was entered. This is the mirror of api/app/markdown_writer.py's
+    # merge_task_update — the CLI writes ticket status directly and never
+    # reaches that function (T-0938's comment above already names this: "this
+    # write happens HERE ... and never reaches a worker action"), so the two
+    # write boundaries need the same stamp independently, or `status_since`
+    # would silently miss every CLI-driven transition (most of them).
+    if old != status:
+        since_ln = f"status_since: {_utc_now()}"
+        for i, ln in enumerate(lines):
+            if re.match(r"^status_since:\s*", ln):
+                lines[i] = since_ln
+                break
+        else:
+            lines.append(since_ln)
     new_fm = "\n".join(lines)
     new_text = text[:m.start(1)] + new_fm + text[m.end(1):]
     _write_atomic(path, new_text)

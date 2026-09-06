@@ -6404,15 +6404,157 @@ def _resolve_image(ref: str):
     was taken to gate."""
     p = subprocess.run(
         ["docker", "image", "inspect", str(ref),
-         "--format", "{{.Id}}\t{{.Created}}"],
+         "--format", "{{.Id}}\t{{.Created}}\t{{json .Config.Env}}"
+                     "\t{{json .RepoTags}}"],
         capture_output=True, text=True)
     if p.returncode != 0 or "\t" not in p.stdout:
         return None
-    image_id, _, created = p.stdout.strip().partition("\t")
+    parts = p.stdout.strip().split("\t")
+    image_id = parts[0]
     if not image_id:
         return None
-    return {"id": image_id, "created": created.strip()}
+    created = parts[1].strip() if len(parts) > 1 else ""
+    # T-1005: the ref the image was BUILT FROM is baked in as BOT_SQUAD_GIT_SHA
+    # (T-0379). It names the retain tag, so read it here rather than shelling
+    # out a second time — and tolerate its absence, which is what a locally
+    # built image looks like.
+    env, repo_tags = [], []
+    for raw, sink in ((parts[2] if len(parts) > 2 else "null", "env"),
+                      (parts[3] if len(parts) > 3 else "null", "tags")):
+        try:
+            val = json.loads(raw)
+        except (ValueError, TypeError):
+            val = None
+        if isinstance(val, list):
+            (env if sink == "env" else repo_tags).extend(str(v) for v in val)
+    git_sha = ""
+    for entry in env:
+        if entry.startswith("BOT_SQUAD_GIT_SHA="):
+            git_sha = entry.split("=", 1)[1].strip()
+            break
+    return {"id": image_id, "created": created, "git_sha": git_sha,
+            "repo_tags": repo_tags}
 
+
+# --- T-1005: retention belongs to the MEASUREMENT, not to the rebuild -------
+#
+# T-1001 stopped the DEPLOY reclaiming the image its own gate was measured in.
+# The deploy is not the only thing that moves `bot-squad-api:latest`:
+# AGENT_INSTRUCTIONS' own api recipe opens with `docker compose build
+# bot-squad-api`, which has exactly the same effect and had nothing retaining
+# anything. So the documented way to PREPARE a certification was also an
+# undocumented way to destroy the previous one.
+#
+# The obvious fix is a wrapper verb around the rebuild — and it is the weaker
+# arm, because it only works for someone who types the right command. A rule
+# that depends on being read is prose, and prose is not a control (T-0994: a
+# lock everybody routed around under load).
+#
+# So the retention is attached HERE, to the measurement, one frame above the
+# run: verify-isolated already has to resolve the image id in order to pin it,
+# and the tag costs one metadata call. THE TOOL THAT CREATES THE OBLIGATION IS
+# THE ONLY WAY TO GET A CERTIFICATION AT ALL, so this arm cannot be routed
+# around. And it makes the remaining hole harmless rather than merely smaller:
+# a rebuild by someone who never read the doc can now only orphan an image THAT
+# NO CERTIFICATION WAS TAKEN IN.
+#
+# The tag format is DUPLICATED between here and the T-1001-IMAGE-RETAIN block in
+# deploy-recipes/bot-squad/staging.sh — one policy, two implementations, which
+# is a drift surface. It is pinned by a test that runs the RECIPE'S OWN BYTES
+# against a stub docker and asserts byte-identity with what this function
+# computes from the same metadata (scripts/cli/test_t1005_retain_parity.py).
+#
+# Reclamation is deliberately NOT here. This function only ever ADDS a tag; the
+# deploy stays the single reclaimer, with one bounded window (`RETAIN_KEEP=3`),
+# because a measurement tool that deletes images is a measurement tool that can
+# destroy the thing it was asked to preserve.
+
+
+def _image_repo(reference: str):
+    """The repository half of an image reference, or None if there isn't one.
+
+    Returns None for a bare id (`sha256:…`), which has no repository and so
+    cannot name a retain tag — the caller falls back to the image's own
+    RepoTags rather than inventing one.
+    """
+    ref = str(reference)
+    if ref.startswith("sha256:") or re.fullmatch(r"[0-9a-f]{12,64}", ref):
+        return None
+    ref = ref.split("@", 1)[0]
+    head, sep, last = ref.rpartition("/")
+    if ":" in last:
+        last = last.rsplit(":", 1)[0]
+    return head + sep + last if last else None
+
+
+def _image_stamp(created: str):
+    """Docker's `.Created` as the recipe's `date -u -d … +%Y%m%dT%H%M%SZ`.
+
+    Docker emits RFC3339 with NANOseconds; `datetime.fromisoformat` accepts at
+    most microseconds, so the fraction is truncated rather than parsed. Failing
+    to parse returns None, and the caller says so — a stamp guessed from the
+    clock would name a build time the image does not have, which is the whole
+    reason both coordinates come from the image.
+    """
+    txt = str(created or "").strip()
+    m = re.match(r"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})(?:\.(\d+))?"
+                 r"(Z|[+-]\d{2}:?\d{2})?$", txt)
+    if not m:
+        return None
+    frac = (m.group(2) or "")[:6]
+    off = (m.group(3) or "Z").replace("Z", "+00:00")
+    if len(off) == 5:                      # +0000 -> +00:00
+        off = off[:3] + ":" + off[3:]
+    iso = m.group(1).replace(" ", "T") + (f".{frac}" if frac else "") + off
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    return dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _image_retain_tag(reference: str, info: dict):
+    """The retain tag for an image, or None when it cannot be named.
+
+    Byte-identical to what the T-1001-IMAGE-RETAIN shell block produces for the
+    same image, and pinned to it by test_t1005_retain_parity.py. Both
+    coordinates come FROM THE IMAGE — its build time and the ref it was built
+    from — never from the clock, so retaining the same image twice is idempotent
+    rather than a second tag for the same bytes.
+    """
+    repo = _image_repo(reference)
+    if repo is None:
+        for tag in (info.get("repo_tags") or []):
+            repo = _image_repo(tag)
+            if repo:
+                break
+    if not repo:
+        return None
+    stamp = _image_stamp(info.get("created")) or "unknown"
+    sha = (info.get("git_sha") or "").strip()
+    if not sha or sha == "unknown":
+        sha = info["id"].split(":")[-1]
+    return f"{repo}:cert-{stamp}-{sha[:12]}"
+
+
+def _retain_image(reference: str, info: dict):
+    """Tag ``info['id']`` so a later rebuild of ``reference`` cannot orphan it.
+
+    Returns ``(tag, error)``. A failure is REPORTED, never raised: refusing to
+    run a suite because a tag could not be written would trade a measurement
+    for a bookkeeping entry. But it is reported ON THE ENVIRONMENT LINE, beside
+    the verdict, because a certification whose image was not retained is
+    precisely as fragile as every certification taken before this existed.
+    """
+    tag = _image_retain_tag(reference, info)
+    if not tag:
+        return (None, "the image reference names no repository, so no retain "
+                      "tag can be derived from it")
+    p = subprocess.run(["docker", "tag", info["id"], tag],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        return (None, (p.stderr or p.stdout or "docker tag failed").strip())
+    return (tag, None)
 
 def _pin_image_in_cmd(cmd: list, explicit: str):
     """Replace the image reference in ``cmd`` with its immutable id, in place.
@@ -6455,9 +6597,69 @@ def _pin_image_in_cmd(cmd: list, explicit: str):
             "is not wrong — it is UNCHECKABLE, which is a narrower thing.",
             code=VERIFY_UNMEASURED_RC)
     cmd[idx] = info["id"]
-    return (f"verify-isolated: ENVIRONMENT {ref} = {info['id']} "
-            f"(created {info['created']})")
+    # T-1005 — retain BEFORE the run, not after. A rebuild landing while the
+    # suite is still going would otherwise orphan the very image this
+    # certification is about, and the run would finish reporting an id nobody
+    # can inspect.
+    tag, err = _retain_image(ref, info)
+    env = (f"verify-isolated: ENVIRONMENT {ref} = {info['id']} "
+           f"(created {info['created']})")
+    if tag:
+        return env + f", RETAINED as {tag}"
+    # Reported, not raised: refusing to run a suite because a tag could not be
+    # written trades a measurement for a bookkeeping entry. But it rides the
+    # ENVIRONMENT line, because a certification whose image was not retained is
+    # exactly as fragile as every certification taken before this existed.
+    return (env + f" — ⚠ NOT RETAINED: {err}. A rebuild of {ref} will leave "
+            "this certification UNCHECKABLE.")
 
+
+def cmd_build_api(args) -> None:
+    """Rebuild the api image, retaining the one it replaces (T-1005).
+
+    THE WEAKER OF THE TWO ARMS, and the ticket says so. It only protects
+    someone who types this instead of `docker compose build bot-squad-api`, and
+    a control that depends on being read is prose. The arm that cannot be routed
+    around is in verify-isolated, which retains the image at MEASUREMENT time —
+    so what this verb adds is coverage of images nobody has certified in yet,
+    which are real but are not what a certification chain hangs on.
+
+    It deliberately does NOT reclaim anything. The deploy stays the single
+    reclaimer with one bounded window.
+    """
+    repo_root = _repo_root()
+    ref = args.image
+    info = _resolve_image(ref)
+    if info is None:
+        print(f"build-api: {ref} does not resolve yet — nothing to retain "
+              f"(first build on this host?)")
+    else:
+        tag, err = _retain_image(ref, info)
+        if tag:
+            print(f"build-api: RETAINED the outgoing image as {tag} "
+                  f"({info['id']})")
+            print(f"build-api: certifications taken in {ref} before this build "
+                  f"stay re-runnable as {tag}")
+        else:
+            print(f"build-api: ⚠ could not retain {info['id']} — {err}\n"
+                  "  Certifications taken in it become UNCHECKABLE after this "
+                  "build. Stop unless you know none were.", file=sys.stderr)
+    if args.no_build:
+        print("build-api: --no-build — retained only, no rebuild")
+        return
+    print("build-api: an image build is an EXCLUSIVE, ANNOUNCED event on this "
+          "host — announce it and take a build slot before you let this run "
+          "(scripts/cli/fleet_slot.py run --kind build).")
+    cmd = ["docker", "compose", "build", args.service]
+    print(f"build-api: running: {' '.join(cmd)}", flush=True)
+    rc = subprocess.run(cmd, cwd=repo_root).returncode
+    after = _resolve_image(ref)
+    if after and info and after["id"] == info["id"]:
+        print(f"build-api: {ref} still resolves to {after['id']} — the build "
+              "was fully cached and moved no tag.")
+    elif after:
+        print(f"build-api: {ref} now resolves to {after['id']}")
+    sys.exit(rc)
 
 def cmd_verify_isolated(args) -> None:
     """Run a command against a `git archive` extract of a ref (T-0752).
@@ -8966,6 +9168,21 @@ def build_parser() -> argparse.ArgumentParser:
     vi.add_argument("--ref", default="HEAD", help="ref to extract (default HEAD)")
     vi.add_argument("--keep", action="store_true",
                     help="leave the extract in place and print its path")
+    # build-api (T-1005) — the weaker arm: retain, then rebuild
+    ba = sub.add_parser(
+        "build-api",
+        help="T-1005: rebuild the api image, retaining the one it replaces "
+             "(the strong arm is verify-isolated, which retains at "
+             "measurement time)")
+    ba.add_argument("--image", default="bot-squad-api:latest",
+                    help="image reference being rebuilt (default "
+                         "bot-squad-api:latest)")
+    ba.add_argument("--service", default="bot-squad-api",
+                    help="compose service to build (default bot-squad-api)")
+    ba.add_argument("--no-build", action="store_true",
+                    help="retain the current image and stop — no rebuild")
+    ba.set_defaults(func=cmd_build_api)
+
     vi.add_argument("--image", default=None,
                     help="T-1001: the docker image reference this run uses, "
                          "when the argv is too exotic to parse. It is "

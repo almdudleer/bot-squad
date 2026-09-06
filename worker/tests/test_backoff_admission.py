@@ -16,7 +16,7 @@ import pytest
 
 from bot_squad_worker import backoff as B
 from bot_squad_worker import sessions as S
-from bot_squad_worker.actions import ActionError
+from bot_squad_worker.actions import ActionError, SpawnBackpressure
 from bot_squad_worker.sessions import _enforce_parallel_cap, _write_session_metadata
 
 
@@ -105,3 +105,107 @@ def test_kill_switch_restores_cap_only(tmp_path, monkeypatch):
     for i in range(5):  # 5 < cap 15, but > depressed 2
         _live(cfg, f"S-u-x-p{i}")
     _enforce_parallel_cap(cfg)  # no raise — kill-switch ignores backoff
+
+
+# --- T-1007: the classification travels as a TYPE, not as message text -------
+#
+# Four call sites used to recover "is this backpressure?" by testing the
+# exception's TEXT. The admission check has THREE refusal wordings (pace
+# ceiling, hard cap, AIMD backoff) and the hard-cap branch requires a configured
+# cap -- so with max_parallel_sessions unset it is unreachable and every real
+# refusal carried the one wording the test did not match. Measured live
+# 2026-09-06: a monitor breach was told "nobody is working on it" while the
+# raiser's own text said the task stays queued and retries.
+#
+# These construct the exception FROM THE RAISER, never from a literal: a
+# hand-typed string would re-freeze the wording this change exists to stop
+# depending on.
+
+
+def test_backoff_refusal_is_typed_backpressure(tmp_path):
+    cfg = _make_cfg(tmp_path, cap=15)
+    B.save_state(cfg, {"effective_limit": 3, "last_pressure_at": 0,
+                       "last_ramp_at": 0, "reason": "pressure"})
+    for i in range(3):
+        _live(cfg, f"S-u-x-p{i}")
+    with pytest.raises(SpawnBackpressure) as ei:
+        _enforce_parallel_cap(cfg)
+    # and it is still an ActionError, so every existing `except ActionError`
+    # keeps catching it -- the change cannot silently un-handle a refusal
+    assert isinstance(ei.value, ActionError)
+
+
+def test_hard_cap_refusal_is_typed_backpressure(tmp_path):
+    cfg = _make_cfg(tmp_path, cap=2)
+    _live(cfg, "S-u-a-p1")
+    _live(cfg, "S-u-b-p2")
+    with pytest.raises(SpawnBackpressure) as ei:
+        _enforce_parallel_cap(cfg)
+    assert isinstance(ei.value, ActionError)
+
+
+def test_a_plain_ActionError_saying_capacity_reached_is_NOT_backpressure():
+    """The arm that fails on the pre-T-1007 implementation.
+
+    ``bind_task`` refuses with its own unrelated capacity message. The old
+    substring test classified it as spawn backpressure; the type does not.
+    Unreachable from the spawn callers today (``spawn`` makes no ``bind_task``
+    call), so this pins a latent false positive rather than a live one -- and it
+    is the arm that distinguishes a type check from a text check at all.
+    """
+    e = ActionError("bind_task: capacity reached (cap=1) — task stays pending")
+    assert not isinstance(e, SpawnBackpressure)
+
+# --- T-1007: the READERS, not just the raiser (gap named by p664) ------------
+#
+# The three tests above pin what the RAISER produces. They do not pin what the
+# four readers DO with it, and p664 named the consequence: revert the readers to
+# substring matching and every string-asserting test in the fleet stays green,
+# because the wording is unchanged and the wording is all they check.
+#
+# THE LOAD-BEARING CASE IS THE NEGATIVE ONE: a refusal whose message does NOT
+# contain the old substring must STILL be classified as backpressure. That is
+# the case that is broken today -- with max_parallel_sessions unset the matching
+# branch is unreachable, so every real refusal on this box takes this path.
+
+
+def _routine_reader_classification(monkeypatch, exc):
+    """Drive routines.py's reader with `exc` and return its (sid, failure)."""
+    from bot_squad_worker import routines as R
+    from bot_squad_worker import sessions as _S
+
+    def _boom(*a, **kw):
+        raise exc
+    monkeypatch.setattr(_S, "spawn", _boom)
+    ev = R.FireEvent(kind="fire", value=1, threshold=0, judge="numeric_gt",
+                     breach_first_seen=None)
+    rt = types.SimpleNamespace(id="R-9999", title="t", instruction="i",
+                               monitor={}, file_path=Path("/dev/null"))
+    monkeypatch.setattr(R, "_handler_brief", lambda *a, **kw: "brief")
+    return R._spawn_routine_handler(object(), "p1", rt, ev)
+
+
+def test_reader_defers_on_a_refusal_WITHOUT_the_old_substring(monkeypatch):
+    """The arm that is broken before T-1007 and green after it."""
+    from bot_squad_worker import routines as R
+    from bot_squad_worker.actions import SpawnBackpressure
+    exc = SpawnBackpressure(
+        "spawn: backoff — 12/8 effective concurrency (rate-limit/usage-limit "
+        "pressure; hard cap=unlimited); spawn refused, task stays QUEUED, "
+        "retry on ramp-up")
+    assert "capacity reached" not in str(exc)      # the whole point
+    sid, failure = _routine_reader_classification(monkeypatch, exc)
+    assert sid is None
+    assert failure == R.SPAWN_DEFER_CAPACITY       # deferred, NOT degraded
+
+
+def test_reader_still_degrades_on_a_genuine_fault(monkeypatch):
+    """The silence arm: a real failure must NOT be laundered into a defer."""
+    from bot_squad_worker import routines as R
+    from bot_squad_worker.actions import ActionError
+    sid, failure = _routine_reader_classification(
+        monkeypatch, ActionError("spawn: tmux new-window failed: no server"))
+    assert sid is None
+    assert failure != R.SPAWN_DEFER_CAPACITY
+    assert "tmux new-window failed" in failure
+

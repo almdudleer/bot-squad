@@ -988,7 +988,7 @@ def _spawn_for_routine(cfg: Any, slug: str, routine: Routine,
     caller puts in front of the stakeholder.
     """
     from bot_squad_worker import sessions as S
-    from bot_squad_worker.actions import ActionError
+    from bot_squad_worker.actions import ActionError, SpawnBackpressure
 
     try:
         res = S.spawn(cfg, slug, "dev",
@@ -1011,7 +1011,7 @@ def _spawn_for_routine(cfg: Any, slug: str, routine: Routine,
     except ActionError as e:
         # Parallel-session cap / quota backpressure is normal — defer quietly;
         # next_run_at is NOT advanced (below), so a later tick retries.
-        if "capacity reached" in str(e):
+        if isinstance(e, SpawnBackpressure):   # T-1007: a type, not a substring
             log.debug("routine %s spawn deferred for %s (%s)", routine.id, slug, e)
             return None, SPAWN_DEFER_CAPACITY
         log.exception("routine %s spawn failed for %s", routine.id, slug)
@@ -1410,7 +1410,7 @@ def _spawn_routine_handler(cfg: Any, slug: str, routine: Routine,
     ``(sid, failure)`` contract as :func:`_spawn_for_routine` so the caller's
     T-0895 capacity-defer / degraded-notify handling applies unchanged."""
     from bot_squad_worker import sessions as S
-    from bot_squad_worker.actions import ActionError
+    from bot_squad_worker.actions import ActionError, SpawnBackpressure
 
     try:
         res = S.spawn(cfg, slug, ROUTINE_HANDLER_OWNER,
@@ -1425,7 +1425,7 @@ def _spawn_routine_handler(cfg: Any, slug: str, routine: Routine,
             return None, "spawn returned no sid"
         return sid, None
     except ActionError as e:
-        if "capacity reached" in str(e):
+        if isinstance(e, SpawnBackpressure):   # T-1007: a type, not a substring
             log.debug("routine-handler spawn deferred for %s (%s)", slug, e)
             return None, SPAWN_DEFER_CAPACITY
         log.exception("routine-handler spawn failed for %s", slug)

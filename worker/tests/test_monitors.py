@@ -27,7 +27,7 @@ import pytest
 from bot_squad_worker import input_mux
 from bot_squad_worker import routines as R
 from bot_squad_worker import sessions as S
-from bot_squad_worker.actions import ActionError
+from bot_squad_worker.actions import ActionError, SpawnBackpressure
 from tests.test_jobs import _make_config_with_project, _make_project_with_repo
 
 UTC = timezone.utc
@@ -721,7 +721,18 @@ def test_sweep_capacity_deferral_retries_without_stamping_cooldown(
                                 cooldown_s=1800, interval_s=5)
 
     def _full(c, s, window, **kw):
-        raise ActionError("session capacity reached (3/3)")
+        # T-1007: backpressure is now carried by TYPE, not by message text.
+        # This stimulus used to be ActionError("session capacity reached (3/3)")
+        # -- a hand-typed string that NO raiser in sessions.py ever emits (the
+        # real wordings are "spawn: capacity reached — …" and "spawn: backoff
+        # — …"). It passed only because the reader substring-matched any message
+        # containing that phrase, which is the defect this ticket removes. The
+        # BEHAVIOUR pinned below is unchanged: capacity backpressure must defer
+        # without firing and without stamping cooldown.
+        raise SpawnBackpressure(
+            "spawn: backoff — 3/3 effective concurrency (rate-limit/usage-limit "
+            "pressure; hard cap=unlimited); spawn refused, task stays QUEUED, "
+            "retry on ramp-up")
 
     monkeypatch.setattr(S, "spawn", _full)
     res = R.monitor_sweep(cfg, slug, now=T0)

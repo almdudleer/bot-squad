@@ -40,6 +40,28 @@ class ActionError(Exception):
     """Raised when an action call is invalid (unknown name, bad params)."""
 
 
+class SpawnBackpressure(ActionError):
+    """T-1007: admission refused for CAPACITY/PRESSURE — a deferral, not a fault.
+
+    The classification MUST travel as a type, never as a substring of the
+    message. It used to be recovered by a substring test against the exception
+    text at four call sites -- deliberately not quoted here, because a comment
+    describing a pattern is itself matched by any grep hunting that pattern
+    (T-0989, found the same day, in a comment written to prevent this).
+
+    THREE admission refusals exist and they do not share one wording: a pace
+    ceiling, a hard parallel-session cap, and the AIMD backoff. The hard-cap
+    branch requires a configured cap, so with ``max_parallel_sessions`` unset it
+    is UNREACHABLE and every real refusal took the wording the substring did not
+    match -- measured live 2026-09-06: two backoff refusals in the journal, none
+    of the matched form, and a monitor breach degraded to "nobody is working on
+    it" while the raiser's own text said the task stays queued and retries.
+
+    A subclass is safe by construction: every existing ``except ActionError``
+    still catches it, and no call site anywhere tests the exact type.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Worker mode — set by __main__.py at startup from BOT_SQUAD_MODE env.
 # "coordinator": runs scheduler + all actions (single-host).

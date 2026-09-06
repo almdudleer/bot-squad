@@ -467,7 +467,7 @@ def _respawn_operator(cfg: Any, slug: str) -> Optional[str]:
     """
     from bot_squad_worker import sessions as S
     from bot_squad_worker import dispatch as _dispatch
-    from bot_squad_worker.actions import ActionError
+    from bot_squad_worker.actions import ActionError, SpawnBackpressure
 
     # T-0783a: the respawn brief carries the CONCRETE pickup queue, not just the
     # "clear the backlog" directive. This is the seam the whole ticket turns on —
@@ -512,7 +512,7 @@ def _respawn_operator(cfg: Any, slug: str) -> Optional[str]:
         # has, in effect, stalled out of its time budget. Defer quietly (don't
         # ERROR-spam every 60s) so re-drive backs off instead of respawning into
         # a wall. This is what makes it "NOT a never-recycled process".
-        if "capacity reached" in str(e):
+        if isinstance(e, SpawnBackpressure):   # T-1007: a type, not a substring
             log.debug("operator_redrive: respawn deferred for %s (%s)", slug, e)
         else:
             log.exception("operator_redrive: respawn failed for %s", slug)
@@ -549,7 +549,7 @@ def bud_operator(cfg: Any, slug: str, *, requested_by: str = "") -> dict:
     reason verbatim.
     """
     from bot_squad_worker import dispatch as _dispatch
-    from bot_squad_worker.actions import ActionError
+    from bot_squad_worker.actions import ActionError, SpawnBackpressure
 
     if cfg.projects.get(slug) is None:
         raise ActionError(f"bud_operator: unknown project slug {slug!r}")

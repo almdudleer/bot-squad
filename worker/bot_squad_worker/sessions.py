@@ -4244,7 +4244,7 @@ def _enforce_parallel_cap(cfg: Any, slug: str | None = None) -> None:
     binds or does not, so this is the layer it had to move to.
     """
     from bot_squad_worker import backoff as _backoff
-    from bot_squad_worker.actions import ActionError
+    from bot_squad_worker.actions import ActionError, SpawnBackpressure
 
     if slug:
         try:
@@ -4255,7 +4255,7 @@ def _enforce_parallel_cap(cfg: Any, slug: str | None = None) -> None:
         if pace_cap > 0:
             lanes = count_live_dev_sessions(cfg, slug)
             if lanes >= pace_cap:
-                raise ActionError(
+                raise SpawnBackpressure(
                     f"spawn: capacity reached — {lanes}/{pace_cap} live dev "
                     f"sessions on {slug} (pace.max_in_progress, the parallelism "
                     f"target); spawn refused, task stays pending"
@@ -4267,11 +4267,11 @@ def _enforce_parallel_cap(cfg: Any, slug: str | None = None) -> None:
     if live < effective:
         return
     if cap > 0 and effective >= cap:
-        raise ActionError(
+        raise SpawnBackpressure(
             f"spawn: capacity reached — {live}/{cap} parallel sessions live "
             f"(max_parallel_sessions cap); spawn refused, task stays pending"
         )
-    raise ActionError(
+    raise SpawnBackpressure(
         f"spawn: backoff — {live}/{effective} effective concurrency "
         f"(rate-limit/usage-limit pressure; hard cap={cap or 'unlimited'}); "
         f"spawn refused, task stays QUEUED, retry on ramp-up"

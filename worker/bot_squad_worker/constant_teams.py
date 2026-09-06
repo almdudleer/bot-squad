@@ -294,7 +294,7 @@ def _compose_brief(
 
 def _spawn_member(cfg: Any, slug: str, *, window: str, init_filename: str, brief: str) -> Optional[str]:
     from bot_squad_worker import sessions as S
-    from bot_squad_worker.actions import ActionError
+    from bot_squad_worker.actions import ActionError, SpawnBackpressure
     try:
         res = S.spawn(cfg, slug, window, initial_prompt=brief,
                       initiative=init_filename, owner="constant-team",
@@ -305,7 +305,7 @@ def _spawn_member(cfg: Any, slug: str, *, window: str, init_filename: str, brief
         # the work stays pending and a later tick retries when a slot frees. Don't
         # ERROR-spam the journal every 60s at N/N; defer quietly. Other
         # ActionErrors are genuine faults and keep their loud traceback.
-        if "capacity reached" in str(e):
+        if isinstance(e, SpawnBackpressure):   # T-1007: a type, not a substring
             log.debug("constant_teams: spawn deferred for %s/%s (%s)", slug, init_filename, e)
         else:
             log.exception("constant_teams: spawn failed for %s/%s", slug, init_filename)

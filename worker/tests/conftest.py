@@ -256,18 +256,49 @@ def pytest_exception_interact(node, call, report):
         substrate.record_exception(call.excinfo.value)
 
 
+# --- T-1019: a run must declare its own provenance ---------------------------
+#
+# T-1002's substrate guard above asks "is my environment complete"; it cannot
+# see a run that measured working-tree files that exist in no commit — the
+# defect T-1002 itself paid for twice (see provenance.py's docstring). The
+# hooks below run at terminal-summary time, after every test has already
+# imported whatever it imports, and ask git which of those files differ from
+# HEAD. See tests/provenance.py for the design and its stated limits;
+# tests/test_t1019_provenance_gate.py pins both the fire and the no-fire cases.
+_provenance_spec = importlib.util.spec_from_file_location(
+    "bot_squad_test_provenance", Path(__file__).resolve().parent / "provenance.py"
+)
+provenance = importlib.util.module_from_spec(_provenance_spec)
+_provenance_spec.loader.exec_module(provenance)
+
+_provenance_result = None  # cached here in pytest_terminal_summary; read by pytest_unconfigure
+
+
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
-    if not substrate.any_gap():
-        return
-    terminalreporter.write_sep("=", substrate.BANNER_TITLE, red=True, bold=True)
-    for line in substrate.banner_lines():
-        terminalreporter.write_line(line, red=True)
+    if substrate.any_gap():
+        terminalreporter.write_sep("=", substrate.BANNER_TITLE, red=True, bold=True)
+        for line in substrate.banner_lines():
+            terminalreporter.write_line(line, red=True)
+
+    global _provenance_result
+    _provenance_result = provenance.check()
+    if _provenance_result.cannot_check:
+        terminalreporter.write_sep("=", provenance.CANNOT_CHECK_TITLE, yellow=True, bold=True)
+        for line in provenance.cannot_check_lines():
+            terminalreporter.write_line(line, yellow=True)
+    elif _provenance_result.differing:
+        terminalreporter.write_sep("=", provenance.BANNER_TITLE, red=True, bold=True)
+        for line in provenance.banner_lines(_provenance_result.differing):
+            terminalreporter.write_line(line, red=True)
 
 
 def pytest_unconfigure(config):
-    if not substrate.any_gap():
+    if not substrate.any_gap() and (_provenance_result is None or _provenance_result.clean):
         return
     reporter = config.pluginmanager.get_plugin("terminalreporter")
     if reporter is None:  # -p no:terminal, or an embedding harness
         return
-    reporter.write_line(substrate.trailer_line(), red=True, bold=True)
+    if substrate.any_gap():
+        reporter.write_line(substrate.trailer_line(), red=True, bold=True)
+    if _provenance_result is not None and not _provenance_result.clean:
+        reporter.write_line(provenance.trailer_line(_provenance_result), red=True, bold=True)

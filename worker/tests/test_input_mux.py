@@ -7,6 +7,7 @@ the user's live-typed composer text.
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -39,6 +40,22 @@ _BUF_TYPING = (
 _BUF_BUSY = (
     "● Doing work...\n"
     "  ⎿ running (esc to interrupt)\n"
+)
+# T-0957 DoD2: a payload that landed but whose Enter was swallowed — the
+# composer still shows it, unsubmitted.
+_BUF_PARKED = (
+    "✻ Worked for 40s\n"
+    "────────────────────────────────────────\n"
+    "❯ check mail\n"
+    "────────────────────────────────────────\n"
+    "  ⏵⏵ bypass permissions on\n"
+)
+# A permission/choice dialog sharing the ❯ rune — not this composer at all.
+_BUF_DIALOG = (
+    " Do you want to proceed?\n"
+    " ❯ 1. Yes\n"
+    "   2. No\n"
+    " Esc to cancel\n"
 )
 
 
@@ -267,3 +284,142 @@ def test_direct_lane_and_queued_lane_serialize_on_delivery_lock(tmp_path, monkey
                 "direct-lane keystroke landed inside the queued-lane delivery "
                 "window — the two lanes spliced into one composer line"
             )
+
+
+# ---------------------------------------------------------------------------
+# T-0957 DoD 2: a swallowed Enter must not be counted as delivered
+# ---------------------------------------------------------------------------
+
+def _fast_confirm(monkeypatch):
+    """Shrink the confirm-retry knobs so these tests run in milliseconds."""
+    monkeypatch.setattr(input_mux, "_DELIVER_CONFIRM_TIMEOUT_SEC", 0.02)
+    monkeypatch.setattr(input_mux, "_DELIVER_CONFIRM_POLL_INTERVAL_SEC", 0.005)
+    monkeypatch.setattr(input_mux.time, "sleep", lambda s: None)
+
+
+def test_deliver_to_pane_raises_when_enter_is_swallowed(monkeypatch):
+    """The queued lane's payload paste+Enter can have its Enter swallowed
+    (T-0201's failure mode). Before this fix `_deliver_to_pane` returned
+    silently either way, so `flush()` reported the batch delivered while it
+    was still sitting unsubmitted in the composer. It must now raise so
+    `flush()`'s existing except-clause requeues instead."""
+    import bot_squad_worker.sessions as S
+    _fast_confirm(monkeypatch)
+    monkeypatch.setattr(S, "_run", lambda *a, **k: None)
+    monkeypatch.setattr(input_mux, "raw_keys", lambda *a, **k: None)
+    monkeypatch.setattr(input_mux, "_capture_pane", lambda pane_id: _BUF_PARKED)
+
+    with pytest.raises(input_mux.DeliveryNotConfirmed):
+        input_mux._deliver_to_pane("%1", "check mail")
+
+
+def test_deliver_to_pane_confirms_after_a_retry(monkeypatch):
+    """Positive control: a delivery that clears on a LATER Enter (the first
+    one or two swallowed) must not raise — retrying is success, not failure."""
+    import bot_squad_worker.sessions as S
+    _fast_confirm(monkeypatch)
+    monkeypatch.setattr(S, "_run", lambda *a, **k: None)
+    monkeypatch.setattr(input_mux, "raw_keys", lambda *a, **k: None)
+    calls = {"n": 0}
+
+    def capture(pane_id):
+        calls["n"] += 1
+        return _BUF_PARKED if calls["n"] < 3 else _BUF_EMPTY
+
+    monkeypatch.setattr(input_mux, "_capture_pane", capture)
+
+    input_mux._deliver_to_pane("%1", "check mail")   # must not raise
+
+
+def test_flush_requeues_rather_than_reports_delivered_on_swallowed_enter(tmp_path, monkeypatch):
+    """Integration: flush() over the REAL _deliver_to_pane (not a fake
+    `deliver`) must leave the message in the queue — never drained — when
+    the composer never confirms, and must not report `delivered`."""
+    import bot_squad_worker.sessions as S
+    _fast_confirm(monkeypatch)
+    monkeypatch.setattr(S, "_run", lambda *a, **k: None)
+    monkeypatch.setattr(input_mux, "raw_keys", lambda *a, **k: None)
+    monkeypatch.setattr(input_mux, "_capture_pane", lambda pane_id: _BUF_PARKED)
+
+    sid = "S-almdudleer-target-p9"
+    input_mux.enqueue(tmp_path, sid, "check mail", "S-alice")
+
+    with pytest.raises(input_mux.DeliveryNotConfirmed):
+        input_mux.flush(tmp_path, sid, pane_lookup=lambda s: "%1",
+                        capture=lambda p: _BUF_EMPTY)
+
+    # Requeued, not lost — a later tick gets another attempt.
+    msgs = input_mux.read_queue(tmp_path, sid)
+    assert len(msgs) == 1 and msgs[0]["text"] == "check mail"
+
+
+def test_flush_pending_one_stuck_queue_does_not_block_the_rest(tmp_path, monkeypatch):
+    """T-0957 DoD2 + flush_pending's own docstring contract: one sid's
+    unconfirmed delivery must not stop the sweep from reaching the next sid,
+    or the fleet-wide 'one bad queue never kills the sweep' claim is false
+    for exactly the failure this ticket is about."""
+    import bot_squad_worker.sessions as S
+    _fast_confirm(monkeypatch)
+    monkeypatch.setattr(S, "_run", lambda *a, **k: None)
+    monkeypatch.setattr(input_mux, "raw_keys", lambda *a, **k: None)
+    monkeypatch.setattr(input_mux, "_capture_pane",
+                        lambda pane_id: _BUF_PARKED if pane_id == "%stuck" else _BUF_EMPTY)
+    monkeypatch.setattr(input_mux, "_default_pane_lookup",
+                        lambda sid: "%stuck" if sid == "S-stuck" else "%ok")
+
+    input_mux.enqueue(tmp_path, "S-stuck", "check mail", "S-alice")
+    input_mux.enqueue(tmp_path, "S-ok", "check mail", "S-bob")
+
+    res = input_mux.flush_pending(tmp_path)
+
+    assert res["queues"] == 2
+    assert res["delivered"] == 1                       # S-ok got through
+    stuck_msgs = input_mux.read_queue(tmp_path, "S-stuck")
+    assert len(stuck_msgs) == 1 and stuck_msgs[0]["text"] == "check mail"
+    assert stuck_msgs[0]["author"] == "S-alice"          # requeued, not lost
+    assert input_mux.read_queue(tmp_path, "S-ok") == []  # drained
+
+
+# ---------------------------------------------------------------------------
+# T-0957 DoD 2 (direct lane): _type_lines confirms, retries, and stops for a
+# dialog — a nudge landing and stopping there must not be silently assumed
+# ---------------------------------------------------------------------------
+
+def test_type_lines_retries_swallowed_enter_then_confirms(monkeypatch):
+    _fast_confirm(monkeypatch)
+    monkeypatch.setattr(input_mux, "raw_keys", lambda *a, **k: None)
+    calls = {"n": 0}
+
+    def capture(pane_id):
+        calls["n"] += 1
+        return _BUF_PARKED if calls["n"] < 3 else _BUF_EMPTY
+
+    sent = input_mux._type_lines("%1", "check mail", capture=capture)
+    assert sent == 1
+
+
+def test_type_lines_gives_up_and_logs_after_bound(monkeypatch, caplog):
+    """The direct lane has no queue to fall back on — a payload it can never
+    confirm must still be LOGGED, not silently assumed delivered."""
+    _fast_confirm(monkeypatch)
+    monkeypatch.setattr(input_mux, "raw_keys", lambda *a, **k: None)
+
+    with caplog.at_level(logging.ERROR, logger="bot_squad_worker.input_mux"):
+        sent = input_mux._type_lines("%1", "check mail",
+                                     capture=lambda p: _BUF_PARKED)
+    assert sent == 1   # still counted as "sent" — the direct lane's contract
+    assert "never confirmed submitted" in caplog.text
+
+
+def test_type_lines_stops_retrying_into_a_permission_dialog(monkeypatch, caplog):
+    """A permission dialog sharing the ❯ rune is not this session's to
+    answer — the retry must stop and say so, not blast Enter at a prompt
+    belonging to a human."""
+    _fast_confirm(monkeypatch)
+    monkeypatch.setattr(input_mux, "raw_keys", lambda *a, **k: None)
+
+    with caplog.at_level(logging.WARNING, logger="bot_squad_worker.input_mux"):
+        sent = input_mux._type_lines("%1", "check mail",
+                                     capture=lambda p: _BUF_DIALOG)
+    assert sent == 1
+    assert "permission dialog" in caplog.text

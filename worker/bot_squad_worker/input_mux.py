@@ -350,6 +350,23 @@ def raw_keys(pane_id: str, *keys: str) -> None:
     _run(["tmux", "send-keys", "-t", pane_id, *keys])
 
 
+class DeliveryNotConfirmed(RuntimeError):
+    """Raised when a payload was sent but the composer never showed it clear.
+
+    T-0957 DoD 2: "a nudge that reaches the composer and stops there must not
+    count as delivered." :func:`flush` already requeues the batch on ANY
+    exception from its ``deliver`` callable (see its ``except`` clause) — this
+    exception is what makes a swallowed Enter use that same path instead of
+    silently reporting success.
+    """
+
+
+#: T-0957 DoD 2 knobs for :func:`_deliver_to_pane`'s post-send confirmation.
+_DELIVER_CONFIRM_MAX_RETRIES = 3
+_DELIVER_CONFIRM_TIMEOUT_SEC = 2.0
+_DELIVER_CONFIRM_POLL_INTERVAL_SEC = 0.3
+
+
 def _deliver_to_pane(pane_id: str, text: str) -> None:
     """Deliver a (possibly multi-line) payload as ONE composer message.
 
@@ -358,7 +375,20 @@ def _deliver_to_pane(pane_id: str, text: str) -> None:
     Enter to submit. This is deliberately NOT the raw ``inject_input`` path,
     which sends one Enter per line (correct for single-line nudges, wrong for a
     batched payload).
+
+    T-0957 DoD 2: the Enter can land inside the bracketed-paste wrap and never
+    submit (T-0201's failure mode, measured on the direct lane; the queued
+    lane shares the same paste-buffer+Enter shape and has no reason to be
+    immune). Before this, `flush()` counted the batch as delivered the moment
+    this returned without raising — a swallowed Enter left the payload sitting
+    in the composer while the queue was already drained, which is exactly the
+    "reaches the composer and stops there" case the DoD calls out. Now this
+    confirms the composer actually cleared, re-sending Enter up to a bound,
+    and raises :class:`DeliveryNotConfirmed` if it never does — `flush()`'s
+    existing exception handler requeues the batch instead of reporting it
+    delivered.
     """
+    from bot_squad_worker import composer_watch
     from bot_squad_worker.sessions import _run
     buf_name = f"bsq-input-{pane_id.lstrip('%')}"
     # Load the payload into a named tmux buffer over STDIN, then bracketed-
@@ -368,7 +398,29 @@ def _deliver_to_pane(pane_id: str, text: str) -> None:
     _run(["tmux", "load-buffer", "-b", buf_name, "-"], input=text)
     _run(["tmux", "paste-buffer", "-t", pane_id, "-b", buf_name, "-p", "-d"])
     time.sleep(0.4)
-    raw_keys(pane_id, "Enter")
+
+    for attempt in range(_DELIVER_CONFIRM_MAX_RETRIES):
+        raw_keys(pane_id, "Enter")
+        deadline = time.monotonic() + _DELIVER_CONFIRM_TIMEOUT_SEC
+        while time.monotonic() < deadline:
+            time.sleep(_DELIVER_CONFIRM_POLL_INTERVAL_SEC)
+            if not (composer_watch.composer_text(_capture_pane(pane_id)) or "").strip():
+                if attempt:
+                    log.info("input_mux: %s's composer cleared after %d retry "
+                             "Enter(s) — the first was swallowed", pane_id,
+                             attempt)
+                return
+        log.warning("input_mux: %s's composer still shows the payload %d.%ds "
+                    "after Enter (attempt %d/%d) — resending", pane_id,
+                    int(_DELIVER_CONFIRM_TIMEOUT_SEC),
+                    int(_DELIVER_CONFIRM_TIMEOUT_SEC * 10) % 10, attempt + 1,
+                    _DELIVER_CONFIRM_MAX_RETRIES)
+    log.error("input_mux: %s's composer never cleared after %d Enter "
+             "attempts — requeuing rather than reporting delivered", pane_id,
+             _DELIVER_CONFIRM_MAX_RETRIES)
+    raise DeliveryNotConfirmed(
+        f"composer for {pane_id} never cleared after "
+        f"{_DELIVER_CONFIRM_MAX_RETRIES} Enter attempts")
 
 
 # Direct-lane knobs (read at call time so tests can monkeypatch them):
@@ -429,7 +481,7 @@ def deliver_direct(data_dir: Path | str, sid: str, pane_id: str, text: str, *,
             return _deliver_ahead_of_draft(data_dir, sid, pane_id, text, draft,
                                            capture)
 
-        return _type_lines(pane_id, text)
+        return _type_lines(pane_id, text, capture=capture)
 
 
 def _pane_width(pane_id: str) -> int:
@@ -470,13 +522,59 @@ def _draft_swap_enabled() -> bool:
     return os.environ.get("BOT_SQUAD_DRAFT_SWAP", "1") != "0"
 
 
-def _type_lines(pane_id: str, text: str) -> int:
-    """The verbatim lane's keystrokes: one send-keys per line, one Enter each."""
+def _type_lines(pane_id: str, text: str, *,
+                capture: Callable[[str], str] | None = None) -> int:
+    """The verbatim lane's keystrokes: one send-keys per line, one Enter each.
+
+    T-0957 DoD 2: confirms each line's Enter actually submitted (the composer
+    cleared) before moving to the next, re-sending Enter up to a bound when it
+    did not — the direct lane has no queue to fall back on, so a payload that
+    "reaches the composer and stops there" can only be RE-SUBMITTED, never
+    requeued, and that still has to be logged rather than silently assumed
+    (the pre-fix behaviour: one blind Enter, whatever happened next was
+    reported as sent). A permission dialog sharing the composer's rune is its
+    own outcome (DoD 3's pane-state table) — the retry stops rather than
+    blasting Enter into a prompt that is not this session's to answer.
+    """
+    from bot_squad_worker import composer_watch
+    capture = capture or _capture_pane
     lines_sent = 0
     for line in text.split("\n"):
         raw_keys(pane_id, "--", line)
         time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
-        raw_keys(pane_id, "Enter")
+        for attempt in range(_DELIVER_CONFIRM_MAX_RETRIES):
+            raw_keys(pane_id, "Enter")
+            deadline = time.monotonic() + _DELIVER_CONFIRM_TIMEOUT_SEC
+            outcome = None
+            while time.monotonic() < deadline:
+                time.sleep(_DELIVER_CONFIRM_POLL_INTERVAL_SEC)
+                try:
+                    buf = capture(pane_id)
+                except Exception:  # noqa: BLE001 — a capture hiccup, not proof of anything
+                    continue
+                if composer_watch.looks_like_dialog(buf):
+                    outcome = "dialog"
+                    break
+                if not (composer_watch.composer_text(buf) or "").strip():
+                    outcome = "cleared"
+                    break
+            if outcome == "cleared":
+                if attempt:
+                    log.info("input_mux: %s's %r submitted after %d retry "
+                             "Enter(s) — the first was swallowed", pane_id,
+                             line, attempt)
+                break
+            if outcome == "dialog":
+                log.warning("input_mux: %s shows a permission dialog after "
+                            "sending %r — not this session's to answer, "
+                            "stopping retries (line may be unsubmitted)",
+                            pane_id, line)
+                break
+        else:
+            log.error("input_mux: %s's %r never confirmed submitted after %d "
+                      "Enter attempts — it may still be sitting in the "
+                      "composer (direct lane has no queue to requeue into)",
+                      pane_id, line, _DELIVER_CONFIRM_MAX_RETRIES)
         lines_sent += 1
     return lines_sent
 
@@ -559,7 +657,7 @@ def _deliver_ahead_of_draft(data_dir: Path | str, sid: str, pane_id: str,
     raw_keys(pane_id, "C-u")
     time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
 
-    lines_sent = _type_lines(pane_id, text)
+    lines_sent = _type_lines(pane_id, text, capture=capture)
 
     raw_keys(pane_id, "--", draft)
     time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
@@ -632,6 +730,16 @@ def flush_pending(data_dir: Path | str) -> dict[str, Any]:
     Picks up queues left deferred when the user was typing / mid-generation:
     once the composer frees up this re-attempts delivery without needing a new
     write. Idempotent — an empty or still-busy queue is a no-op / re-deferred.
+
+    T-0957 DoD 2: ``flush`` re-raises on a delivery it could not confirm (see
+    :class:`DeliveryNotConfirmed`), after requeuing the batch, so the sid gets
+    another attempt on the next tick rather than losing the payload. One sid's
+    exception must not stop the REST of this tick's sweep — the caller-level
+    ``except`` around the whole scheduler tick (``jobs.input_flush_tick``)
+    already swallows a single uncaught exception, but a loop with no per-sid
+    guard lets the FIRST failing sid abort every sid after it in the same
+    pass, which is exactly what "one bad queue never kills the sweep" (this
+    function's own docstring, T-0469) says must not happen.
     """
     qdir = queue_dir(data_dir)
     delivered = 0
@@ -648,7 +756,14 @@ def flush_pending(data_dir: Path | str) -> dict[str, Any]:
                 continue
         except FileNotFoundError:
             continue
-        res = flush(data_dir, sid)
+        try:
+            res = flush(data_dir, sid)
+        except Exception:
+            log.exception("input_mux: flush_pending — %s's delivery failed "
+                          "and was requeued; continuing with the rest of "
+                          "this sweep", sid)
+            flushed += 1
+            continue
         flushed += 1
         delivered += res.get("delivered", 0)
         if res.get("deferred"):

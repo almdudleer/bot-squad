@@ -4998,9 +4998,15 @@ def _drift_state(repo_root: str, timeout: float = 25.0) -> dict:
         return {"status": "unknown", "reason": f"{type(exc).__name__}: {exc}"[:200]}
 
 
-def _drift_message(st: dict) -> str | None:
+def _drift_message(st: dict, *, just_committed: bool = True) -> str | None:
     """Render `_drift_state` into the advisory, or None when there is nothing
-    to say. Split from the measurement so the wording is testable without git."""
+    to say. Split from the measurement so the wording is testable without git.
+
+    `just_committed` is the difference between the two callers, and it is not
+    cosmetic: the post-commit path can say "the commit you just made", while
+    `bsq clone-drift` is asked by a session that is READING the tree and has
+    committed nothing. Telling that session it just committed is a false
+    statement in the one message whose whole job is to be believed."""
     if st.get("status") == "unknown":
         return (
             "\n*** CLONE DRIFT: UNKNOWN (T-0959) ***\n"
@@ -5015,15 +5021,20 @@ def _drift_message(st: dict) -> str | None:
     lines = ["\n*** CLONE DRIFT (T-0959) ***"]
     if behind > _DRIFT_BEHIND_LIMIT:
         lines.append(
-            f"This clone is {behind} commit(s) BEHIND {st['upstream']}. You just committed "
-            f"onto a base\nthe deploy does not ship, so your tests ran against code the "
-            f"install does not have."
+            f"This clone is {behind} commit(s) BEHIND {st['upstream']}."
+            + (" You just committed onto a base\nthe deploy does not ship, so your tests "
+               "ran against code the install does not have."
+               if just_committed else
+               " A grep, a test run or a file read here\nanswers about code the install "
+               "does not have — including well-formed FALSE NEGATIVES\nfor files that "
+               "exist on origin and are simply absent from this tree.")
         )
     if unshipped:
         lines.append(
-            f"{unshipped} commit(s) here have NO equivalent on origin — including, most "
-            f"likely, the one\nyou just made. A deploy ships origin/{st['branch']}; those "
-            f"commits are not on the install\nand nothing will put them there on its own."
+            f"{unshipped} commit(s) here have NO equivalent on origin"
+            + (" — including, most likely, the one\nyou just made." if just_committed else ".")
+            + f" A deploy ships origin/{st['branch']}; those commits are not on the "
+              f"install\nand nothing will put them there on its own."
         )
     lines.append(
         "Reconcile before you report READY: `git merge origin/" + st["branch"] + "` here, "
@@ -5596,7 +5607,7 @@ def cmd_drift(args) -> None:
         f"({st['unshipped']} of them carry content that is on NO origin commit)\n"
         f"behind  {st['behind']} commit(s) on origin that this tree does not have"
     )
-    msg = _drift_message(st)
+    msg = _drift_message(st, just_committed=False)
     if msg:
         print(msg, file=sys.stderr)
         sys.exit(1)

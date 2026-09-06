@@ -397,7 +397,7 @@ const census = VERDICTS.reduce<Record<string, number>>(
  * unchecked ones.
  */
 const EXPECTED_CENSUS: Record<string, number> = {
-  checked: 115,
+  checked: 117,
   "opt-out": 5,
 };
 

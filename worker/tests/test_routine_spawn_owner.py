@@ -29,7 +29,7 @@ import pytest
 
 from bot_squad_worker import routines as R
 from bot_squad_worker import sessions as S
-from bot_squad_worker.actions import ActionError
+from bot_squad_worker.actions import ActionError, SpawnBackpressure
 from tests.test_jobs import _make_config_with_project, _make_project_with_repo
 from tests.test_monitors import T0, _events, _spec
 
@@ -222,6 +222,17 @@ def _spawn_raises(msg: str):
     return _boom
 
 
+def _spawn_backpressure(msg: str):
+    """T-1007: capacity refusal is a TYPE now, not a message that happens to
+    contain the word "capacity". A test that keeps raising a bare ActionError
+    here is no longer stimulating the capacity branch — it silently becomes a
+    non-capacity failure test, and the deferral behaviour it claims to pin goes
+    unexercised. Every capacity intent in this file must go through here."""
+    def _boom(*a, **kw):
+        raise SpawnBackpressure(msg)
+    return _boom
+
+
 def test_non_capacity_spawn_failure_pages_and_records_notify(notify_cfg,
                                                              monkeypatch):
     """The exact shape of the shipped defect: spawn refuses (here: the owner
@@ -288,7 +299,7 @@ def test_capacity_deferral_is_quiet_then_alerts_once_per_window(notify_cfg,
                                                                 monkeypatch):
     n = notify_cfg
     monkeypatch.setattr(S, "spawn",
-                        _spawn_raises("spawn: capacity reached (3/3 sessions)"))
+                        _spawn_backpressure("spawn: capacity reached (3/3 sessions)"))
     monkeypatch.setattr(R, "SPAWN_DEFER_QUIET_S", 900.0)
 
     # first sighting + everything inside the quiet window: silent retries,
@@ -320,7 +331,7 @@ def test_capacity_deferral_is_quiet_then_alerts_once_per_window(notify_cfg,
 def test_capacity_deferral_bookkeeping_cleared_when_the_spawn_lands(notify_cfg,
                                                                     monkeypatch):
     n = notify_cfg
-    monkeypatch.setattr(S, "spawn", _spawn_raises("spawn: capacity reached"))
+    monkeypatch.setattr(S, "spawn", _spawn_backpressure("spawn: capacity reached"))
     R.monitor_sweep(n.cfg, n.slug, now=T0)
     assert R.load_state(n.cfg, n.slug, n.rid)["spawn_defer_count"] == 1
 
@@ -337,7 +348,7 @@ def test_capacity_deferral_bookkeeping_cleared_on_recovery(notify_cfg,
     """A stale defer-since would make the NEXT breach's first capacity
     deferral alert immediately instead of waiting out its quiet window."""
     n = notify_cfg
-    monkeypatch.setattr(S, "spawn", _spawn_raises("spawn: capacity reached"))
+    monkeypatch.setattr(S, "spawn", _spawn_backpressure("spawn: capacity reached"))
     R.monitor_sweep(n.cfg, n.slug, now=T0)
     n.metric.write_text("1")        # back under threshold
     R.monitor_sweep(n.cfg, n.slug, now=T0 + timedelta(seconds=10))
@@ -387,7 +398,7 @@ def test_schedule_routine_capacity_deferral_stays_quiet(tmp_path, monkeypatch):
         actions, "_send_stakeholder_dm",
         lambda c, *, message, **kw: (dms.append(message),
                                      {"ok": True, "channel": "test"})[1])
-    monkeypatch.setattr(S, "spawn", _spawn_raises("spawn: capacity reached"))
+    monkeypatch.setattr(S, "spawn", _spawn_backpressure("spawn: capacity reached"))
     rid = R.declare(cfg, project.slug, instruction="daily sweep",
                     schedule="0 9 * * *", provenance="T-0895", now=T0)["id"]
     before = R.load(cfg, project.slug, rid).next_run_at

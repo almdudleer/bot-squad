@@ -21,7 +21,7 @@ from bot_squad_worker import operator_redrive as ord_
 from bot_squad_worker import pickup
 from bot_squad_worker import sessions as S
 from bot_squad_worker import dispatch
-from bot_squad_worker.actions import ActionError
+from bot_squad_worker.actions import SpawnBackpressure
 from tests.test_jobs import _make_config_with_project, _make_project_with_repo
 
 # The real detector, captured before any per-test fixture stubs it — used by the
@@ -249,8 +249,12 @@ def test_capacity_backpressure_defers_redrive(cfg_slug, monkeypatch):
     cfg, slug, spawns = cfg_slug
     _write_task(cfg, slug, "T-1", status="open")
 
+    # T-1007: this one stayed GREEN through the type change, because its
+    # assertion sits outside the branch that changed — which makes a stale
+    # stimulus here more dangerous than a red one, not less. Typed so the test
+    # exercises the deferral branch it names.
     def _cap_spawn(c, s, window, **kw):
-        raise ActionError("capacity reached: 15/15 parallel sessions")
+        raise SpawnBackpressure("capacity reached: 15/15 parallel sessions")
 
     monkeypatch.setattr(S, "spawn", _cap_spawn)
     res = ord_.tick(cfg, slug)

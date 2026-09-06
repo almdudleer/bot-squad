@@ -151,10 +151,14 @@ def test_spawn_member_treats_cap_as_quiet_backpressure(cfg_slug, monkeypatch, ca
     """At 15/15 the constant tick fired an ERROR+traceback every 60s. The cap is
     normal backpressure — defer quietly (return None, no ERROR log)."""
     cfg, slug, _ = cfg_slug
-    from bot_squad_worker.actions import ActionError
+    # T-1007: the cap is a TYPE now. Raising a bare ActionError here stopped
+    # stimulating the cap branch and this test went red — the twin of the
+    # test_monitors.py stimulus, missed because the verifying run's file set
+    # did not include this file.
+    from bot_squad_worker.actions import SpawnBackpressure
 
     def _capped(*a, **k):
-        raise ActionError(
+        raise SpawnBackpressure(
             "spawn: capacity reached — 15/15 parallel sessions live "
             "(max_parallel_sessions cap); spawn refused, task stays pending")
 

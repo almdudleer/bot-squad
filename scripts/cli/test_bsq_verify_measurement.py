@@ -225,9 +225,28 @@ def _repo_root() -> str:
                           text=True, check=True).stdout.strip()
 
 
+def _skip_without_git() -> None:
+    """T-0983: these three need the AMBIENT repo, and a `git archive` extract
+    has no `.git` — so certifying this suite the mandated way turned them into
+    three ERRORs (`git rev-parse --show-toplevel` exit 128) on a perfectly good
+    commit. Measured at 760c0fe, before any of today's changes, so this is the
+    pre-existing shape and not a regression.
+
+    An EXPLICIT skip naming the reason, never a silent pass: a reader has to be
+    able to tell 'this control did not run here' from 'this control is green'.
+    """
+    probe = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                           cwd=str(_BSQ_PATH.parent), capture_output=True,
+                           text=True)
+    if probe.returncode != 0:
+        pytest.skip("no ambient git repo (this tree is a `git archive` extract) "
+                    "— the index-vs-disk comparison has no index to read here")
+
+
 @pytest.fixture(scope="module")
 def real_extract(tmp_path_factory):
     """A genuine `git archive HEAD | tar -x`, the way verify-isolated makes one."""
+    _skip_without_git()
     root = _repo_root()
     sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root,
                          capture_output=True, text=True, check=True).stdout.strip()
@@ -316,25 +335,45 @@ _TRIVIAL_TEST = "def test_one(): assert True\ndef test_two(): assert True\n"
 
 @pytest.fixture(scope="module")
 def gate_sandbox(tmp_path_factory):
-    """A plugin dir + a two-test file, both OUTSIDE the extract on purpose.
+    """A plugin dir + a two-test file, both OUTSIDE the extract on purpose,
+    beside a throwaway git repo for `verify-isolated` to extract.
 
     The extract holds only what is committed, so anything the child needs that
     is not in the ref has to arrive the way a real gate does — on PYTHONPATH.
+
+    THE REPO IS ITS OWN, not this checkout's, and that is the point: a
+    `git archive` extract contains no `.git`, so a test that reaches for the
+    AMBIENT repo dies with `git rev-parse --show-toplevel` exit 128 the moment
+    anyone certifies this suite the way the fleet mandates. Three tests below
+    already do that — see `_skip_without_git`. A test that cannot survive its
+    own project's certification method reports a red on every clean run, which
+    is worse than not existing. Nothing here needs a big tree: the plugin
+    arrives on PYTHONPATH and the test file by absolute path, so the extract's
+    CONTENT is irrelevant to what is under test.
     """
     d = tmp_path_factory.mktemp("t0983")
     (d / "stub_gate.py").write_text(_STUB_GATE)
     (d / "test_trivial.py").write_text(_TRIVIAL_TEST)
+    repo = d / "repo"
+    repo.mkdir()
+    (repo / "README").write_text("t0983 throwaway repo\n")
+    for argv in (["git", "init", "-q", "."],
+                 ["git", "config", "user.email", "t0983@example.invalid"],
+                 ["git", "config", "user.name", "t0983"],
+                 ["git", "add", "-A"],
+                 ["git", "commit", "-qm", "base"]):
+        subprocess.run(argv, cwd=str(repo), check=True, capture_output=True)
     return d
 
 
 def _run_verify(gate_sandbox, extra_env=None, cmd=()):
-    """Invoke the REAL `bsq verify-isolated` against HEAD. Returns (rc, output)."""
+    """Invoke the REAL `bsq verify-isolated` against the sandbox repo's HEAD."""
     env = dict(os.environ)
     env["PYTHONPATH"] = str(gate_sandbox)
     env.update(extra_env or {})
     proc = subprocess.run(
         [sys.executable, str(_BSQ_PATH), "verify-isolated", "--"] + list(cmd),
-        cwd=_repo_root(), env=env, capture_output=True, text=True)
+        cwd=str(gate_sandbox / "repo"), env=env, capture_output=True, text=True)
     return proc.returncode, proc.stdout + proc.stderr
 
 

@@ -775,6 +775,47 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
     md_path = sessions._find_session_md(sessions_dir, sid, row.get("claude_uuid"))
     if md_path is None:
         return False
+
+    # T-0949: three concurrent scheduler jobs drive this session's pane. The
+    # lease gives one 60s window to ONE of them — the composer_free capture
+    # every path here gates on is a check-then-act that both this tick and the
+    # telemetry tick pass before either injects. Non-blocking: a machine that
+    # cannot take it defers to its next tick.
+    with sessions.recycle_lease(md_path) as leased:
+        if not leased:
+            if recycle_gate.should_log_skip(f"idle-lease:{sid}", now):
+                log.info("idle_timeout: %s is held by another recycler this "
+                         "tick — deferring (T-0949)", sid)
+            return False
+        return _maybe_recycle_leased(cfg, slug, sid, row, md_path, now, user_home)
+
+
+def _sibling_busy(cfg: Any, slug: str, sid: str, meta: dict,
+                  now: float) -> str | None:
+    """T-0949: the OTHER recycler mid-sequence on this session, or None.
+
+    ``idle_recycle_*`` and ``compact_stay_*`` are both this module's own state
+    (the ceiling shares the latter by design, T-0649), so they never block it;
+    graceful_exit's ``exit_handoff_phase`` and the ceiling's telemetry-side
+    phase do. Consult it only before STARTING a sequence — a finalize must
+    always be free to run, or an armed phase could outlive its owner.
+    """
+    other = recycle_gate.other_recycler(
+        meta,
+        own=(recycle_gate.MACHINE_IDLE_RECYCLE,
+             recycle_gate.MACHINE_COMPACT_STAY),
+        ceiling_phase=autocompact.ceiling_phase(cfg, slug, sid))
+    if other and recycle_gate.should_log_skip(f"idle-busy:{sid}", now):
+        log.info("idle_timeout: %s is mid-sequence under %s — deferring rather "
+                 "than drive the same pane (T-0949)", sid, other)
+    return other
+
+
+def _maybe_recycle_leased(cfg: Any, slug: str, sid: str, row: dict, md_path,
+                          now: float, user_home: str) -> bool:
+    """:func:`maybe_recycle`'s body, under the T-0949 per-session lease. The md
+    is read HERE, inside the lease — a snapshot taken before it is exactly the
+    stale read that lost the other machines' fields."""
     meta = sessions._read_session_metadata(md_path)
     if meta is None:
         return False
@@ -839,6 +880,8 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
             log.info("idle_timeout: %s became attached/pinned mid-recycle — "
                      "terminate half abandoned (compact-in-place only)", sid)
             return True
+        if _sibling_busy(cfg, slug, sid, meta, now):
+            return False
         return _maybe_compact_and_stay(cfg, slug, sid, row, meta, md_path, now,
                                        pane, user_home, role=role)
 
@@ -854,6 +897,12 @@ def maybe_recycle(cfg: Any, slug: str, row: dict, now: float, user_home: str) ->
     if phase in ("finalizing", "compacting"):
         return _finalize_compact(cfg, slug, sid, meta, md_path, now, pane,
                                  role=role, plan=plan)
+
+    # T-0949: everything below STARTS something — a nudge, a compact-and-stay,
+    # a handoff+terminate — and each one injects into the pane. Not while a
+    # sibling recycler's sequence is in flight there.
+    if _sibling_busy(cfg, slug, sid, meta, now):
+        return False
 
     if plan == PLAN_NUDGE:
         # Never dies on the timeout while its drive condition holds: the

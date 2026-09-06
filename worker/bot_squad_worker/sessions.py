@@ -8,6 +8,7 @@ Session ID (SID) format: ``S-<user>-<window>-p<pane_id_no_pct>``
 """
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import logging
@@ -15,6 +16,7 @@ import os
 import re
 import shlex
 import subprocess
+import threading
 import time
 import tomllib
 from datetime import datetime, timedelta, timezone
@@ -23,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from bot_squad_worker import frontmatter as _frontmatter
+from bot_squad_worker import mdlock as _mdlock
 from bot_squad_worker import agent_provider as _agent_provider
 from bot_squad_worker import boot_orientation as _boot
 
@@ -864,38 +867,235 @@ def _find_session_md(sessions_dir: Path, sid: str, claude_uuid: str | None) -> P
     return None
 
 
+# --- T-0949: concurrent session-md mutation safety --------------------------
+#
+# The session md is read-modify-written by FOUR concurrent writers: the
+# ``idle_timeout`` / ``graceful_exit`` / ``telemetry`` (autocompact ceiling)
+# apscheduler jobs — separate jobs on a 30-thread pool, so ``max_instances=1``
+# only guards each against ITSELF — plus ``scripts/hooks/session_start.sh``,
+# which runs in the session's own process. Each read the WHOLE md at tick
+# start and later wrote back a mutated copy of that snapshot, so the last
+# writer resurrected its stale view of every OTHER machine's fields: an
+# ``exit_handoff_phase`` armed by graceful_exit was erased by idle_timeout's
+# nudge stamp, a ``compact_stay_phase`` was erased by the ceiling's write, and
+# the anti-loop guards those fields exist to be were silently defeated. Field
+# separation between the state machines does NOT protect them — whole-file
+# writes do not respect it. (The same class ``mdlock.task_lock`` was written
+# for on the TASK mds, T-0373; this is its session-md half.)
+#
+# Two mechanisms, both here so every writer inherits them without call-site
+# churn:
+#
+# 1. :func:`session_md_lock` — the SAME ``<file>.lock`` flock convention
+#    ``mdlock`` uses, so worker threads, the API and the shell hook mutually
+#    exclude. Held over the whole read→merge→write of every session-md write.
+# 2. :class:`SessionMeta` — a read remembers the snapshot it came from, so a
+#    write applies only the keys THAT READER CHANGED onto a FRESH read of the
+#    md. A concurrent machine's fields are never resurrected or erased, even
+#    when the two reads are minutes apart. A plain dict (a caller REBUILDING
+#    the md from scratch, e.g. :func:`suspend`) still writes whole-file, which
+#    is what those callers mean.
+#
+# The write is always atomic now, via ``mdlock.atomic_write``'s UNIQUE tmp:
+# the old ``atomic=True`` path used ONE shared ``<name>.tmp`` per md, so two
+# writers racing on the same session clobbered each other's tmp.
+
+_MD_LOCK_STATE = threading.local()
+
+
+def _held_locks() -> dict:
+    """Per-thread depth map of session-md locks this thread already holds.
+
+    ``fcntl.flock`` is per open-file-description, so a second acquire from the
+    same thread (a nested write inside a locked section) would DEADLOCK
+    against itself. Re-entrant acquires are counted, not re-taken.
+    """
+    held = getattr(_MD_LOCK_STATE, "held", None)
+    if held is None:
+        held = {}
+        _MD_LOCK_STATE.held = held
+    return held
+
+
+@contextlib.contextmanager
+def session_md_lock(path: Path):
+    """Exclusive cross-process lock for mutating a session md (T-0949).
+
+    Same lockfile convention as :func:`mdlock.task_lock` (``<path>.lock``), so
+    the worker's scheduler threads, any other process, and the SessionStart
+    hook can mutually exclude on one file. Re-entrant within a thread.
+    """
+    key = str(path)
+    held = _held_locks()
+    if held.get(key):
+        held[key] += 1
+        try:
+            yield
+        finally:
+            held[key] -= 1
+        return
+    with _mdlock.task_lock(Path(path)):
+        held[key] = 1
+        try:
+            yield
+        finally:
+            held.pop(key, None)
+
+
+class SessionMeta(dict):
+    """A session md's frontmatter PLUS the on-disk snapshot it was read from.
+
+    Behaves as a plain dict everywhere; :func:`_write_session_metadata` uses
+    ``baseline`` to write back only the keys this reader actually changed (and
+    the ones it removed), merged onto the CURRENT file. ``source`` pins which
+    md the snapshot came from — a write to a DIFFERENT path (the rename paths)
+    is a whole-file write, since a merge would be against an unrelated file.
+    """
+
+    __slots__ = ("baseline", "source")
+
+    def __init__(self, data: dict, source: Path | None = None):
+        super().__init__(data)
+        self.baseline = dict(data)
+        self.source = str(source) if source is not None else None
+
+    def rebase(self, on_disk: dict) -> None:
+        """Adopt ``on_disk`` (what was just written) as the new snapshot."""
+        self.clear()
+        self.update(on_disk)
+        self.baseline = dict(on_disk)
+
+
+def _merge_session_meta(path: Path, meta: dict) -> dict:
+    """Merge ``meta``'s OWN changes onto the md's current on-disk content.
+
+    Whole-file (``dict(meta)``) unless ``meta`` is a :class:`SessionMeta` read
+    from THIS path and the file still exists. Call inside
+    :func:`session_md_lock`.
+    """
+    baseline = getattr(meta, "baseline", None)
+    source = getattr(meta, "source", None)
+    if baseline is None or source is None or source != str(path):
+        return dict(meta)
+    parsed = _frontmatter.parse_or_none(path.read_text()) if path.exists() else None
+    if parsed is None:
+        return dict(meta)
+    merged = dict(parsed[0] or {})
+    for k, v in meta.items():
+        if k not in baseline or baseline[k] != v:
+            merged[k] = v          # a key THIS reader set/changed wins
+    for k in baseline:
+        if k not in meta:
+            merged.pop(k, None)    # ...and one it deliberately removed goes
+    return merged
+
+
 def _write_session_metadata(path: Path, meta: dict, *, atomic: bool = False) -> None:
     """Write a session metadata file with YAML frontmatter.
 
-    ``atomic=True`` writes to a sibling ``*.tmp`` then ``os.rename`` — used by
-    the gc reconcilers (T-0073 / T-0077) so a concurrent reader never sees a
-    half-written md.
+    T-0949: the write holds :func:`session_md_lock` over a re-read + merge of
+    the caller's own changes (see :class:`SessionMeta`), and always lands via
+    a UNIQUE tmp + ``os.replace``. ``atomic`` is retained for call-site
+    compatibility and no longer selects anything — every write is atomic, and
+    the shared ``<name>.tmp`` two racing writers used to clobber is gone.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # T-0075: delegate serialization to the shared frontmatter writer (lists
-    # inline, None as `~`, timestamps unquoted). Map the legacy "~" string
-    # sentinel → None so it still emits as `~` (unquoted) and round-trips to
-    # None, byte-matching the pre-T-0075 hand-rolled output.
-    norm = {k: (None if v == "~" else v) for k, v in meta.items()}
-    body = f"---\n{_frontmatter.dump_frontmatter(norm)}---\n"
-    if atomic:
-        tmp = path.parent / (path.name + ".tmp")
-        tmp.write_text(body)
-        os.rename(tmp, path)
-    else:
-        path.write_text(body)
+    path = Path(path)
+    with session_md_lock(path):
+        payload = _merge_session_meta(path, meta)
+        # T-0075: delegate serialization to the shared frontmatter writer (lists
+        # inline, None as `~`, timestamps unquoted). Map the legacy "~" string
+        # sentinel → None so it still emits as `~` (unquoted) and round-trips to
+        # None, byte-matching the pre-T-0075 hand-rolled output.
+        norm = {k: (None if v == "~" else v) for k, v in payload.items()}
+        body = f"---\n{_frontmatter.dump_frontmatter(norm)}---\n"
+        _mdlock.atomic_write(path, body)
+    if isinstance(meta, SessionMeta) and meta.source == str(path):
+        # The caller keeps working with this dict after the write — hand it
+        # what is now ON DISK, so its next mutation diffs against reality.
+        meta.rebase(payload)
 
 
 def _read_session_metadata(path: Path) -> dict | None:
     """Parse YAML frontmatter from a session metadata file (T-0075: shared
     pyyaml parser, so block- and inline-style lists read identically).
 
-    Returns None if the file doesn't exist or has no frontmatter.
+    Returns None if the file doesn't exist or has no frontmatter. The result is
+    a :class:`SessionMeta` (a dict) that remembers this snapshot, so a later
+    :func:`_write_session_metadata` of it cannot clobber a concurrent writer's
+    fields (T-0949).
     """
     if not path.exists():
         return None
     parsed = _frontmatter.parse_or_none(path.read_text())
-    return parsed[0] if parsed is not None else None
+    if parsed is None:
+        return None
+    return SessionMeta(parsed[0] or {}, source=path)
+
+
+# --- T-0949: the per-session RECYCLE LEASE ----------------------------------
+
+_LEASE_STATE = threading.local()
+
+
+@contextlib.contextmanager
+def recycle_lease(md_path: Path):
+    """Non-blocking per-session lease for the three recycle state machines.
+
+    ``idle_timeout_tick``, ``graceful_exit_tick`` and ``telemetry_tick`` (the
+    autocompact ceiling) are separate 60s apscheduler jobs registered
+    microseconds apart, so they fire in the SAME second on the SAME session,
+    and their only serializer was a racy check-then-act ``composer_free``
+    capture: two threads both passed the phase check before either wrote it,
+    then both injected into one pane (two contradictory prompts, or the
+    doubled ``/compact`` the ``compact_stay_*`` fields exist to prevent).
+
+    A machine takes this lease for the whole of its decide→act→write pass on
+    one session. It NEVER blocks: a machine that cannot take it simply defers
+    to its next tick, which is what every other gate on these paths does.
+
+    Yields True when the lease is held (act), False when another machine has
+    it (defer). Re-entrant within a thread.
+    """
+    path = Path(md_path)
+    lock_path = path.parent / (path.name + ".recycle.lock")
+    key = str(lock_path)
+    held = getattr(_LEASE_STATE, "held", None)
+    if held is None:
+        held = {}
+        _LEASE_STATE.held = held
+    if held.get(key):
+        held[key] += 1
+        try:
+            yield True
+        finally:
+            held[key] -= 1
+        return
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        # Can't even open the lease file — fail OPEN rather than wedge every
+        # recycler on a permissions problem (the pre-T-0949 behaviour).
+        log.warning("recycle_lease: cannot open %s — proceeding unleased",
+                    lock_path)
+        yield True
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        held[key] = 1
+        try:
+            yield True
+        finally:
+            held.pop(key, None)
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
 
 
 def _parent_sid_of(meta: dict | None) -> str:

@@ -181,7 +181,7 @@ fi
 if [ -n "$sid" ] && [ -n "$CLAUDE_SID" ]; then
     mkdir -p "$DATA/sessions"
     SID="$sid" SLUG="$slug" CLAUDE_SID="$CLAUDE_SID" DATA="$DATA" CWD="$PWD" TASK_ID="$task_id" INITIATIVE="${BOT_SQUAD_INITIATIVE:-}" OWNER="${BOT_SQUAD_OWNER:-}" OWNER_USER="${BOT_SQUAD_OWNER_USER:-}" TMUX_SESSION="$tmux_session" HOOK_SOURCE="$HOOK_SOURCE" python3 - <<'PY' 2>/dev/null || true
-import os, re, time
+import fcntl, os, re, tempfile, time
 from pathlib import Path
 
 sid        = os.environ["SID"]
@@ -203,6 +203,17 @@ window     = sid.rsplit("-p", 1)[0].split("-", 2)[-1] if "-p" in sid else ""
 linux_user = sid.split("-", 2)[1] if (sid.startswith("S-") and len(sid.split("-", 2)) >= 2) else ""
 now        = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 md_path    = data / "sessions" / f"{sid}.md"
+
+# T-0949: this hook is the FOURTH concurrent read-modify-writer of the session
+# md (the worker's idle_timeout / graceful_exit / telemetry ticks are the other
+# three), and the fields it manages — the _INFLIGHT_RECYCLE set below — are
+# exactly the ones those ticks arm. Unlocked, a hook fire landing between a
+# tick's read and its write silently dropped whichever side wrote first. Take
+# the SAME `<file>.lock` flock the worker takes (mdlock.LOCK_SUFFIX /
+# sessions.session_md_lock), around the whole read→write below.
+md_path.parent.mkdir(parents=True, exist_ok=True)
+_lock_fd = os.open(str(md_path) + ".lock", os.O_CREAT | os.O_RDWR, 0o644)
+fcntl.flock(_lock_fd, fcntl.LOCK_EX)
 
 # Preserve existing started_at + task_id + initiative + extras + owner
 # (existing wins if non-empty). T-0080: owner is the UI username stamp
@@ -350,7 +361,7 @@ extra_task_ids   = existing.get("extra_task_ids")   or "[]"
 extra_initiatives = existing.get("extra_initiatives") or "[]"
 
 extra_lines = "".join(line + "\n" for line in passthrough)
-md_path.write_text(
+_body = (
     "---\n"
     f"sid: {sid}\n"
     f"status: active\n"
@@ -369,6 +380,19 @@ md_path.write_text(
     + extra_lines +
     "---\n"
 )
+# T-0949: unique tmp + os.replace — the worker's atomic write used ONE shared
+# `<name>.tmp` per md, so a racing writer could clobber the other's tmp.
+_fd, _tmp = tempfile.mkstemp(dir=str(md_path.parent), prefix=md_path.name + ".",
+                             suffix=".tmp")
+try:
+    with os.fdopen(_fd, "w", encoding="utf-8") as _fh:
+        _fh.write(_body)
+    os.replace(_tmp, md_path)
+finally:
+    if os.path.exists(_tmp):
+        os.unlink(_tmp)
+    fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+    os.close(_lock_fd)
 PY
 fi
 

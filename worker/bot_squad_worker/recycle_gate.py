@@ -349,3 +349,68 @@ def recycle_allowed(cfg: Any, *, slug: str, role: str | None,
     if is_attached(tmux_target, now=now):
         return False
     return True
+
+
+# --- T-0949: which recycler is already driving this session ----------------
+#
+# THREE state machines can drive one pane, and none of them could see the
+# others: the ceiling recycler kept its in-flight state in the TELEMETRY record
+# (``rec['compact']``), idle_timeout in the session md
+# (``idle_recycle_phase`` / ``compact_stay_phase``), graceful_exit in
+# ``exit_handoff_phase``. Each injects a PROMPT into the pane when it arms, so
+# two machines arming in the same 60s window put two contradictory asks in
+# front of one session ("this SAME session continues" vs "this incarnation is
+# ending"), and each injection resets the jsonl idle clock the OTHER machine
+# reads.
+#
+# The rule this encodes: a machine may always drive ITS OWN in-flight sequence
+# to completion (``own``), and may never START a new one while another
+# machine's is in flight. Every in-flight state is bounded by its own timeout,
+# so deferring can never wedge — the blocker always clears itself.
+
+MACHINE_IDLE_RECYCLE = "idle_timeout"      # idle_recycle_phase (handoff+exit)
+MACHINE_COMPACT_STAY = "compact_stay"      # compact_stay_phase (compact-in-place)
+MACHINE_EXIT_HANDOFF = "graceful_exit"     # exit_handoff_phase (pre-exit write)
+MACHINE_CEILING = "ceiling"                # autocompact rec['compact'] (telemetry)
+
+# md field -> machine name. The ceiling's marker is NOT here: it lives in the
+# telemetry record, so callers pass it in as ``ceiling_phase``.
+_MACHINE_MD_FIELDS = (
+    ("idle_recycle_phase", MACHINE_IDLE_RECYCLE),
+    ("compact_stay_phase", MACHINE_COMPACT_STAY),
+    ("exit_handoff_phase", MACHINE_EXIT_HANDOFF),
+)
+
+
+def inflight_machines(meta: dict | None = None, *,
+                      ceiling_phase: str = "") -> tuple[str, ...]:
+    """Every recycle state machine currently mid-sequence on this session.
+
+    Pure. ``meta`` is the session md's frontmatter; ``ceiling_phase`` is
+    ``autocompact.ceiling_phase(...)`` (the telemetry record's
+    ``compact.phase``), which the md cannot see.
+    """
+    m = meta or {}
+    out = []
+    for field, machine in _MACHINE_MD_FIELDS:
+        v = m.get(field)
+        if v and v != "~":
+            out.append(machine)
+    if ceiling_phase and ceiling_phase != "~":
+        out.append(MACHINE_CEILING)
+    return tuple(out)
+
+
+def other_recycler(meta: dict | None = None, *, own: tuple[str, ...] = (),
+                   ceiling_phase: str = "") -> str | None:
+    """Name the OTHER machine mid-sequence on this session, or None.
+
+    ``own`` lists the machines the CALLER drives — its own in-flight state
+    never blocks it, or a machine could never finalize what it armed. Call
+    this only in front of a decision to START a new sequence (an injection, a
+    ``/compact``, a terminate); never in front of a finalize.
+    """
+    for machine in inflight_machines(meta, ceiling_phase=ceiling_phase):
+        if machine not in own:
+            return machine
+    return None

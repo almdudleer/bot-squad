@@ -452,13 +452,49 @@ def maybe_exit(cfg: Any, slug: str, row: dict, now: float, user_home: str) -> bo
     # already done and the deliverable already exists. (T-0954 dropped the
     # second signal, an explicit `pinned` marker, with the rest of the pin
     # feature — «это была ошибка».)
+    # T-0949: this session is also driven by idle_timeout_tick and the
+    # telemetry (ceiling) tick — separate 60s jobs that fire in the same
+    # second. The lease gives the window to ONE of them; non-blocking, so a
+    # machine that cannot take it simply defers, like every other gate here.
     md_path = sessions._session_file(cfg.data_dir, slug, sid)
+    with sessions.recycle_lease(md_path) as leased:
+        if not leased:
+            if recycle_gate.should_log_skip(f"exit-lease:{sid}", now):
+                log.info("graceful_exit: %s is held by another recycler this "
+                         "tick — deferring the exit (T-0949)", sid)
+            return False
+        return _maybe_exit_leased(cfg, slug, sid, role, task_id, task_status,
+                                  md_path, pane, now)
+
+
+def _maybe_exit_leased(cfg: Any, slug: str, sid: str, role: str, task_id: Any,
+                       task_status: str, md_path, pane: str,
+                       now: float) -> bool:
+    """:func:`maybe_exit`'s action half, under the T-0949 per-session lease.
+    The md is read HERE, inside the lease — a snapshot taken before it is the
+    stale read whose write-back erased the other machines' in-flight fields."""
     meta = sessions._read_session_metadata(md_path) or {}
     if recycle_gate.is_attached(pane, sid=sid, now=now):
         if recycle_gate.should_log_skip(f"exit-attached:{sid}", now):
             log.info("graceful_exit: %s is done but a human client is attached "
                      "— holding the exit (T-0945)", sid)
         return False
+
+    # T-0949: a sibling recycler mid-sequence owns this pane — it has an
+    # injected prompt outstanding there, and suspending under it would strand
+    # the ask (or, for the ceiling's handoff, relaunch a fresh incarnation of a
+    # session whose work is done). Our OWN in-flight handoff still finalizes
+    # below; every blocker is bounded by its own timeout, so this cannot wedge.
+    if not meta.get("exit_handoff_phase"):
+        other = recycle_gate.other_recycler(
+            meta, own=(recycle_gate.MACHINE_EXIT_HANDOFF,),
+            ceiling_phase=autocompact.ceiling_phase(cfg, slug, sid))
+        if other:
+            if recycle_gate.should_log_skip(f"exit-busy:{sid}", now):
+                log.info("graceful_exit: %s is done but mid-sequence under %s "
+                         "— holding the exit until that clears (T-0949)",
+                         sid, other)
+            return False
 
     # T-0945: «можно будет начать новую из тикета» — so bring the ticket up to
     # date first. Bounded, never wedges, and never spends a /compact.

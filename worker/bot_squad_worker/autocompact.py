@@ -1278,6 +1278,55 @@ def _maybe_compact_stay_ceiling(sid: str, meta: dict, md_path, level: str, now: 
     return True
 
 
+def ceiling_phase(cfg: Any, slug: str, sid: str | None) -> str:
+    """T-0949: this machine's in-flight phase for ``sid`` — ``""`` when idle.
+
+    The ceiling recycler keeps its state in the TELEMETRY record
+    (``rec['compact']``), not on the session md, so :mod:`idle_timeout` and
+    :mod:`graceful_exit` — which read only the md — were structurally unable to
+    see it and armed contradictory sequences on the same pane. This is the read
+    they were missing; see :func:`recycle_gate.other_recycler`.
+    """
+    if not sid:
+        return ""
+    try:
+        from bot_squad_worker import telemetry
+        rec = telemetry._read_json(telemetry._record_path(cfg, slug, sid)) or {}
+        return str((rec.get("compact") or {}).get("phase") or "")
+    except Exception:
+        return ""
+
+
+def bound_task_done(cfg: Any, slug: str, rec: dict, meta: dict) -> bool:
+    """T-0949: True when EVERY task this session is bound to is terminal.
+
+    ``maybe_compact`` read no task status at all, so the ceiling fired on a dev
+    that had just delivered into ``to_accept`` and was sitting inside
+    :mod:`graceful_exit`'s 180s quiet grace: a checkpoint prompt plus a native
+    ``/compact`` spent on a session suspended minutes later, kill-not-resume —
+    and every injection reset the jsonl mtime that grace is measured from, so
+    the ceiling pushed the exit further out each time it fired. That violates
+    graceful_exit's own invariant («no compact, ever… nothing resumes a done
+    session») and the stakeholder's rule that a compact is only worth paying
+    for when a resume is certain.
+
+    Partial delivery is NOT done: a session still holding one live binding is
+    working, so the ceiling still owns it.
+    """
+    from bot_squad_worker import idle_timeout as _it, recovery as _recovery
+    task_ids = _it.bound_task_ids(rec, meta)
+    if not task_ids:
+        return False
+    for tid in task_ids:
+        try:
+            status = _recovery.read_task_status(cfg, slug, tid)
+        except Exception:
+            return False
+        if status not in _recovery.DONE_STATUSES:
+            return False
+    return True
+
+
 def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> bool:
     """Recycle ``rec``'s session if it's over-threshold AND safe.
 
@@ -1299,17 +1348,45 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
     # operator (T-0334) is subject to this gate. The telemetry rec doesn't
     # carry the recycle_exempt md marker, so read the session md best-effort.
     from bot_squad_worker import sessions as _sessions
-    meta: dict = {}
     md_path = None
     if sid:
         try:
             md_path = _sessions._session_file(cfg.data_dir, slug, sid)
-            meta = _sessions._read_session_metadata(md_path) or {}
         except Exception:
-            meta = {}
             md_path = None
     if not recycle_gate.project_allowed(cfg, slug, now):
         return False
+
+    # T-0949: this session is driven by THREE concurrent scheduler jobs. The
+    # lease is what makes one 60s window belong to one of them — without it
+    # idle_timeout's and this tick's ``composer_free`` captures both predate
+    # either injection, and both fire. It never blocks: a machine that cannot
+    # take it defers to its next tick, like every other gate here.
+    if md_path is None:
+        return _maybe_compact_leased(cfg, slug, rec, level, now, sid, md_path)
+    with _sessions.recycle_lease(md_path) as leased:
+        if not leased:
+            if recycle_gate.should_log_skip(f"ceiling-lease:{sid}", now):
+                log.info("autocompact: %s is held by another recycler this "
+                         "tick — deferring (T-0949)", sid)
+            return False
+        return _maybe_compact_leased(cfg, slug, rec, level, now, sid, md_path)
+
+
+def _maybe_compact_leased(cfg: Any, slug: str, rec: dict, level: str,
+                          now: float, sid: str | None, md_path) -> bool:
+    """:func:`maybe_compact`'s body, under the T-0949 per-session lease.
+
+    The md is read HERE, inside the lease — a snapshot taken before it would
+    be exactly the stale read this ticket is about.
+    """
+    from bot_squad_worker import sessions as _sessions
+    meta: dict = {}
+    if md_path is not None:
+        try:
+            meta = _sessions._read_session_metadata(md_path) or {}
+        except Exception:
+            meta = {}
     pane = _pane_for(sid) if sid else None
     # T-0926 made an explicit human pin beat every other signal here, including
     # the compact-and-stay path below: no ceiling action at all.
@@ -1330,6 +1407,46 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
 
     role = rec.get("role") or meta.get("role")
     window = rec.get("window") or meta.get("window")
+    exempt = recycle_gate.user_session_exempt(role=role, window=window, meta=meta)
+    compact = rec.get("compact") or {}
+
+    # T-0949 (gate 1): the work is DONE — graceful_exit owns this session, and
+    # its exit is record-free by design. Spending a checkpoint + /compact on a
+    # session that is about to be suspended kill-not-resume is the exact waste
+    # the "compact only when a resume is certain" rule forbids, and it pushes
+    # the exit grace out on every injection. An ALREADY-armed sequence is
+    # abandoned rather than finalized, for the same reason: the forward-state
+    # it asked for lives on the ticket either way. The human's own sessions and
+    # an attended pane are excluded — nothing exits those, so blocking here
+    # would only deny them a compact-in-place they still need.
+    if not exempt and not attached and bound_task_done(cfg, slug, rec, meta):
+        if compact.get("phase"):
+            rec["compact"] = {}
+            log.info("autocompact: %s's work is done — abandoning the armed "
+                     "ceiling handoff (graceful_exit owns the exit; T-0949)",
+                     sid)
+        elif recycle_gate.should_log_skip(f"ceiling-done:{sid}", now):
+            log.info("autocompact: %s is over the ceiling but its work is done "
+                     "— no compact on a session nothing resumes (T-0949)", sid)
+        return False
+
+    # T-0949 (gate 2): never START a sequence while a SIBLING recycler has one
+    # in flight — two injected prompts in one window contradict each other and
+    # each reset the idle clock the other reads. Our OWN in-flight state (the
+    # phase dict below; ``compact_stay_*`` on the exempt path, which is shared
+    # machinery by design, T-0649) still finalizes normally: every blocker is
+    # bounded by its own timeout, so a defer can never wedge.
+    if not compact.get("phase"):
+        own = (recycle_gate.MACHINE_CEILING,)
+        if exempt:
+            own += (recycle_gate.MACHINE_COMPACT_STAY,)
+        other = recycle_gate.other_recycler(meta, own=own)
+        if other:
+            if recycle_gate.should_log_skip(f"ceiling-busy:{sid}", now):
+                log.info("autocompact: %s is mid-sequence under %s — the "
+                         "ceiling defers rather than drive the same pane "
+                         "(T-0949)", sid, other)
+            return False
 
     # T-0649: the human's own sessions (user-conversation role, hand-launched
     # user-session window, recycle_exempt md marker) never ride the
@@ -1339,7 +1456,7 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
     # triggers can never double-compact the same session. Worker sessions
     # (dev/TL/operator) are not exempt and fall through to the unchanged flow
     # below.
-    if recycle_gate.user_session_exempt(role=role, window=window, meta=meta):
+    if exempt:
         if md_path is None:
             return False
         return _maybe_compact_stay_ceiling(sid, meta, md_path, level, now, pane,
@@ -1350,7 +1467,6 @@ def maybe_compact(cfg: Any, slug: str, rec: dict, level: str, now: float) -> boo
 
     # A handoff already in flight → drive its finalize half (independent of the
     # cooldown; the phase dict is its own guard).
-    compact = rec.get("compact") or {}
     if compact.get("phase") == "writing":
         return _maybe_finalize(cfg, slug, rec, compact, now)
 

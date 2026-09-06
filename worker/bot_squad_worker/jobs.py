@@ -1304,6 +1304,20 @@ def task_lifecycle_tick(cfg: Config) -> None:
         log.exception("task_lifecycle_tick error")
 
 
+def ticket_deadline_tick(cfg: Config) -> None:
+    """T-0950: sweep blocked_on_user/to_accept/totest for tickets past their
+    per-status deadline and page the stakeholder once per breach (see
+    ``status_deadlines.deadline_check_tick``). Per-project errors are
+    contained inside the tick; this wrapper guards the scheduler thread.
+    """
+    from bot_squad_worker import status_deadlines as _status_deadlines
+
+    try:
+        _status_deadlines.deadline_check_tick(cfg)
+    except Exception:
+        log.exception("ticket_deadline_tick error")
+
+
 def outbound_drain_tick(cfg: Config) -> None:
     """T-0755: mirror delivered outbound messages into the conversation store.
 

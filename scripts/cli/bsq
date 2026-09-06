@@ -6614,6 +6614,63 @@ def _pin_image_in_cmd(cmd: list, explicit: str):
             "this certification UNCHECKABLE.")
 
 
+def _materialise_clone(repo_root: str, sha: str, dest: str, ref: str) -> None:
+    """Materialise ``sha`` as a real CHECKOUT rather than a `git archive` (T-1010).
+
+    THE ARM THIS EXISTS FOR (finding: T-0987, which made the price visible;
+    this pays it). `git archive` carries committed PATHS only, so an
+    extract has no `.git` — and the isolation that makes the extract
+    trustworthy is the same property that makes every checkout-needing test
+    unrunnable. That is a fallback sharing the primary's gate: anything only
+    checkable in a real checkout could NEVER be certified by the mandated
+    mechanism. Measured on 2026-09-06 at 760c0fe, scripts/cli: 486 passed /
+    0 skipped in a clone against 483 passed / 3 errors in an extract of the
+    same ref.
+
+    It keeps the isolation. A fresh clone checked out at a sha contains
+    committed state and nothing else — no peer's uncommitted edits, which is
+    the whole reason a worktree run does not certify a commit.
+
+    ``--no-hardlinks`` IS LOAD-BEARING, not caution. `git clone --local`
+    hardlinks the object store into the SOURCE repository by default, so a test
+    that writes to git in the clone can reach the shared clone every live
+    session is working in.
+
+    ``--no-checkout`` then an explicit detached checkout, rather than
+    ``--branch``: the sha we were asked for is not necessarily any branch's tip,
+    and cloning a branch and hoping it still points where it did is the race
+    this tool exists to remove.
+    """
+    src_dir = os.path.join(dest, ".src")
+    clone = subprocess.run(
+        ["git", "clone", "--quiet", "--local", "--no-hardlinks",
+         "--no-checkout", repo_root, src_dir],
+        capture_output=True, text=True)
+    if clone.returncode != 0:
+        die(f"verify-isolated: could not clone {repo_root} for {ref} — "
+            f"{clone.stderr.strip() or 'git clone failed'}")
+    co = subprocess.run(["git", "checkout", "--quiet", "--detach", sha],
+                        cwd=src_dir, capture_output=True, text=True)
+    if co.returncode != 0:
+        die(f"verify-isolated: cloned {repo_root} but could not check out "
+            f"{sha[:12]} — {co.stderr.strip() or 'git checkout failed'}")
+    # Move the checkout up so `dest` IS the tree, matching the extract layout
+    # exactly. Everything downstream — the completeness proof, GATE_EXTRACT_ROOT,
+    # the child's cwd — then needs no branch on which arm produced it.
+    for name in os.listdir(src_dir):
+        shutil.move(os.path.join(src_dir, name), os.path.join(dest, name))
+    leftover = os.listdir(src_dir) if os.path.isdir(src_dir) else []
+    has_git = os.path.isdir(os.path.join(dest, ".git"))
+    if leftover or not has_git:
+        die(f"verify-isolated: --with-git did not produce a usable checkout in "
+            f"{dest} — .git present: {has_git}; not hoisted: "
+            f"{leftover[:3] or 'nothing'}.\n"
+            "A `.git` is the one thing this arm exists to provide, so this "
+            "REFUSES rather than running on as a slower archive arm whose "
+            "checkout-gated tests would quietly skip again.")
+    os.rmdir(src_dir)
+
+
 def cmd_build_api(args) -> None:
     """Rebuild the api image, retaining the one it replaces (T-1005).
 
@@ -6726,12 +6783,15 @@ def cmd_verify_isolated(args) -> None:
     sha = ref.stdout.strip()
     dest = tempfile.mkdtemp(prefix=f"bsq-verify-{sha[:8]}-")
     try:
-        ar = subprocess.Popen(["git", "archive", "--format=tar", sha],
-                              cwd=repo_root, stdout=subprocess.PIPE)
-        tar = subprocess.run(["tar", "-x", "-C", dest], stdin=ar.stdout)
-        ar.stdout.close()
-        if ar.wait() != 0 or tar.returncode != 0:
-            die(f"verify-isolated: could not extract {args.ref} into {dest}")
+        if getattr(args, "with_git", False):
+            _materialise_clone(repo_root, sha, dest, args.ref)
+        else:
+            ar = subprocess.Popen(["git", "archive", "--format=tar", sha],
+                                  cwd=repo_root, stdout=subprocess.PIPE)
+            tar = subprocess.run(["tar", "-x", "-C", dest], stdin=ar.stdout)
+            ar.stdout.close()
+            if ar.wait() != 0 or tar.returncode != 0:
+                die(f"verify-isolated: could not extract {args.ref} into {dest}")
         # SOURCE instrument (T-0819) — see _extract_missing_paths. A partial
         # extract manufactured 22 false regressions elsewhere on this ticket.
         tracked, missing = _extract_missing_paths(repo_root, sha, dest)
@@ -6750,10 +6810,26 @@ def cmd_verify_isolated(args) -> None:
         # banner lands AFTER the output it introduces — and under nohup it can
         # be lost entirely, which already cost one session the ability to
         # confirm its extract had happened at all (T-0819).
-        print(f"verify-isolated: {args.ref} ({sha[:12]}) extracted to {dest}",
+        kind = "cloned" if getattr(args, "with_git", False) else "extracted"
+        print(f"verify-isolated: {args.ref} ({sha[:12]}) {kind} to {dest}",
               flush=True)
-        print(f"verify-isolated: extract verified — all {len(tracked)} tracked "
+        print(f"verify-isolated: tree verified — all {len(tracked)} tracked "
               "path(s) present", flush=True)
+        if getattr(args, "with_git", False):
+            # Say what this arm is and is not, every run. A clone answers the
+            # EXECUTION question the extract structurally cannot; it is weaker
+            # at the SOURCE question the extract is best at, because a clone
+            # carries a `.git` a test could write to.
+            print("verify-isolated: --with-git — this is the CLONE arm "
+                  "(T-1010). It has the extract's isolation (a fresh checkout "
+                  "of committed state, no peer's uncommitted edits) PLUS the "
+                  "VCS metadata, so tests needing a real checkout RUN here "
+                  "instead of skipping.", flush=True)
+            print("verify-isolated: it does NOT replace the frozen extract as "
+                  "the SOURCE-INTEGRITY arm, and it does NOT fix a test whose "
+                  "path derivation is wrong — a wrong root is wrong in a clone "
+                  "too. Origin is the source clone, HEAD is detached, hooks "
+                  "are not installed.", flush=True)
         # T-1001 — pin the ENVIRONMENT as hard as the source is already pinned.
         # Runs before anything expensive: an unanchorable run must cost the
         # host nothing.
@@ -6808,7 +6884,7 @@ def cmd_verify_isolated(args) -> None:
         except FileNotFoundError:
             # Overwhelmingly: a relative interpreter path. The extract holds
             # only what is COMMITTED, and a venv is not — that is the point.
-            die(f"verify-isolated: {cmd[0]!r} does not exist inside the extract.\n"
+            die(f"verify-isolated: {cmd[0]!r} does not exist inside the tree.\n"
                 "The extract contains only what is committed at that ref — your venv\n"
                 "is not in git, so name its interpreter by ABSOLUTE path:\n"
                 f"  bsq verify-isolated -- {Path(repo_root) / 'worker/.venv/bin/python'} "
@@ -6829,7 +6905,7 @@ def cmd_verify_isolated(args) -> None:
         sys.exit(exit_rc)
     finally:
         if args.keep:
-            print(f"verify-isolated: extract kept at {dest}")
+            print(f"verify-isolated: {'clone' if getattr(args, 'with_git', False) else 'extract'} kept at {dest}")
         else:
             shutil.rmtree(dest, ignore_errors=True)
 
@@ -9205,7 +9281,12 @@ def build_parser() -> argparse.ArgumentParser:
              "(a worktree suite run does not certify a commit)")
     vi.add_argument("--ref", default="HEAD", help="ref to extract (default HEAD)")
     vi.add_argument("--keep", action="store_true",
-                    help="leave the extract in place and print its path")
+                    help="leave the tree in place and print its path")
+    vi.add_argument("--with-git", action="store_true",
+                    help="T-1010: materialise the ref as a real CHECKOUT "
+                         "(clone at the sha) instead of a `git archive` "
+                         "extract, so tests needing `.git` RUN instead of "
+                         "skipping. Same isolation, plus the VCS metadata.")
     # build-api (T-1005) — the weaker arm: retain, then rebuild
     ba = sub.add_parser(
         "build-api",

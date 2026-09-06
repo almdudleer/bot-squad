@@ -566,9 +566,13 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
     # cadence: unlike task_lifecycle_tick's per-transition notice, latency here
     # only bounds "how promptly a breach is caught", not correctness — the
     # ticket has already been silently waiting for a day or more by the time
-    # any of these deadlines is even reached. max_instances=1 + coalesce;
-    # idempotent (a stay already alerted never re-fires). Kill switch:
-    # BOT_SQUAD_TICKET_DEADLINES=0.
+    # any of these deadlines is even reached. This is a SWEEP interval, not a
+    # PAGE interval — status_deadlines.page_min_interval_sec() (1h default)
+    # separately caps how often a PAGE actually fires per project, so a large
+    # backlog rotates through as hourly digests rather than a page every tick
+    # (operator review, 2026-09-06 — see status_deadlines.py's "PAGE CADENCE
+    # vs SWEEP CADENCE"). max_instances=1 + coalesce; idempotent (a stay
+    # already alerted never re-fires). Kill switch: BOT_SQUAD_TICKET_DEADLINES=0.
     sched.add_job(
         ticket_deadline_tick,
         "interval",

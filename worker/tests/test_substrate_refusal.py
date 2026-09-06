@@ -225,11 +225,21 @@ def test_missing_substrate_gets_a_banner_and_a_trailer(tmp_path):
     # launder the real bug into the substrate count.
     assert "2 failure(s) in this run are THE ENVIRONMENT" in out, out
     # ...and it must not let the unlisted remainder read as vindicated either.
-    # Measured on the api image: the one failure this module declined to claim
-    # reproduced under NEITHER a complete worker venv NOR apscheduler's absence
-    # alone, so "not attributed" is not "proven real".
+    #
+    # THE MEASURED EPISODE, in the order it actually went, because an earlier
+    # version of this comment froze the middle of it and read as settled:
+    #   api image, whole file  -> 6 failed; this module claimed 5, refused the 6th
+    #   complete worker venv   -> that 6th PASSES
+    #   whole file, post-fix   -> 5 failed; the 6th is GONE
+    # The 6th was a REAL defect (T-1007's stale stimulus, fixed in 5541413) that
+    # only the api image exposed. So "unattributed" is neither "proven real" nor
+    # "proven environmental", and it must cut BOTH ways: an earlier banner said
+    # only "reproduce it on a complete substrate before filing it", which on this
+    # very case would have talked a reader out of a genuine bug.
     assert "LOWER BOUND, NOT A SPLIT" in out, out
-    assert "COMPLETE substrate before filing one as a defect" in out, out
+    assert "neither proven real NOR proven" in out, out
+    assert "still be a REAL defect that only this substrate exposes" in out, out
+    assert "let the mechanism decide" in out, out
 
     # The trailer lands AFTER pytest's own count line, so the caveat travels
     # with whichever line a reader copies into a report.

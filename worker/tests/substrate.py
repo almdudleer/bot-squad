@@ -41,15 +41,31 @@ KNOWN LIMITS, stated so nobody over-reads this.
   reports as a skip and this does not see it (that loss class is T-0987's). It
   also cannot see a path that has no test at all.
 * **The attributed count is a LOWER BOUND on the environment's damage, not a
-  split of the failures into "environment" and "real".** Measured on the api
-  image at 19:35Z: 6 failed, of which this module attributed 5 to apscheduler
-  and correctly refused to claim the 6th
-  (`test_sweep_capacity_deferral_retries_without_stamping_cooldown`) — which
-  then turned out to reproduce under NEITHER the complete worker venv NOR the
-  worker venv with apscheduler hidden. So it is an artefact of that substrate
-  by some other route, and reading it as a product bug is exactly the mistake
-  this module exists to prevent. The banner says so rather than letting the
-  unlisted remainder read as vindicated.
+  split of the failures into "environment" and "real".** It is UNATTRIBUTED
+  that the remainder is, and unattributed cuts both ways.
+
+  The worked example, measured, in the order it went — because the middle of
+  it reads as a settled answer and is not one:
+
+  1. api image, whole `test_monitors.py`: **6 failed**. This module attributed
+     5 to apscheduler and refused to claim the 6th
+     (`test_sweep_capacity_deferral_retries_without_stamping_cooldown`).
+  2. Complete worker venv: **that 6th PASSES.** At this point it looks like an
+     artefact of the image, and that is what I published. It was wrong.
+  3. Whole file again, after `5541413`: **5 failed — the 6th is GONE.** It had
+     been a REAL defect all along (T-1007: capacity refusal became a TYPE while
+     three test files still raised a bare `ActionError`), and only the api
+     image exposed it.
+
+  So a failure this module does not name is neither proven real nor proven
+  environmental. An incomplete substrate invents failures (T-0824 measured 22
+  in this image) AND hides real ones behind a green on the complete substrate.
+  The banner states both errors rather than letting the unlisted remainder read
+  as vindicated — and deliberately ends on an INVESTIGATION rule ("investigate
+  on both substrates, let the mechanism decide") rather than a FILING rule.
+  An earlier version said only "reproduce it on a complete substrate before
+  filing it", which on this very case would have talked a reader out of a
+  genuine bug.
 """
 from __future__ import annotations
 
@@ -216,11 +232,19 @@ def banner_lines() -> list[str]:
     lines += [
         "",
         "⚠ THAT COUNT IS A LOWER BOUND, NOT A SPLIT. A failure NOT listed above",
-        "is UNATTRIBUTED, not proven real: an incomplete substrate is known to",
-        "produce failures that exist nowhere else (T-0824 measured 22 in the api",
-        "image; T-1002 measured a 6th in test_monitors.py that reproduces under",
-        "neither the worker venv nor apscheduler's absence alone). Reproduce any",
-        "of them on a COMPLETE substrate before filing one as a defect.",
+        "is UNATTRIBUTED — which means neither proven real NOR proven",
+        "environmental. It cuts both ways and BOTH ERRORS HAVE BEEN MADE HERE:",
+        "  · an incomplete substrate produces failures that exist nowhere else",
+        "    (T-0824 measured 22 in the api image), so filing one as a product",
+        "    bug wastes a lane;",
+        "  · and a failure that does NOT reproduce on a complete substrate can",
+        "    still be a REAL defect that only this substrate exposes. T-1002's",
+        "    own unattributed 6th was exactly that: it passed on the worker venv",
+        "    and failed here, and it was a genuine stale-stimulus defect, fixed",
+        "    in 5541413 — dismissing it for not reproducing would have been the",
+        "    wrong call.",
+        "So: investigate it, on both substrates, and let the mechanism decide.",
+        "Do not let this run's silence about it stand for either verdict.",
         "",
         "Every code path needing one of those went UNMEASURED. The pass count",
         "below counts only what this substrate could reach — it is not a result",

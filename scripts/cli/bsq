@@ -6614,6 +6614,71 @@ def _pin_image_in_cmd(cmd: list, explicit: str):
             "this certification UNCHECKABLE.")
 
 
+def _ambient_repo_at_or_above(path: str, env: dict) -> str:
+    """The git toplevel a process running in ``path`` would see, or "".
+
+    ⚠ `git rev-parse --show-toplevel` WALKS UP. Measured 2026-09-06 (T-1018): a
+    directory with NO `.git` of its own, nested inside a repo, returns the
+    ANCESTOR toplevel with rc 0; from a directory with no repo above it, rc 128.
+
+    So a faithful frozen extract placed under any repository silently reads THAT
+    repository's VCS state, and every checkout-gated test runs against a tree
+    that is not the one being certified. It is a contaminated AMBIENT rather
+    than a contaminated tree, the completeness proof never looks at parent
+    directories, and the result is INDISTINGUISHABLE in every number from a
+    correct clone run: same collected, same passed, same zero skipped.
+
+    THE ENVIRONMENT IS THE CHILD'S ON PURPOSE, not a sanitised one. git honours
+    GIT_DIR, GIT_WORK_TREE and GIT_CEILING_DIRECTORIES, and the child sees
+    whatever those say; a guard that unset them would pass while the child still
+    read the wrong repo. The guard must model the child's view.
+    """
+    probe = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                           cwd=path, env=env, capture_output=True, text=True)
+    return probe.stdout.strip() if probe.returncode == 0 else ""
+
+
+def _assert_vcs_isolation(dest: str, with_git: bool, env: dict) -> None:
+    """Refuse a run whose tree can see VCS state it was not given (T-1018).
+
+    Isolation is a property of WHERE the tree was materialised, and we had been
+    treating it as a property of the tree. `git` is present by construction
+    here — the archive or clone above has already succeeded — so an empty answer
+    genuinely means "no repo", not "no git".
+    """
+    top = _ambient_repo_at_or_above(dest, env)
+    if with_git:
+        # The check INVERTS: the repo must be the one we just made. A clone that
+        # resolves to an ancestor instead of itself is the same defect wearing
+        # the other arm's clothes.
+        if not top:
+            die("verify-isolated: --with-git produced a tree with NO reachable "
+                f"git repo at {dest} — the one thing this arm exists to "
+                "provide. Refusing to run.")
+        if os.path.realpath(top) != os.path.realpath(dest):
+            die(f"verify-isolated: --with-git tree at {dest} resolves to a "
+                f"DIFFERENT repo: {top}.\n"
+                "Tests needing a checkout would read that repo, not the ref "
+                "you asked to certify. Refusing to run.")
+        print(f"verify-isolated: VCS isolation — the tree IS its own repo "
+              f"({top})", flush=True)
+        return
+    if top:
+        die(f"verify-isolated: ⛔ AMBIENT GIT REPO at {top}\n"
+            f"  The extract at {dest} has no `.git` of its own, but "
+            "`git rev-parse --show-toplevel` WALKS UP and finds that one, so "
+            "every checkout-gated test would run against IT rather than "
+            f"against {dest}.\n"
+            "  That is a contaminated AMBIENT, not a contaminated tree: the "
+            "completeness proof still passes and the run is indistinguishable "
+            "from a correct one in every count — same collected, same passed, "
+            "same zero skipped.\n"
+            "  Materialise somewhere with no repo above it (TMPDIR unset gives "
+            "/tmp), or use --with-git if you WANT a real checkout.")
+    print("verify-isolated: VCS isolation — no git repo at or above the "
+          "extract", flush=True)
+
+
 def _materialise_clone(repo_root: str, sha: str, dest: str, ref: str) -> None:
     """Materialise ``sha`` as a real CHECKOUT rather than a `git archive` (T-1010).
 
@@ -6869,6 +6934,10 @@ def cmd_verify_isolated(args) -> None:
                   f"extract", flush=True)
         print(f"verify-isolated: GATE_EXTRACT_ROOT={dest} (exported — arming "
               "the provenance gate needs no wrapper)", flush=True)
+        # T-1018: the tree is complete and the root is published; now prove it
+        # cannot SEE VCS state it was not given. Probed with the child's own
+        # environment, immediately before the run.
+        _assert_vcs_isolation(dest, getattr(args, "with_git", False), child_env)
         if report_note:
             print(report_note, flush=True)
         print(_verify_admission_ticket(), flush=True)

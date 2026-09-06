@@ -1541,6 +1541,52 @@ def test_list_routines_surfaces_error_state_T0899(mcfg, tmp_path):
     assert row["last_value"] == 6
 
 
+def test_list_routines_carries_the_error_REASON_from_the_first_error_T0999(
+        mcfg, tmp_path):
+    """T-0899 made a blind probe VISIBLE; it never made it EXPLICABLE.
+
+    The error value was computed every tick and kept on none of them: poll()
+    passes it into a FireEvent only at exactly MONITOR_ERROR_BOUND, so for a
+    300s interval the reason arrived fifty minutes after the count did. These
+    pin that `last_error` carries the reason from error ONE, and — the arm
+    that matters — that it DIES WITH THE STREAK rather than outliving it,
+    because a stale reason beside a healthy count is worse than no reason.
+    """
+    cfg, slug, _ = mcfg
+    metric = tmp_path / "metric.txt"
+    metric.write_text("5")
+    rid = _declare_file_monitor(cfg, slug, metric, threshold=10)
+
+    R.monitor_sweep(cfg, slug, now=T0)
+    row = {r["id"]: r for r in R.list_routines(cfg, slug)}[rid]["monitor"]
+    assert row["last_error"] is None      # healthy: no reason to carry
+
+    metric.unlink()
+    R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=5))
+    row = {r["id"]: r for r in R.list_routines(cfg, slug)}[rid]["monitor"]
+    assert row["consecutive_errors"] == 1
+    assert row["broken"] is False          # nine ticks before the old alert
+    assert row["last_error"]               # ...but the reason is here NOW
+    assert "exit=" in str(row["last_error"])
+
+    first_reason = row["last_error"]
+    for i in range(2, R.MONITOR_ERROR_BOUND + 1):
+        R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=5 * i))
+    row = {r["id"]: r for r in R.list_routines(cfg, slug)}[rid]["monitor"]
+    assert row["broken"] is True
+    assert row["last_error"] == first_reason   # same cause, still named
+    assert row["last_value"] == 5              # T-0899 stale value untouched
+
+    # recovery: the reason must NOT outlive the streak that produced it
+    metric.write_text("6")
+    R.monitor_sweep(cfg, slug,
+                    now=T0 + timedelta(seconds=5 * (R.MONITOR_ERROR_BOUND + 1)))
+    row = {r["id"]: r for r in R.list_routines(cfg, slug)}[rid]["monitor"]
+    assert row["consecutive_errors"] == 0
+    assert row["last_error"] is None
+    assert row["last_value"] == 6
+
+
 def test_list_routines_schedule_rows_unchanged(mcfg):
     """Schedule routines keep the pre-T-0604 summary shape — no monitor key,
     no mute keys."""

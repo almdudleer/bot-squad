@@ -428,6 +428,15 @@ class MonitorTrigger(Trigger):
             # blind probe leaves the breach state exactly as it was.
             errors = int(st.get("consecutive_errors") or 0) + 1
             st["consecutive_errors"] = errors
+            # T-0999: the error value was computed and thrown away on every
+            # tick but one. `monitor_broken` carries it at exactly
+            # errors == MONITOR_ERROR_BOUND and nowhere else, so a blind probe
+            # said only "error x N" for the whole streak — and for a 300s
+            # interval that is fifty minutes before anyone learns WHY. Kept
+            # here so the reason is available from the FIRST error, alongside
+            # the count T-0899 already renders. Cleared on the success path
+            # below, so it never outlives the streak it describes.
+            st["last_error"] = value
             if errors == MONITOR_ERROR_BOUND:
                 return FireEvent(kind="monitor_broken", value=value,
                                  threshold=self.spec.get("threshold"),
@@ -435,6 +444,7 @@ class MonitorTrigger(Trigger):
                                  breach_first_seen=st.get("breach_first_seen"))
             return None
         st["consecutive_errors"] = 0
+        st.pop("last_error", None)   # T-0999: dies with the streak
         st["last_value"] = value
         # T-0899: stamped only here, alongside last_value — last_probe_at
         # advances on every tick including errors, so it can't tell a fresh
@@ -813,6 +823,7 @@ def list_routines(cfg: Any, slug: str) -> list[dict]:
                 "last_value": st.get("last_value"),
                 "last_value_at": st.get("last_value_at"),
                 "last_probe_at": st.get("last_probe_at"),
+                "last_error": st.get("last_error"),
                 "consecutive_errors": consecutive_errors,
                 "broken": consecutive_errors >= MONITOR_ERROR_BOUND,
                 "breach": bool(st.get("breach_first_seen")),

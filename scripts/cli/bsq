@@ -3686,13 +3686,21 @@ def _routine_print_row(r: dict) -> None:
         # stays shown for as long as it's true, unlike the one-time
         # alert message, so it can't go silently blind forever.
         errors = mon.get("consecutive_errors") or 0
+        # T-0999: the REASON, from the first error. The count told you a probe
+        # was blind; it never told you why, and the value that says why was
+        # discarded on every tick except the one-shot monitor_broken at the
+        # bound — fifty minutes on a 300s interval. Truncated because a probe
+        # error carries up to 200 chars of stderr and this is one line in a
+        # list; the full string is in the sidecar and in the alert.
+        why = mon.get("last_error")
+        why = f" — {str(why)[:120]}" if why else ""
         if mon.get("broken"):
             health = (f"  BROKEN ({errors} consecutive probe errors, "
                       f"last ok value stale since "
-                      f"{mon.get('last_value_at') or '—'})")
+                      f"{mon.get('last_value_at') or '—'}{why})")
         elif errors:
             health = (f"  error×{errors} (stale since "
-                      f"{mon.get('last_value_at') or '—'})")
+                      f"{mon.get('last_value_at') or '—'}{why})")
         else:
             health = ""
         print(f"{r['id']}  [{r.get('status')}]  monitor({spec})  "

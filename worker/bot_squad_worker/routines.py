@@ -972,6 +972,18 @@ SPAWN_DEFER_CAPACITY = "capacity"
 SPAWN_DEFER_QUIET_S = float(
     os.environ.get("BOT_SQUAD_ROUTINE_SPAWN_DEFER_QUIET_S") or 900)
 
+#: T-1006: the ``degraded`` sub-kind on an events.ndjson record — a queryable
+#: answer to "was an AI supposed to be attached here?". Both values ride a
+#: ``kind="notify"`` record emitted for a routine whose ``on_breach`` is
+#: ``spawn``, which by kind alone is indistinguishable from a routine that
+#: asked for a code-only alert in the first place.
+#:
+#: The field is written on EVERY record, ``None`` when nothing degraded, so an
+#: ABSENT key means "written before T-1006" and never "not degraded" — the two
+#: readings are not the same fact and an omitted key cannot tell them apart.
+DEGRADED_ATTACH_FAILED = "attach_failed"      # non-capacity: gave up, alerted
+DEGRADED_CAPACITY_UNATTENDED = "capacity_unattended"   # still retrying, unheld
+
 
 def _spawn_for_routine(cfg: Any, slug: str, routine: Routine,
                        event: Optional[FireEvent] = None, *,
@@ -1152,11 +1164,25 @@ def events_path(cfg: Any, slug: str) -> Path:
 
 def append_event(cfg: Any, slug: str, *, ts: str, routine: str, kind: str,
                  value: Any = None, threshold: Any = None,
-                 sid: Optional[str] = None, note: Optional[str] = None) -> None:
-    """Append one fire/recover/monitor_broken line (D-0048 §3.3) — the
-    observability contract the UI layer (T-0587 lineage) reads later."""
+                 sid: Optional[str] = None, note: Optional[str] = None,
+                 degraded: Optional[str] = None) -> None:
+    """Append one fire/notify/recover/monitor_broken line (D-0048 §3.3).
+
+    ``degraded`` is the T-1006 sub-kind: on a ``notify`` record it says the
+    routine actually asked for ``spawn`` and no AI got attached. It rides
+    ALONGSIDE ``kind`` rather than replacing it with a fifth value, so every
+    existing reader keeps the meaning it has today.
+
+    Reader census, 2026-09-06 (T-1006), measured rather than assumed: the only
+    production reader of this file is ``_fire_count_24h`` below, which
+    whitelists ``kind == "fire"`` for one line of the spawn prompt. The UI
+    reader this docstring used to promise does not exist — no route, no
+    component, no CLI verb reads it. Do not restore that claim without a
+    reader to point at.
+    """
     rec = {"ts": ts, "routine": routine, "kind": kind, "value": value,
-           "threshold": threshold, "sid": sid, "note": note}
+           "threshold": threshold, "sid": sid, "note": note,
+           "degraded": degraded}
     path = events_path(cfg, slug)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as fh:
@@ -1574,6 +1600,7 @@ def _spawn_failed_notify(cfg: Any, slug: str, routine: Routine,
         return False
     append_event(cfg, slug, ts=_iso(now), routine=routine.id, kind="notify",
                  value=event.value, threshold=event.threshold,
+                 degraded=DEGRADED_ATTACH_FAILED,
                  note=f"on_breach=spawn: attach failed ({failure}) — "
                       f"degraded to code-only alert")
     log.error("monitor breach could NOT attach AI: %s (%s) — alerted "
@@ -1608,6 +1635,7 @@ def _defer_under_capacity(cfg: Any, slug: str, routine: Routine,
             append_event(cfg, slug, ts=_iso(now), routine=routine.id,
                          kind="notify", value=event.value,
                          threshold=event.threshold,
+                         degraded=DEGRADED_CAPACITY_UNATTENDED,
                          note=f"on_breach=spawn: unattended {int(waited)}s "
                               f"under capacity backpressure")
             # restart the quiet window — one alert per window, not per tick

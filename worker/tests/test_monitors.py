@@ -851,7 +851,12 @@ def test_fire_event_appended_with_schema_fields(mcfg, tmp_path):
     events = _events(cfg, slug)
     assert len(events) == 1
     ev = events[0]
-    assert set(ev) == {"ts", "routine", "kind", "value", "threshold", "sid", "note"}
+    # T-1006 widened this deliberately: `degraded` is written on EVERY record,
+    # None here, so that an absent key means "pre-T-1006 writer" and not "this
+    # one did not degrade". Widen it again only for the same reason.
+    assert set(ev) == {"ts", "routine", "kind", "value", "threshold", "sid",
+                       "note", "degraded"}
+    assert ev["degraded"] is None
     assert ev["routine"] == rid
     assert ev["kind"] == "fire"
     assert ev["value"] == 42

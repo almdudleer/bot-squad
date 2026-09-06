@@ -540,3 +540,110 @@ def test_handler_brief_names_the_standing_role(real_spawn_cfg, tmp_path):
     assert "[ROUTINE BREACH R-NNNN]" in brief
     assert "Stay resident" in brief
     assert rid in brief  # the triggering breach rides along
+
+
+# ---------------------------------------------------------------------------
+# T-1006 — the degraded sub-kind. A `spawn` routine that could not attach an AI
+# writes kind="notify", which is byte-identical in kind to a routine that ASKED
+# for a code-only alert. Live proof this is not theoretical: at the time of
+# writing, watchrobot + bot-squad held 362 notify records of which exactly 3
+# meant "nobody is working on this" — and no query could tell you which 3.
+# ---------------------------------------------------------------------------
+
+def test_attach_failure_carries_its_own_subkind(notify_cfg, monkeypatch):
+    n = notify_cfg
+    monkeypatch.setattr(S, "spawn", _spawn_raises("spawn: invalid owner"))
+
+    R.monitor_sweep(n.cfg, n.slug, now=T0)
+
+    ev = _events(n.cfg, n.slug)[0]
+    assert ev["kind"] == "notify"          # unchanged: no fifth kind value
+    assert ev["degraded"] == R.DEGRADED_ATTACH_FAILED
+
+
+def test_capacity_unattended_alert_carries_a_DIFFERENT_subkind(notify_cfg,
+                                                               monkeypatch):
+    """The two degraded shapes are not one population: an attach that FAILED is
+    over, an attach deferred by capacity is still being retried. Collapsing
+    them would answer "is anyone on it?" with a maybe."""
+    n = notify_cfg
+    monkeypatch.setattr(S, "spawn",
+                        _spawn_backpressure("spawn: capacity reached (3/3 sessions)"))
+    monkeypatch.setattr(R, "SPAWN_DEFER_QUIET_S", 900.0)
+
+    R.monitor_sweep(n.cfg, n.slug, now=T0)
+    assert _events(n.cfg, n.slug) == []        # quiet window: nothing recorded
+    R.monitor_sweep(n.cfg, n.slug, now=T0 + timedelta(seconds=901))
+
+    ev = _events(n.cfg, n.slug)[0]
+    assert ev["kind"] == "notify"
+    assert ev["degraded"] == R.DEGRADED_CAPACITY_UNATTENDED
+    assert ev["degraded"] != R.DEGRADED_ATTACH_FAILED
+
+
+def test_a_routine_that_ASKED_for_notify_is_not_marked_degraded(notify_cfg):
+    """The negative control that makes the field mean anything: on_breach=notify
+    is the intended outcome, not a degradation. If this ever reads truthy the
+    field stops separating the populations it exists to separate."""
+    from tests.test_monitors import _declare_notify_monitor
+
+    n = notify_cfg
+    metric2 = n.metric.parent / "metric_notify.txt"
+    metric2.write_text("42")
+    # scoped to THIS routine on purpose: the fixture's own R-0001 is a spawn
+    # routine that also breaches here, and it is a degraded record. Asserting
+    # over every notify in the file would be asserting about both.
+    rid2 = _declare_notify_monitor(n.cfg, n.slug, metric2, threshold=10,
+                                   persist_s=0)
+
+    R.monitor_sweep(n.cfg, n.slug, now=T0)
+
+    mine = [e for e in _events(n.cfg, n.slug)
+            if e["routine"] == rid2 and e["kind"] == "notify"]
+    assert len(mine) == 1
+    assert mine[0]["degraded"] is None
+
+
+def test_the_census_that_was_impossible_by_kind_alone(notify_cfg, monkeypatch):
+    """The whole ticket in one assertion: three notify records, three different
+    answers to "was an AI supposed to be here?", and a query by kind returns
+    the same value for all three."""
+    from tests.test_monitors import _declare_notify_monitor
+
+    n = notify_cfg
+    metric2 = n.metric.parent / "metric_census.txt"
+    metric2.write_text("42")
+    _declare_notify_monitor(n.cfg, n.slug, metric2, threshold=10, persist_s=0,
+                            cooldown_s=100000)
+    monkeypatch.setattr(R, "SPAWN_DEFER_QUIET_S", 900.0)
+
+    monkeypatch.setattr(S, "spawn", _spawn_backpressure("spawn: capacity reached"))
+    R.monitor_sweep(n.cfg, n.slug, now=T0)                       # quiet
+    R.monitor_sweep(n.cfg, n.slug, now=T0 + timedelta(seconds=901))
+    monkeypatch.setattr(S, "spawn", _spawn_raises("spawn: invalid owner"))
+    # +950, not +902: the monitor's interval gates the probe, so a sweep one
+    # second later is not a tick and the third population never gets written.
+    R.monitor_sweep(n.cfg, n.slug, now=T0 + timedelta(seconds=950))
+
+    evs = [e for e in _events(n.cfg, n.slug) if e["kind"] == "notify"]
+    assert len({e["kind"] for e in evs}) == 1        # kind cannot separate them
+    assert sorted(str(e["degraded"]) for e in evs) == [
+        "None", R.DEGRADED_ATTACH_FAILED, R.DEGRADED_CAPACITY_UNATTENDED]
+
+
+def test_the_only_production_reader_is_untouched(notify_cfg, monkeypatch):
+    """_fire_count_24h whitelists kind == "fire". Riding alongside kind rather
+    than replacing it is what keeps that true — a fifth kind value would have
+    been dropped by it, and dropped is worse than unaggregated."""
+    n = notify_cfg
+    monkeypatch.setattr(S, "spawn", _spawn_raises("spawn: invalid owner"))
+    R.monitor_sweep(n.cfg, n.slug, now=T0)
+    assert R._fire_count_24h(n.cfg, n.slug, n.rid, now=T0) == 0
+
+    # past the fixture's 1800s cooldown — a degraded fire stamps cooldown just
+    # like a real notify, so an earlier sweep would produce no second record
+    # and the 0 -> 1 step would prove nothing about the reader.
+    later = T0 + timedelta(seconds=1801)
+    monkeypatch.setattr(S, "spawn", lambda *a, **kw: {"ok": True, "sid": "S-x-p1"})
+    R.monitor_sweep(n.cfg, n.slug, now=later)
+    assert R._fire_count_24h(n.cfg, n.slug, n.rid, now=later) == 1

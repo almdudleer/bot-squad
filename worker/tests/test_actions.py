@@ -81,6 +81,9 @@ def test_registry_lists_only_allowed_actions():
         "send_input",
         # T-0153: autopilot — prompt-driven, time-boxed autonomous runs.
         "autopilot_start", "autopilot_stop", "autopilot_status",
+        # T-0929: the project drive state + the "is anything automatic running"
+        # read — the ultimate off-switch's surface.
+        "automation_status", "automation_set_state",
         "peer_send", "peer_inbox_read", "peer_inbox_wait",
         # T-0498 (M6/F6.2): synchronous inter-session channel handshake + send.
         "sync_request", "sync_ack", "sync_enter", "sync_send",

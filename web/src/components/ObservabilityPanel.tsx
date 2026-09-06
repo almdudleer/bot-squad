@@ -7,6 +7,7 @@ import {
   type Transparency as TransparencyData,
 } from "../api";
 import { Markdown } from "./Markdown";
+import { AutomationCard } from "./AutomationCard";
 
 /**
  * T-0593 (T-0588a, D-0046) — top-level observability on the project home.
@@ -419,6 +420,20 @@ export function ObservabilityPanel({ slug }: { slug: string }) {
 
   return (
     <div style={{ marginBottom: "1rem" }}>
+      {/* T-0929 — the AUTOMATION card, deliberately OUTSIDE the transparency
+          gate below. It has its own fetch, so it renders (and the STOP button
+          works) while the transparency read is still loading or has failed.
+
+          THIS IS NOT A LAYOUT PREFERENCE. The walkthrough for this ticket found
+          the card mounted inside `ObservabilityView`, which renders only after
+          `api.transparency` resolves — that read fans out to `list_sessions`,
+          so a slow or dead session fan-out left the page showing "Loading
+          system state" and NO off-switch. He asked for "the ultimate switch";
+          a switch that a different subsystem's outage can hide is not one. Keep
+          it here, on its own read. */}
+      <div className="mc-an-cards" style={{ marginBottom: "0.6rem" }}>
+        <AutomationCard slug={slug} />
+      </div>
       {error && (
         <div className="text-muted" style={{ fontSize: "0.85rem" }}>
           System state unavailable: {error}

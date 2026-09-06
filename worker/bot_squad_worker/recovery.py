@@ -262,9 +262,11 @@ def _gather(cfg: Any, now: float | None = None) -> list[dict]:
         # neither respawns NOR archives on it (a paused project is never
         # written to; its stale mds are defused by the stale-age cutoff
         # whenever the project is un-paused).
-        if _redrive.is_paused(cfg, slug):
-            log.info("recovery: skipping paused project %s — operator "
-                     "re-drive paused = no standing need (T-0618)", slug)
+        # T-0929: the SAME predicate, now called through the shared gate so
+        # `automation.MECHANISMS` and its source-scan test can see it. The
+        # behaviour is unchanged — one pause SSOT, one call shape.
+        from bot_squad_worker import automation as _automation
+        if not _automation.gate(cfg, slug, "recovery"):
             continue
         sess_dir = cfg.data_dir / slug / "sessions"
         if not sess_dir.exists():

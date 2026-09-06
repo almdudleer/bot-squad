@@ -941,7 +941,58 @@ export type DriveMode = {
   source_text: string | null;
   configured: boolean;
   invalid: Record<string, unknown>;
+  /**
+   * T-0929 — the NAMED state ("one_task" | "finish_up" | "all_tasks", or
+   * "custom" for axes set by hand). NEVER "off": that is the pause flag, which
+   * rides `quota.paused`. Combine the two with `effectiveDriveState` — a card
+   * that renders this field alone will print a mode beside a stopped system,
+   * which is the exact "unclear and uncontrollable" report.
+   */
+  state?: string;
 };
+
+/**
+ * T-0929 — "is anything automatic running for this project, and in what mode".
+ * Mirrors `worker/bot_squad_worker/automation.py:snapshot`, served by
+ * `api/app/routes_automation.py`.
+ *
+ * Unlike `Transparency` (a file read that survives a dead worker) this needs a
+ * live worker, and that is honest: with no worker, nothing is running.
+ */
+export type AutomationSnapshot = {
+  ok?: boolean;
+  /** EFFECTIVE state — "off" whenever the switch is engaged. */
+  state: string;
+  label: string;
+  running: boolean;
+  paused: boolean;
+  max_in_progress: number;
+  drive: DriveMode;
+  /**
+   * The caps + targets that go WITH the state — he asked for them in the same
+   * sentence. `null` is an explicit unknown (no target set / no quota anchor to
+   * measure spend against), never a zero standing in for one.
+   */
+  quota: {
+    max_in_progress: number;
+    weekly_target_pct: number | null;
+    spend_pct: number | null;
+    verdict: string | null;
+  };
+  autopilots: {
+    key: string;
+    kind: string;
+    ref: string;
+    target_sid: string;
+    expires_at: string;
+  }[];
+  /** Every automatic mechanism, and whether the switch covers it. */
+  mechanisms: { key: string; why: string; gated: boolean; active: boolean }[];
+};
+
+/** The settable states, mirroring `pace.DRIVE_STATES`. */
+export const DRIVE_STATES = ["all_tasks", "finish_up", "one_task", "off"] as const;
+export type DriveState = (typeof DRIVE_STATES)[number];
 
 // T-0620/T-0630: web operator controls — pause/resume the re-drive tick and
 // read/change the fleet default model. Thin wrappers over the operator_pause/
@@ -1069,6 +1120,19 @@ export const api = {
   // `api` (like analytics) — single-install, not proxied through mothership.
   transparency: (slug: string) =>
     call<Transparency>(`/api/projects/${slug}/transparency`),
+  // T-0929: the drive state + the ultimate off-switch. GET needs a live worker
+  // (it reports what is RUNNING, not just what is configured); POST returns the
+  // resulting snapshot so the UI renders what the system now IS rather than
+  // assuming the write landed.
+  automation: (slug: string) =>
+    call<AutomationSnapshot>(`/api/projects/${slug}/automation`),
+  setDriveState: (slug: string, state: DriveState, sourceText?: string) =>
+    call<AutomationSnapshot>(`/api/projects/${slug}/automation/state`, {
+      method: "POST",
+      body: JSON.stringify(
+        sourceText ? { state, source_text: sourceText } : { state },
+      ),
+    }),
   // T-0620/T-0630: pause takes effect immediately on the 60s re-drive tick;
   // `reason` is optional (surfaced back on the paused-state read). Resume is
   // idempotent no-op if not paused.

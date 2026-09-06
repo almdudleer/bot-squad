@@ -4200,6 +4200,90 @@ def _action_operator_resume(params: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "was_paused": was_paused}
 
 
+# ---------------------------------------------------------------------------
+# T-0929: the project's DRIVE STATE + the "is anything automatic running" view.
+#
+# Both go through the worker deliberately. The drive state's on-disk shape is
+# mirrored by the api and the CLI (they cannot import worker code), but the
+# MECHANISM REGISTRY — which subsystems the switch actually stops — must have
+# exactly ONE copy: a second, hand-maintained list of automatic subsystems is
+# the "not covering the whole system" defect with a new face. So the registry
+# stays in `automation.py` and every surface asks for it here.
+# ---------------------------------------------------------------------------
+
+_AUTOMATION_STATUS_REQUIRED = {"slug"}
+_AUTOMATION_STATUS_ALLOWED = _AUTOMATION_STATUS_REQUIRED | set()
+
+
+def _action_automation_status(params: dict[str, Any]) -> dict[str, Any]:
+    """READ: the one "is anything automatic running for this project" view.
+
+    Required params: slug. Returns :func:`automation.snapshot` — the effective
+    drive state, whether the switch is engaged, every mechanism the switch
+    covers (and every one it deliberately does not), and the autopilot runs
+    live right now.
+    """
+    extra = set(params) - _AUTOMATION_STATUS_ALLOWED
+    if extra:
+        raise ActionError(f"automation_status got unexpected params: {sorted(extra)}")
+    missing = _AUTOMATION_STATUS_REQUIRED - set(params)
+    if missing:
+        raise ActionError(f"automation_status missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"automation_status: unknown project slug {slug!r}")
+
+    from bot_squad_worker import automation as _automation
+    return {"ok": True, **_automation.snapshot(cfg, slug)}
+
+
+_AUTOMATION_SET_STATE_REQUIRED = {"slug", "state"}
+_AUTOMATION_SET_STATE_ALLOWED = _AUTOMATION_SET_STATE_REQUIRED | {
+    "requested_by", "source_text"}
+
+
+def _action_automation_set_state(params: dict[str, Any]) -> dict[str, Any]:
+    """WRITE: set the project's named drive state — including ``off``, the
+    ultimate switch.
+
+    Required params: slug, state (one of ``pace.DRIVE_STATES``). Optional:
+    requested_by, source_text (his words, stored verbatim so every surface can
+    say WHY the state is what it is). Returns
+    ``{ok, **automation.snapshot(...)}`` so the caller renders the resulting
+    state rather than assuming the write did what it asked.
+
+    An out-of-set state RAISES rather than falling back to a default — a
+    settings surface that quietly ignores what you set it to is the defect
+    D-0069 named and this ticket re-reports.
+    """
+    extra = set(params) - _AUTOMATION_SET_STATE_ALLOWED
+    if extra:
+        raise ActionError(f"automation_set_state got unexpected params: {sorted(extra)}")
+    missing = _AUTOMATION_SET_STATE_REQUIRED - set(params)
+    if missing:
+        raise ActionError(
+            f"automation_set_state missing required params: {sorted(missing)}")
+
+    cfg = _get_config()
+    slug = params["slug"]
+    if cfg.projects.get(slug) is None:
+        raise ActionError(f"automation_set_state: unknown project slug {slug!r}")
+
+    from bot_squad_worker import automation as _automation
+    from bot_squad_worker import pace as _pace
+    try:
+        _pace.set_drive_state(
+            cfg, slug, params["state"],
+            set_by=params.get("requested_by") or "user",
+            source_text=params.get("source_text"),
+        )
+    except _pace.DriveModeError as e:
+        raise ActionError(str(e)) from e
+    return {"ok": True, **_automation.snapshot(cfg, slug)}
+
+
 _OPERATOR_STATUS_REQUIRED = {"slug"}
 _OPERATOR_STATUS_ALLOWED = _OPERATOR_STATUS_REQUIRED
 
@@ -6075,6 +6159,9 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "autopilot_start": _action_autopilot_start,
     "autopilot_stop": _action_autopilot_stop,
     "autopilot_status": _action_autopilot_status,
+    # T-0929: the project-wide drive state + the one automation-visibility read.
+    "automation_status": _action_automation_status,
+    "automation_set_state": _action_automation_set_state,
     "peer_send": _action_peer_send,
     "peer_inbox_read": _action_peer_inbox_read,
     "peer_inbox_wait": _action_peer_inbox_wait,
@@ -6273,6 +6360,10 @@ ACTION_MODES: dict[str, str] = {
     "autopilot_start": "coordinator_only",
     "autopilot_stop": "coordinator_only",
     "autopilot_status": "coordinator_only",
+    # T-0929: reads/writes the project's pace config + the coordinator-owned
+    # pause flag, and stopping the switch stops autopilots — same placement.
+    "automation_status": "coordinator_only",
+    "automation_set_state": "coordinator_only",
     "peer_send": "coordinator_only",
     "peer_inbox_read": "coordinator_only",
     "peer_inbox_wait": "coordinator_only",

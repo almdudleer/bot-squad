@@ -4233,6 +4233,66 @@ _PACE_DRIVE_CHOICES = {
 }
 _PACE_DRIVE_PROVENANCE_FIELDS = ("set_by", "set_at", "source_text")
 
+# T-0929 — the NAMED drive states. Third mirror of pace.py's DRIVE_STATES /
+# DRIVE_STATE_AXES / DRIVE_STATE_LABELS (this CLI is stdlib-only and reaches the
+# worker only over its socket, so every piece of worker logic it needs is a copy,
+# never an import). `off` is NEVER a stored value: it is the pause flag, so
+# `_pace_normalized_drive` never returns it and `_pace_effective_state` combines
+# the two.
+_PACE_DRIVE_STATES = ("one_task", "finish_up", "all_tasks", "off")
+_PACE_DRIVE_STATE_CUSTOM = "custom"
+_PACE_DRIVE_STATE_AXES = {
+    "one_task": {"scope": "all", "stop_when": "scope_exhausted",
+                 "max_in_progress": 1},
+    "finish_up": {"scope": "in_progress", "stop_when": "scope_exhausted",
+                  "max_in_progress": 0},
+    "all_tasks": {"scope": "all", "stop_when": "scope_exhausted",
+                  "max_in_progress": 0},
+}
+_PACE_DRIVE_STATE_DEFAULT = "all_tasks"
+# Each label is the EXPLANATION ONLY and deliberately does not repeat the state
+# name: every surface renders "<state> — <label>", and a label carrying the name
+# too produced "off — off — nothing automatic runs" in the walkthrough.
+_PACE_DRIVE_STATE_LABELS = {
+    "off": "nothing automatic runs",
+    "one_task": "work on one task",
+    "finish_up": "close what is in progress, take nothing new",
+    "all_tasks": "drive the backlog end to end",
+    _PACE_DRIVE_STATE_CUSTOM: "axes set by hand, no named state",
+}
+
+
+def _pace_coerce_int(v, default: int) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _pace_derive_drive_state(raw: dict) -> str:
+    """Mirror of pace.py:derive_drive_state — the state a pre-T-0929 config is
+    in, matched on the FULL axis tuple including max_in_progress."""
+    src = raw.get("drive")
+    src = src if isinstance(src, dict) else {}
+    if not src:
+        return _PACE_DRIVE_STATE_DEFAULT
+    cap = max(0, _pace_coerce_int(raw.get("max_in_progress"), 0))
+    for name, axes in _PACE_DRIVE_STATE_AXES.items():
+        if (src.get("scope", _PACE_DRIVE_DEFAULTS["scope"]) == axes["scope"]
+                and src.get("stop_when", _PACE_DRIVE_DEFAULTS["stop_when"]) == axes["stop_when"]
+                and cap == axes["max_in_progress"]):
+            return name
+    return _PACE_DRIVE_STATE_CUSTOM
+
+
+def _pace_effective_state(drive: dict, paused: bool) -> str:
+    """Mirror of pace.py:effective_drive_state — `off` whenever the switch is
+    engaged, else the configured state. Every surface must use this, or it prints
+    a mode beside an engaged switch."""
+    if paused:
+        return "off"
+    return str(drive.get("state") or _PACE_DRIVE_STATE_DEFAULT)
+
 
 def _pace_dir(slug: str) -> Path:
     return Path(BOT_SQUAD) / "data" / slug / "_worker" / "pace"
@@ -4324,6 +4384,7 @@ def _pace_normalized_drive(raw: dict) -> dict:
     out.update({"set_by": None, "set_at": None, "source_text": None})
     out["configured"] = False
     out["invalid"] = {}
+    out["state"] = _PACE_DRIVE_STATE_DEFAULT
 
     src = raw.get("drive")
     if not isinstance(src, dict):
@@ -4342,6 +4403,15 @@ def _pace_normalized_drive(raw: dict) -> dict:
     for field in _PACE_DRIVE_PROVENANCE_FIELDS:
         v = src.get(field)
         out[field] = str(v) if v is not None else None
+
+    stored = src.get("state")
+    if stored is None:
+        out["state"] = _pace_derive_drive_state(raw)
+    elif str(stored).strip() == "off" or str(stored).strip() not in _PACE_DRIVE_STATE_AXES:
+        out["invalid"]["state"] = stored
+        out["state"] = _pace_derive_drive_state(raw)
+    else:
+        out["state"] = str(stored).strip()
     return out
 
 
@@ -4540,7 +4610,12 @@ def cmd_pace_show(args) -> None:
         mip = 0
     paused = _pace_redrive_flag(slug).exists()
     inits = _pace_initiatives(raw)
+    # T-0929: the NAMED state first — "off" whenever the switch is engaged, so
+    # this surface can never print a mode beside a stopped system.
+    drive_block = _pace_normalized_drive(raw)
+    eff = _pace_effective_state(drive_block, paused)
     print(f"pace control for {slug}:")
+    print(f"  drive state: {eff} — {_PACE_DRIVE_STATE_LABELS.get(eff, eff)}")
     print(f"  max_in_progress: {mip if mip else '0 (unlimited)'}")
     print(f"  paused (global): {'yes' if paused else 'no'}")
     if inits:
@@ -4562,7 +4637,8 @@ def cmd_pace_show(args) -> None:
         print(f"  weekly quota target: {target}%  spend-to-date: {spend_s}  "
               f"verdict: {verdict_s}")
     # T-0828: one more block in this same output — not a new verb.
-    _pace_print_drive(_pace_normalized_drive(raw), slug)
+    _pace_print_drive(drive_block, slug)
+    print("  (`bsq pace status` lists every automatic mechanism the switch covers)")
 
 
 def cmd_pace_set(args) -> None:
@@ -4726,6 +4802,112 @@ def cmd_pace_resume(args) -> None:
         print(f"pace[{slug}]: RESUMED — operator re-drive may start new work")
     else:
         print(f"pace[{slug}]: not paused (nothing to resume)")
+
+
+def cmd_pace_state(args) -> None:
+    """T-0929: set the project's NAMED drive state — including `off`, the switch.
+
+    > "There should be drive states like 'work on one task', 'finish up (i.e.
+    > close all in progress)', and the main one with the set of tasks which need
+    > to be done. And there should be explicit UI state where I could easily turn
+    > them off for a project" — the stakeholder, 2026-08-28.
+
+    Goes through the worker (`automation_set_state`) rather than writing the
+    files here, unlike the rest of `bsq pace`. Two reasons, and both are the
+    ticket: `off` has to also END running autopilots (a file write cannot), and
+    the mechanism registry that says WHAT the switch covers must have exactly one
+    copy — a second hand-maintained list of automatic subsystems is the "not
+    covering the whole system" defect wearing a new face.
+    """
+    slug = resolve_slug()
+    state = str(args.state).strip().replace("-", "_")
+    try:
+        res = post("automation_set_state", {
+            "slug": slug,
+            "state": state,
+            "requested_by": require_sid(getattr(args, "sid", None)) or "user",
+            **({"source_text": args.because} if getattr(args, "because", None) else {}),
+        })
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        die(f"could not set the drive state: {exc}")
+    _pace_print_automation(res, slug)
+
+
+def cmd_pace_status(args) -> None:
+    """T-0929: "is anything automatic running for this project, and in what mode".
+
+    The READ half of «explicitly see if it's happening in the first place» — one
+    command instead of composing `bsq operator status` + `bsq pace show` +
+    `bsq autopilot status` and reasoning about how they interact.
+    """
+    slug = resolve_slug()
+    try:
+        res = post("automation_status", {"slug": slug})
+    except Exception as exc:  # noqa: BLE001
+        die(f"could not read the automation status: {exc}")
+    _pace_print_automation(res, slug, verbose=True)
+
+
+def _pace_print_automation(snap: dict, slug: str, *, verbose: bool = False) -> None:
+    """Render an `automation.snapshot` payload.
+
+    The headline is the EFFECTIVE state and whether anything is running — in that
+    order, because "which mode" is useless if the switch is engaged and the
+    surface does not say so. Mirrors the web card's copy
+    (`ObservabilityPanel`/`AutomationCard.automationCopy`); the mirror test
+    compares normalisation only and cannot see a rendering divergence.
+    """
+    state = snap.get("state") or "unknown"
+    label = snap.get("label") or state
+    running = bool(snap.get("running"))
+    print(f"automation for {slug}:")
+    print(f"  drive state: {state} — {label}")
+    print(f"  running:     {'YES — automatic work is happening' if running else 'NO — nothing automatic runs'}")
+
+    # The caps + targets that go WITH the state — he asked for them in the same
+    # sentence as the states, and they live in two different stores.
+    q = snap.get("quota") or {}
+    cap = q.get("max_in_progress", snap.get("max_in_progress"))
+    if cap is not None:
+        print(f"  cap:         max_in_progress={cap if cap else '0 (unlimited)'}")
+    tgt, spend, verdict = (q.get("weekly_target_pct"), q.get("spend_pct"),
+                           q.get("verdict"))
+    # An absent signal is printed as an explicit unknown, never omitted: a
+    # missing line reads as "no target", which is a different fact.
+    print(f"  target:      weekly quota "
+          f"{f'{tgt}%' if tgt is not None else '(none set)'}"
+          f"  spend-to-date {f'{spend:.1f}%' if spend is not None else 'unknown (no quota anchor)'}"
+          f"  verdict {verdict or 'unknown'}")
+
+    aps = snap.get("autopilots") or []
+    if aps:
+        print(f"  running autopilots ({len(aps)}):")
+        for ap in aps:
+            print(f"    {ap.get('key')}  kind={ap.get('kind')} "
+                  f"target={ap.get('target_sid')} expires={ap.get('expires_at')}")
+    else:
+        print("  running autopilots: (none)")
+
+    drive = snap.get("drive") or {}
+    if drive.get("invalid"):
+        for field, raw in sorted(drive["invalid"].items()):
+            print(f"  ⚠ stored {field}={raw!r} is not recognised — "
+                  f"NOT in effect; the fallback is what runs")
+
+    if not verbose:
+        return
+    mechs = snap.get("mechanisms") or []
+    gated = [m for m in mechs if m.get("gated")]
+    ungated = [m for m in mechs if not m.get("gated")]
+    print(f"  the switch covers ({len(gated)}):")
+    for m in gated:
+        mark = "on " if m.get("active") else "OFF"
+        print(f"    [{mark}] {m['key']}: {m['why']}")
+    print(f"  the switch does NOT cover ({len(ungated)}) — these keep running:")
+    for m in ungated:
+        print(f"    [on ] {m['key']}: {m['why']}")
 
 
 # --------------------------------------------------------------------------
@@ -8213,6 +8395,23 @@ def build_parser() -> argparse.ArgumentParser:
     pcp.set_defaults(func=cmd_pace_pause)
     pcr = pace_sub.add_parser("resume", help="clear the GLOBAL operator pause")
     pcr.set_defaults(func=cmd_pace_resume)
+    # T-0929: the named drive states + the one automation-visibility read.
+    pcst = pace_sub.add_parser(
+        "state",
+        help="set the project's drive state: one-task | finish-up | all-tasks | off")
+    pcst.add_argument(
+        "state",
+        help="one_task (finish one before starting another) | finish_up (close "
+             "what is in progress, take nothing new) | all_tasks (drive the "
+             "backlog end to end) | off (THE switch — nothing automatic runs). "
+             "Dashes are accepted for underscores.")
+    pcst.add_argument("--because", help="the words that set it, stored verbatim "
+                                        "so every surface can say why")
+    pcst.set_defaults(func=cmd_pace_state)
+    pcsu = pace_sub.add_parser(
+        "status",
+        help="is anything automatic running for this project, and in what mode")
+    pcsu.set_defaults(func=cmd_pace_status)
 
     cm = sub.add_parser("commit", help="stage explicit paths + safe-commit")
     cm.add_argument("-m", "--message", required=True, help="commit message")

@@ -372,6 +372,13 @@ def drift_check(cfg: Any, slug: str) -> dict:
 
     if drift_minutes() <= 0:
         return {"ok": True, "disabled": True, "nudged": []}
+
+    # T-0929 — THE automation gate. Every mechanism that makes an agent work
+    # reads the one pause SSOT here, so "stop the auto-drive" stops all of
+    # them and not just the three that used to check.
+    from bot_squad_worker import automation as _automation
+    if not _automation.gate(cfg, slug, "drift_check"):
+        return {"ok": True, "paused": True, "nudged": []}
     project = cfg.projects.get(slug)
     if project is None:
         raise ActionError(f"drift_check: unknown project slug {slug!r}")

@@ -210,6 +210,55 @@ _DRIVE_CHOICES = {
 }
 _DRIVE_PROVENANCE_FIELDS = ("set_by", "set_at", "source_text")
 
+# T-0929 — the NAMED drive states. Mirror of pace.py's DRIVE_STATES /
+# DRIVE_STATE_AXES / DRIVE_STATE_LABELS. `off` is deliberately NOT a storable
+# state: it is the pause flag (`_global_paused`), so this normaliser never
+# returns it — combine the two with `_effective_drive_state` exactly as
+# pace.effective_drive_state does, or the panel prints a mode beside an
+# engaged switch.
+_DRIVE_STATES = ("one_task", "finish_up", "all_tasks", "off")
+_DRIVE_STATE_CUSTOM = "custom"
+_DRIVE_STATE_AXES = {
+    "one_task": {"scope": "all", "stop_when": "scope_exhausted",
+                 "max_in_progress": 1},
+    "finish_up": {"scope": "in_progress", "stop_when": "scope_exhausted",
+                  "max_in_progress": 0},
+    "all_tasks": {"scope": "all", "stop_when": "scope_exhausted",
+                  "max_in_progress": 0},
+}
+_DRIVE_STATE_DEFAULT = "all_tasks"
+_DRIVE_STATE_LABELS = {
+    "off": "nothing automatic runs",
+    "one_task": "work on one task",
+    "finish_up": "close what is in progress, take nothing new",
+    "all_tasks": "drive the backlog end to end",
+    _DRIVE_STATE_CUSTOM: "axes set by hand, no named state",
+}
+
+
+def _derive_drive_state(raw: dict) -> str:
+    """Mirror of ``pace.py:derive_drive_state`` — the state a pre-T-0929 config
+    is in, matched on the FULL axis tuple including ``max_in_progress``."""
+    src = raw.get("drive")
+    src = src if isinstance(src, dict) else {}
+    if not src:
+        return _DRIVE_STATE_DEFAULT
+    cap = max(0, _coerce_int(raw.get("max_in_progress"), 0))
+    for name, axes in _DRIVE_STATE_AXES.items():
+        if (src.get("scope", _DRIVE_DEFAULTS["scope"]) == axes["scope"]
+                and src.get("stop_when", _DRIVE_DEFAULTS["stop_when"]) == axes["stop_when"]
+                and cap == axes["max_in_progress"]):
+            return name
+    return _DRIVE_STATE_CUSTOM
+
+
+def _effective_drive_state(drive: dict, paused: bool) -> str:
+    """Mirror of ``pace.py:effective_drive_state`` — ``off`` whenever the gate is
+    engaged, else the configured state."""
+    if paused:
+        return "off"
+    return str(drive.get("state") or _DRIVE_STATE_DEFAULT)
+
 
 def _normalized_drive(raw: dict) -> dict:
     """Mirror of ``pace.py:_normalized_drive`` — defaults applied, closed sets
@@ -229,6 +278,7 @@ def _normalized_drive(raw: dict) -> dict:
     out.update({"set_by": None, "set_at": None, "source_text": None})
     out["configured"] = False
     out["invalid"] = {}
+    out["state"] = _DRIVE_STATE_DEFAULT
 
     src = raw.get("drive")
     if not isinstance(src, dict):
@@ -247,6 +297,15 @@ def _normalized_drive(raw: dict) -> dict:
     for field in _DRIVE_PROVENANCE_FIELDS:
         v = src.get(field)
         out[field] = str(v) if v is not None else None
+
+    stored = src.get("state")
+    if stored is None:
+        out["state"] = _derive_drive_state(raw)
+    elif str(stored).strip() == "off" or str(stored).strip() not in _DRIVE_STATE_AXES:
+        out["invalid"]["state"] = stored
+        out["state"] = _derive_drive_state(raw)
+    else:
+        out["state"] = str(stored).strip()
     return out
 
 

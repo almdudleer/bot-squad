@@ -5955,6 +5955,213 @@ def _measure_pytest_output(text: str) -> dict:
     return out
 
 
+# --- T-0987: the skip census — publish the price of the isolation ----------
+#
+# `git archive` carries COMMITTED PATHS ONLY, so a frozen extract has no
+# `.git`. Every test that needs a real checkout therefore SKIPS, and a skip is
+# a green-adjacent outcome nobody reads: the fleet spent 2026-09-06 reading
+# `N passed, M skipped` as certification without anyone naming what M held.
+#
+# So M is not noise — it is the SIZE OF THE COVERAGE HOLE the isolation buys,
+# and it belongs beside the sha the way a lockfile hash does. Three properties
+# this block exists to make checkable:
+#
+#   * EQUAL COUNTS ARE NOT EQUAL SETS. Today's api attribution leaned partly on
+#     1+1604+2 == 0+1605+2 to argue that exactly one test moved FAILED->PASSED
+#     and nothing else was disturbed. That argument silently assumes the two
+#     skips are the SAME two on both sides; nobody checked, only that there
+#     were two. The fingerprint below is what closes it — it hashes the
+#     (count, location, reason) SET, so a swapped pair at an equal count stops
+#     being invisible.
+#   * REASONS, NOT A PREDICTION. `-r` REPLACES pytest's default report chars,
+#     which is why the `-rf` the fleet had standardised on printed no skip
+#     reasons at all. We INJECT `s` rather than documenting that people should:
+#     a requirement that lives only in prose is not a control.
+#   * A STRUCTURAL SKIP IS NOT A RUN TO RE-TRY. The isolation that makes the
+#     extract trustworthy is the same property that makes those tests
+#     unrunnable — a fallback sharing the primary's gate. Anything only
+#     checkable in a real checkout can NEVER be certified here; it needs a
+#     second arm, which is why they are labelled rather than merely counted.
+
+_PYTEST_SKIPPED_LINE_RE = re.compile(
+    r"^SKIPPED\s+\[(\d+)\]\s+(\S.*?:\d+):\s*(.*)$")
+
+# Reasons whose cause is the ISOLATION ITSELF — no `.git`, no index, no
+# worktree. Advisory only: the verbatim reasons are printed either way, so a
+# reader is never left with this regex's opinion instead of the text. That
+# ordering is deliberate — a confident label over an unread reason is how a
+# wrong classification survives (T-0987 / p653: publish the reasons verbatim,
+# not a match against a prediction).
+_STRUCTURAL_SKIP_RE = re.compile(
+    r"\.git\b"
+    r"|\bcheckout\b"
+    r"|\bworktree\b"
+    r"|\bambient\s+git\b"
+    r"|\bnot\s+a\s+git\b"
+    r"|\bgit\s+(?:repo|repository|archive|index|metadata|rev-parse)\b"
+    r"|\bvcs\b",
+    re.IGNORECASE)
+
+# pytest's short-option letters that CONSUME the rest of the group as a value.
+# `-kfoo` is a keyword expression, not the flags k, f, o, o — so a scan for
+# `r` inside a grouped token must stop at one of these or it will read a
+# substring of somebody's `-k` expression as report chars.
+_PYTEST_VALUE_SHORTOPTS = set("kmpnco")
+
+
+def _find_report_chars(cmd: list) -> tuple:
+    """Locate pytest's `-r` value in ``cmd``. Returns (kind, index, chars).
+
+    kind is "inline" (`-rfE`, `-qrfE`), "separate" (`-r fE`), "absent", or
+    "unparsed" when a token plausibly carries `-r` in a shape we decline to
+    rewrite. Mirrors argparse's own short-option grouping, including the case
+    where the group ends at `r` and the value is the NEXT token.
+    """
+    for i, raw in enumerate(cmd):
+        tok = str(raw)
+        if not tok.startswith("-") or tok.startswith("--") or tok == "-":
+            continue
+        body = tok[1:]
+        if not body.isalpha():
+            # e.g. `-p123` or `-W::x` — not a plain short-flag group.
+            if body.startswith("r"):
+                return ("unparsed", i, None)
+            continue
+        pos = None
+        for j, ch in enumerate(body):
+            if ch in _PYTEST_VALUE_SHORTOPTS:
+                break          # the rest of the group is THAT option's value
+            if ch == "r":
+                pos = j
+                break
+        if pos is None:
+            continue
+        rest = body[pos + 1:]
+        if rest:
+            return ("inline", i, rest)
+        if i + 1 < len(cmd) and not str(cmd[i + 1]).startswith("-"):
+            return ("separate", i + 1, str(cmd[i + 1]))
+        # `-r` with nothing after it is pytest's own error, not ours.
+        return ("unparsed", i, None)
+    return ("absent", -1, None)
+
+
+def _with_skip_reasons(cmd: list) -> tuple:
+    """Return (cmd, note) with pytest's skip reasons guaranteed to be printed.
+
+    The fleet standardised on `-rf`, and `-r` REPLACES the default report
+    chars rather than adding to them — so every certification run all day
+    printed a skip COUNT with no way to learn what it covered. Merging `s` in
+    changes what is REPORTED, never what is RUN, so it cannot move a result.
+    """
+    if not _looks_like_pytest(cmd):
+        return (cmd, None)
+    kind, idx, chars = _find_report_chars(cmd)
+    if kind == "absent":
+        return (list(cmd) + ["-rs"],
+                "verify-isolated: added `-rs` — the skip reasons are part of "
+                "the result, not a detail (T-0987)")
+    if kind == "unparsed":
+        return (cmd,
+                f"verify-isolated: could not safely merge `s` into {cmd[idx]!r} "
+                "— if this run reports skips without reasons, re-run with `s` "
+                "among your `-r` chars")
+    if "s" in chars:
+        return (cmd, None)
+    merged = chars + "s"
+    out = list(cmd)
+    if kind == "inline":
+        tok = str(out[idx])
+        out[idx] = tok[:len(tok) - len(chars)] + merged
+    else:
+        out[idx] = merged
+    return (out,
+            f"verify-isolated: `-r{chars}` -> `-r{merged}` — `-r` REPLACES the "
+            "default report chars, so `-rf` alone prints a skip count with no "
+            "reasons (T-0987)")
+
+
+def _skip_census(text: str, counts: dict) -> dict:
+    """The skips this run bought, as a set — not a number.
+
+    ``entries`` are (count, location, reason) exactly as pytest printed them.
+    ``fingerprint`` hashes that SET, so two refs can be compared on membership
+    instead of on a total that conserves across a swap.
+    """
+    entries = []
+    for raw in text.splitlines():
+        m = _PYTEST_SKIPPED_LINE_RE.match(raw.strip())
+        if m:
+            entries.append((int(m.group(1)), m.group(2).strip(),
+                            m.group(3).strip()))
+    named = sum(n for n, _, _ in entries)
+    reported = counts.get("skipped", 0)
+    blob = "\n".join(sorted(f"{n}\t{loc}\t{why}" for n, loc, why in entries))
+    return {
+        "entries": sorted(entries, key=lambda e: (e[1], e[2])),
+        "named": named,
+        "reported": reported,
+        "complete": bool(entries) and named == reported,
+        "fingerprint": hashlib.sha256(blob.encode()).hexdigest()[:16],
+    }
+
+
+def _census_lines(census: dict) -> list:
+    """The census block printed beside every certification result."""
+    reported = census["reported"]
+    if reported == 0 and not census["entries"]:
+        return ["verify-isolated: SKIP CENSUS — 0 skipped; nothing was traded "
+                "away for the isolation."]
+    out = [
+        f"verify-isolated: SKIP CENSUS — {reported} skipped. This is the "
+        "COVERAGE HOLE the isolation buys, not noise.",
+        f"  fingerprint: skips:{census['fingerprint']} — compare this between "
+        "refs, NOT the count. Equal counts are not equal sets; a MOVED "
+        "fingerprint means the two runs are not comparable measurements.",
+    ]
+    if not census["entries"]:
+        out.append(
+            "  ⚠ REASONS NOT CAPTURED — this run printed no short-summary "
+            "skip lines, so what those skips cover is UNKNOWN. This result "
+            "does NOT say the suite is green over them. Re-run with `s` among "
+            "your `-r` chars.")
+        return out
+    if not census["complete"]:
+        out.append(
+            f"  ⚠ PARTIAL — the summary says {reported} skipped but only "
+            f"{census['named']} were named below; treat the rest as unknown.")
+    families = {}
+    for n, loc, why in census["entries"]:
+        f = families.setdefault(why, {"skips": 0, "sites": []})
+        f["skips"] += n
+        f["sites"].append(loc)
+    structural = 0
+    for why in sorted(families):
+        f = families[why]
+        tag = ""
+        if _STRUCTURAL_SKIP_RE.search(why):
+            structural += 1
+            tag = "   ← NAMES a checkout/worktree/VCS condition"
+        out.append(f"  {f['skips']} skip(s) at {len(f['sites'])} site(s): "
+                   f"{why}{tag}")
+        for loc in sorted(f["sites"]):
+            out.append(f"      {loc}")
+    out.append(
+        "  Reasons above are pytest's own text, VERBATIM. The tag is a keyword "
+        "read of that text and nothing more — it says the reason NAMES the "
+        "condition, not that the condition is what fired. Judge from the "
+        "reason; a skip about the git BINARY being absent reads the same to a "
+        "keyword and is a re-runnable skip, not a permanent one.")
+    if structural:
+        out.append(
+            f"  {structural} of {len(families)} reason "
+            f"{'family' if len(families) == 1 else 'families'} name "
+            "such a condition. Where that IS the cause, the isolation itself "
+            "is the cause — a `git archive` extract has no `.git` — so they "
+            "can never be certified by this mechanism and need a second arm. "
+            "They are not a run to re-try (T-0987).")
+    return out
+
 def _extract_missing_paths(repo_root: str, sha: str, dest: str) -> tuple:
     """Which of ``sha``'s tracked paths are absent from the extract at ``dest``.
 
@@ -5997,6 +6204,9 @@ def _certify_pytest_outcome(text: str, rc: int, cmd: list, sha: str) -> tuple:
             "measurement was made.",
             f"verify-isolated: exit {rc} is the only signal — this is an "
             "UNMEASURED result; do not report it as a green suite.",
+            "verify-isolated: no SKIP CENSUS either — with no pytest argv "
+            "there is no skip count to publish, so the size of what this run "
+            "did NOT cover is also unknown (T-0987).",
             f"verify-isolated: this certifies {short}, not the shared "
             "working tree.",
         ], rc)
@@ -6059,12 +6269,17 @@ def _certify_pytest_outcome(text: str, rc: int, cmd: list, sha: str) -> tuple:
             f"  pytest's summary said: {m['summary_line']}",
             "  A summary of skips, warnings and errors is an ABSENCE wearing "
             "a result's clothes. A skip is not coverage.",
-        ], VERIFY_UNMEASURED_RC)
+        ] + _census_lines(_skip_census(text, m["counts"])), VERIFY_UNMEASURED_RC)
 
     detail = ", ".join(f"{k}={v}" for k, v in sorted(m["counts"].items()))
+    # T-0987: the skip census rides WITH the pass count, in the same block, on
+    # every run. Printing it only when it looked interesting is how a day of
+    # `N passed, M skipped` got read as certification — the number nobody
+    # published is the number nobody questioned.
     return ([
         f"verify-isolated: MEASURED {m['executed']} test(s) executed "
         f"({detail}).",
+    ] + _census_lines(_skip_census(text, m["counts"])) + [
         f"verify-isolated: exit {rc} — this certifies {short}, not the "
         "shared working tree.",
     ], rc)
@@ -6262,6 +6477,9 @@ def cmd_verify_isolated(args) -> None:
     cmd = [a for a in (args.cmd or []) if a != "--"]
     if not cmd:
         die("verify-isolated: nothing to run — `bsq verify-isolated -- pytest worker/tests`")
+    # T-0987: guarantee the skip reasons are printable BEFORE the run, rather
+    # than discovering after a 9-minute suite that `-rf` replaced them away.
+    cmd, report_note = _with_skip_reasons(cmd)
     ref = subprocess.run(["git", "rev-parse", "--verify", args.ref],
                          cwd=repo_root, capture_output=True, text=True)
     if ref.returncode != 0:
@@ -6336,6 +6554,8 @@ def cmd_verify_isolated(args) -> None:
                   f"extract", flush=True)
         print(f"verify-isolated: GATE_EXTRACT_ROOT={dest} (exported — arming "
               "the provenance gate needs no wrapper)", flush=True)
+        if report_note:
+            print(report_note, flush=True)
         print(f"verify-isolated: running: {' '.join(cmd)}\n", flush=True)
         # Captured AND streamed. Capturing is what makes the verdict below
         # possible; streaming is what keeps the evidence readable while a long

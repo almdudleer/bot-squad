@@ -492,7 +492,21 @@ def drift_check(cfg: Any, slug: str) -> dict:
         if ticket_initiative and session_initiative and ticket_initiative != session_initiative:
             continue
 
-        last_touch = _ticket_last_touch(ticket_path) or _parse_iso(row.get("started_at")) or now
+        # T-0948: the anchor is the LATEST of the ticket's own last touch and
+        # this session's start — a MAX, not a fallback.
+        #
+        # It used to be `ticket_last_touch or started_at`, i.e. ticket age won
+        # whenever the ticket had ever been touched, and a ticket is normally
+        # much older than the session bound to it. A dev spawned two minutes
+        # ago onto a six-day-old ticket was therefore told it had been silent
+        # for ~8581 minutes and nagged on its first turn — measured live on
+        # 2026-09-06, on eight lanes, which is why drift was switched off
+        # fleet-wide. A session cannot have failed to report for longer than it
+        # has existed; that is the invariant this max encodes.
+        _touch_candidates = [t for t in (_ticket_last_touch(ticket_path),
+                                         _parse_iso(row.get("started_at")))
+                             if t is not None]
+        last_touch = max(_touch_candidates) if _touch_candidates else now
         stale_min = int((now - last_touch) / 60)
 
         # T-0735: the bound ticket looks stale — but "stale" must mean "reported
@@ -521,15 +535,28 @@ def drift_check(cfg: Any, slug: str) -> dict:
         if last_check is not None and (now - last_check) < cooldown:
             continue
 
+        # T-0948: the cooldown is stamped for an ATTEMPT, not for a success.
+        #
+        # `_deliver_prompt` raises when the paste never appears in the composer
+        # or the composer never clears — which is exactly what a busy pane
+        # does. The old `except: continue` skipped the stamp below, so a
+        # failing delivery had NO cooldown at all and the tick re-fired on its
+        # own 2-minute cadence, forever, against the same session: two parked
+        # nudges 2 minutes apart were read out of one live pane on 2026-09-06.
+        # A failed nudge is the case that most needs rate-limiting, not the
+        # case that should be exempt from it. The stamp goes first, so it
+        # holds whichever way the delivery goes.
+        delivered = True
         try:
             # T-0578: identity threads through so the nudge paste holds the
             # per-sid mux delivery lock (never interleaves with other writers).
             S._deliver_prompt(pane.pane_id, text,
                               data_dir=cfg.data_dir, sid=sid)
         except Exception:
-            log.exception("drift_check: inject failed for %s", sid)
-            continue
-        nudged.append({"sid": sid, "task_id": task_id, "signal": signal, "stale_min": stale_min})
+            delivered = False
+            log.exception("drift_check: inject failed for %s — stamping the "
+                          "cooldown anyway so the retry waits a full window "
+                          "instead of re-firing every tick", sid)
 
         if md_path and meta is not None:
             meta["drift_checked_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
@@ -537,6 +564,10 @@ def drift_check(cfg: Any, slug: str) -> dict:
                 S._write_session_metadata(md_path, meta, atomic=True)
             except OSError:
                 log.exception("drift_check: could not persist drift_checked_at for %s", sid)
+
+        if not delivered:
+            continue
+        nudged.append({"sid": sid, "task_id": task_id, "signal": signal, "stale_min": stale_min})
 
     if nudged:
         log.info("drift_check: %s nudged %d session(s): %s", slug, len(nudged), nudged)

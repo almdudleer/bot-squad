@@ -461,3 +461,114 @@ def test_do_respawn_emits_session_recycled(monkeypatch, tmp_path):
     doc = LE.read_events(cfg, "p1", "S-u-crashed-p1")
     assert doc.get("counts", {}).get(LE.SESSION_RECYCLED) == 1
     assert doc["last"][LE.SESSION_RECYCLED]["cause"] == "recovery"
+
+
+# --- T-0948: the respawn bound must hold ACROSS generations -----------------
+
+def test_classify_parked_task_is_never_respawned():
+    """RED when a crashed session is brought back onto a ticket somebody
+    deliberately parked.
+
+    `paused` used to sit in ACTIVE_STATUSES ("still needs work → recover"),
+    while `task_states.PARKED_STATES` says "no session is or should be
+    engaged" — the same taxonomy gap that had `idle_timeout.task_alive`
+    nudging a paused dev forever. Respawning here undoes the parking decision
+    at the most expensive kind of turn (a full fresh-context boot).
+    """
+    assert R.classify(pane_live=False, task_status="paused", has_artifact=True,
+                      respawn_count=0, bound=2) == "none"
+    assert R.classify(pane_live=False, task_status="paused", has_artifact=False,
+                      respawn_count=0, bound=2) == "none"
+    # `planned` is deliberately NOT parked for a BOUND ticket — the binding is
+    # the queueing act and the label is merely stale (four of seven live devs
+    # sat on `planned` tickets when this shipped). A crashed session that wrote
+    # forward-state on one is still recovered.
+    assert R.classify(pane_live=False, task_status="planned", has_artifact=True,
+                      respawn_count=0, bound=2) == "respawn"
+    # POSITIVE CONTROL: the same call shape with a live status DOES respawn, so
+    # the "none" results above are a decision and not a broken predicate.
+    assert R.classify(pane_live=False, task_status="in_progress", has_artifact=True,
+                      respawn_count=0, bound=2) == "respawn"
+
+
+def test_lineage_key_survives_the_sid_change_a_respawn_makes():
+    """The counter key must name the CHAIN, not the incarnation.
+
+    `_do_respawn` spawns a successor with a brand-new sid and archives the
+    predecessor, so a sid-keyed count restarted at 0 on every crashed
+    generation and the bound was unreachable on the success path.
+    """
+    gen1 = {"slug": "p1", "sid": "S-u-w-p1", "task_id": "T-1",
+            "artifact_path": "/a/T-1.md", "window": "w"}
+    gen2 = dict(gen1, sid="S-u-w-p77")          # respawn: new pane, new sid
+    assert R.lineage_key(gen1) == R.lineage_key(gen2)
+    # task-less: the role artifact is the stable identity (assignment.
+    # role_artifact resolves to the same file across pane incarnations, T-0573,
+    # and _retire_dead deliberately does not reap it).
+    tl1 = {"slug": "p1", "sid": "S-u-tl-p1", "task_id": None,
+           "artifact_path": "/a/role-teamlead-x.md", "window": "tl"}
+    tl2 = dict(tl1, sid="S-u-tl-p90")
+    assert R.lineage_key(tl1) == R.lineage_key(tl2)
+    # ...and two genuinely different chains never share a key.
+    assert R.lineage_key(gen1) != R.lineage_key(tl1)
+
+
+def test_respawn_bound_holds_across_generations(monkeypatch, tmp_path):
+    """RED when a deterministically-crashing session is respawned forever.
+
+    Each pass presents the SAME lineage under a NEW sid — exactly what the
+    respawn does — and after `bound` attempts the action must become `park`
+    (suspend + page the operator), not another full fresh-context boot.
+    """
+    from bot_squad_worker import sessions as S
+    monkeypatch.setenv("BOT_SQUAD_RECOVERY", "1")
+    monkeypatch.setenv("BOT_SQUAD_RESPAWN_MAX", "2")
+    cfg = _cfg(tmp_path)
+    backlog = tmp_path / "data" / "p1" / "backlog"; backlog.mkdir(parents=True)
+    artifacts = tmp_path / "data" / "p1" / "artifacts"; artifacts.mkdir(parents=True)
+    (backlog / "T-1.md").write_text("---\nid: T-1\nstatus: in_progress\n---\n# f\n")
+    (artifacts / "T-1.md").write_text("# forward-state\n")
+
+    spawns, parked = [], []
+    monkeypatch.setattr(S, "live_pane_map", lambda *a, **k: {})
+    monkeypatch.setattr(S, "spawn",
+                        lambda *a, **kw: spawns.append(kw) or {"ok": True})
+    monkeypatch.setattr(S, "archive_session", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(R, "_do_park",
+                        lambda cfg, row, reason: parked.append((row["sid"], reason)))
+
+    actions = []
+    for gen, pane in enumerate(("%11", "%12", "%13", "%14")):
+        # every generation is a NEW sid for the same task — the shape the old
+        # per-sid counter could never see.
+        sid = f"S-u-crashloop-p{pane.strip('%')}"
+        for old in (tmp_path / "data" / "p1" / "sessions").glob("*.md"):
+            old.unlink()
+        _seed(tmp_path, sid, status="active", role="dev", task_id="T-1",
+              pane_id=pane)
+        out = R.recovery_tick(cfg)
+        actions.append(out["acted"][0][0] if out["acted"] else None)
+
+    assert actions[:2] == ["respawn", "respawn"], actions
+    assert actions[2:] == ["park", "park"], (
+        "a new sid reset the count and the crash loop respawned forever")
+    assert len(spawns) == 2
+    assert len(parked) == 2 and "respawn bound 2 reached" in parked[0][1]
+
+
+def test_respawn_bound_decays_so_it_is_a_rate_not_a_life_sentence(monkeypatch, tmp_path):
+    """A lineage-keyed count would otherwise be permanent: a task that burned
+    its respawns once could never be recovered again. Attempts older than
+    `BOT_SQUAD_RESPAWN_WINDOW_SEC` stop counting."""
+    monkeypatch.setenv("BOT_SQUAD_RESPAWN_WINDOW_SEC", "3600")
+    now = 1_000_000.0
+    state = {"p1|task:T-1": {"count": 5, "at": now - 60}}
+    assert R._attempts(state, "p1|task:T-1", now) == 5
+    assert R._attempts(state, "p1|task:T-1", now + 7200) == 0
+    # a pre-T-0948 bare int (a state file written by a running worker) is read,
+    # not silently decayed away
+    assert R._attempts({"S-old": 2}, "S-old", now) == 2
+    # ...and the file does not grow without bound
+    old = {"p1|task:T-9": {"count": 1, "at": now - 3600 * 100}}
+    assert R._prune_state(dict(old), now) == {}
+    assert R._prune_state({"p1|task:T-8": {"count": 1, "at": now}}, now)

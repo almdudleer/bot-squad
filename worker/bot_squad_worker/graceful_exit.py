@@ -148,11 +148,35 @@ def work_done(role: str, task_id: Any, task_status: str, pending_backlog: int,
 def count_pending_initiative_tasks(cfg: Any, slug: str, initiative: Any) -> int:
     """T-0930: the task-less TL's "nothing open" done-signal — the
     initiative-scoped analogue of ``operator_redrive.count_pending_backlog``'s
-    project-wide count. Same terminal-status criterion (``closed`` only — a
-    ``totest`` task is still the TL's to review/close, same reasoning
-    ``operator_redrive`` already uses for the operator's own empty-backlog
-    signal)."""
+    project-wide count.
+
+    T-0948 REPLACED the criterion. It used to be ``closed``-only, on the
+    T-0930-era rationale that "a ``totest`` task is still the TL's to review/
+    close". T-0944 invalidated that: ``totest`` is the HUMAN's queue and
+    ``to_accept`` is the OPERATOR's, and the T-0945 pass that taught
+    ``recovery.DONE_STATUSES`` about both left this counter behind — so a
+    task-BOUND TL on those statuses exited while a task-LESS one on the same
+    statuses did not.
+
+    The consequence was not cosmetic. ``idle_timeout.worker_tasks_alive``
+    imports this counter as the task-less TL's alive-signal, so a TL that
+    delivered every subtask into ``to_accept``/``totest`` on a Friday stayed
+    "alive" all weekend: nudged «продолжай» every 40 min (~36 full model turns
+    a day, its cache kept permanently warm because 40 min < the 55 min
+    deadline), unable to exit because ``work_done`` reads this same count, and
+    unable to take the escape the nudge named because ``to_accept ->
+    blocked_on_user`` is not an edge in the transition graph. Only a person
+    could zero the count, and the count is what was paying for the wait.
+
+    The criterion is now :func:`task_states.demands_coordinator` — delivered
+    (``to_accept``/``totest``/``closed``), waiting on the human
+    (``blocked_on_user``) and parked (``paused``) tickets are not the TL's to
+    drive. ``planned`` deliberately still counts: queueing and dispatching an
+    unstarted subtask IS the coordination work, which is why this predicate is
+    not the same one ``task_alive`` uses for a BOUND ticket.
+    """
     from bot_squad_worker import frontmatter as _fm
+    from bot_squad_worker import task_states
     from bot_squad_worker.actions import normalize_id
 
     target = normalize_id(str(initiative or "").strip())
@@ -176,7 +200,8 @@ def count_pending_initiative_tasks(cfg: Any, slug: str, initiative: Any) -> int:
             continue
         if str(meta.get("archived", "")).strip().lower() in ("true", "yes", "1", "on"):
             continue
-        if str(meta.get("status", "")).strip().lower() == "closed":
+        if not task_states.demands_coordinator(
+                str(meta.get("status", "")).strip().lower()):
             continue
         n += 1
     return n

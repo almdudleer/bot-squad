@@ -229,7 +229,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from bot_squad_worker import autocompact, lifecycle_events, recovery, recycle_gate, sessions
+from bot_squad_worker import (autocompact, lifecycle_events, recovery, recycle_gate,
+                              sessions, task_states)
 
 log = logging.getLogger(__name__)
 
@@ -413,6 +414,69 @@ def dev_nudge_sec() -> int:
     return DEFAULT_DEV_NUDGE_SEC
 
 
+# --- T-0948: the nudge ESCALATION CAP ---------------------------------------
+#
+# The nudge had a cadence and no end. `_maybe_worker_nudge`'s own docstring
+# said "it never terminates": while the bound task stayed non-terminal the plan
+# was NUDGE, `handoff_exit` was unreachable, and every reply reset the idle
+# clock — so a dev that had hit a wall it could not solve was woken ~12 times
+# an hour, at full context, for as long as nobody noticed. Nothing anywhere
+# concluded "N nudges produced no progress, stop paying".
+#
+# The cap is deliberately NOT "keep nudging, quieter" — a slower forever is the
+# same defect with a smaller constant. At the cap the plan flips to
+# `handoff_exit`: the session writes its forward-state into the ticket's
+# `## Context` and TERMINATES, and its owner (a dev's team-lead, a TL's
+# operator) is paged once with the count. The ticket keeps its status, so the
+# work is re-drivable from the artifact by a fresh, cold, cheap incarnation —
+# which is the whole continuity model — instead of by a warm one that has
+# been unable to move for an hour.
+DEFAULT_WORKER_NUDGE_MAX = 6
+
+
+def worker_nudge_max() -> int:
+    """Consecutive no-progress nudges before the session is handed off and
+    exited instead of nudged again. ``BOT_SQUAD_WORKER_NUDGE_MAX``; ``0``
+    disables the cap (restoring the pre-T-0948 "nudge forever" behaviour, for
+    an operator who deliberately wants it).
+
+    6 at the dev's 5-min cadence is ~30 min of being told «продолжай» with
+    nothing reported on the ticket in between; at the TL's 40-min cadence it is
+    ~4h. Both are long enough that a session doing real quiet work is not cut
+    off, and short enough that the 250-330 turns/day figure cannot recur.
+    """
+    raw = os.environ.get("BOT_SQUAD_WORKER_NUDGE_MAX")
+    if raw is not None and raw.strip() != "":
+        try:
+            v = int(raw)
+            if v >= 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_WORKER_NUDGE_MAX
+
+
+def worker_nudge_capped(meta: dict | None, role: str | None) -> bool:
+    """Pure predicate: has this session's no-progress nudge streak hit the cap?
+
+    The streak lives on the session md as ``dev_nudge_streak`` and is RESET by
+    :func:`_reset_streak_if_progressed` whenever the bound ticket is touched
+    between nudges — so it counts consecutive nudges that produced nothing
+    reportable, not nudges in total. A session that files a progress note (the
+    thing drift enforcement already asks of it) never approaches the cap.
+    """
+    if (role or "") not in WORKER_ROLES:
+        return False
+    cap = worker_nudge_max()
+    if cap <= 0:
+        return False
+    try:
+        streak = int((meta or {}).get("dev_nudge_streak") or 0)
+    except (TypeError, ValueError):
+        return False
+    return streak >= cap
+
+
 # --- T-0945: the per-role recycle PLAN (the "четкие критерии") --------------
 #
 # Four plans, and the only one that spends a native /compact is the one where a
@@ -495,23 +559,43 @@ def bound_task_ids(row: dict | None, meta: dict | None) -> list[str]:
 
 
 def task_alive(cfg: Any, slug: str, task_id: str | None) -> bool:
-    """True when ``task_id`` is neither DONE nor WAITING — the "стоит, а задача
-    не выполнена" condition that keeps its session alive.
+    """True when ``task_id`` is still work THIS session can move — the "стоит, а
+    задача не выполнена" condition that keeps its session alive.
 
     An unreadable/absent task is NOT alive: there is nothing for a "продолжай"
-    nudge to point at. Reads :func:`recovery.read_task_status` and
-    ``recovery.DONE_STATUSES``/``WAITING_STATUSES`` — the same reader and the
-    same sets :mod:`graceful_exit` uses — rather than a third local copy.
-    A WAITING (``blocked_on_user``) task is deliberately NOT alive here: that
-    is what lets its session fall through to the terminate path and be revived
-    by ``wait_resume.tick`` when the block lifts, instead of being nudged at a
-    stakeholder who has not answered yet (T-0930)."""
+    nudge to point at. The status reader is :func:`recovery.read_task_status`;
+    the CRITERION is :func:`task_states.demands_own_session`, the one
+    definition the recycle path, the respawn path and budding all read.
+
+    A WAITING (``blocked_on_user``) task is deliberately NOT alive: that is
+    what lets its session fall through to the terminate path and be revived by
+    ``wait_resume.tick`` when the block lifts, instead of being nudged at a
+    stakeholder who has not answered yet (T-0930).
+
+    T-0948 — ``paused`` is NOT alive either, and that is the defect the ticket
+    was filed for. The criterion used to be spelled out here as "not DONE and
+    not WAITING", which made every OTHER status alive by omission — including
+    the one ``task_states.PARKED_STATES`` defines as "no session is or should
+    be engaged". A dev whose ticket an operator paused to deprioritise it was
+    nudged «продолжай» every five minutes indefinitely, urging it to continue
+    work the system's own taxonomy says must not be worked, and the escape the
+    nudge named (``blocked_on_user``) is not an edge out of ``paused``. Now the
+    plan for such a session is ``handoff_exit``: it writes its forward-state
+    into the ticket's ``## Context`` and stops costing money, which is what
+    parking a ticket was supposed to mean.
+
+    ``planned`` deliberately stays ALIVE, even though it too is in
+    ``PARKED_STATES`` — for a ticket that already has a session bound, the
+    binding is the queueing act and the label is merely stale. See the comment
+    on ``task_states.NO_OWN_SESSION_STATES``: excluding it would have exited
+    four of the seven live devs on this fleet.
+    """
     if not task_id:
         return False
     status = recovery.read_task_status(cfg, slug, task_id)
     if not status:
         return False
-    return status not in recovery.DONE_STATUSES and status not in recovery.WAITING_STATUSES
+    return task_states.demands_own_session(status)
 
 
 def worker_tasks_alive(cfg: Any, slug: str, task_ids: list[str], *,
@@ -540,7 +624,8 @@ def worker_tasks_alive(cfg: Any, slug: str, task_ids: list[str], *,
 
 
 def recycle_plan(*, role: str | None, window: str | None, meta: dict | None,
-                 attached: bool, tasks_alive: bool) -> str:
+                 attached: bool, tasks_alive: bool,
+                 nudge_capped: bool = False) -> str:
     """THE per-role criterion (T-0945). Pure — no I/O, no clock — so the policy
     can be read and tested as a table rather than traced through the executor.
 
@@ -567,9 +652,17 @@ def recycle_plan(*, role: str | None, window: str | None, meta: dict | None,
        ролью оператор должна драйвиться дальше, а не умирать по таймауту»);
        drive off ⇒ the user-conversation plan, «то же самое».
     5. **dev / team-lead** — alive work ⇒ ``nudge``; nothing alive ⇒
-       ``handoff_exit``.
+       ``handoff_exit``. T-0948: alive work whose nudges have hit the
+       escalation cap (``nudge_capped``) ⇒ ``handoff_exit`` too — see
+       :func:`worker_nudge_max`. This is the one place the "nudge forever"
+       loop is broken, and it is broken by a real terminal action rather than
+       by a longer cadence.
     6. anything else ⇒ ``handoff_exit`` (the pre-T-0945 default for every
        non-exempt session, unchanged).
+
+    ``nudge_capped`` is an INPUT, not a lookup, for the same reason
+    ``attached`` is: this function stays pure, so the whole policy — including
+    the escalation — is a table a test can enumerate.
     """
     r = (role or "").strip()
     if attached:
@@ -584,7 +677,9 @@ def recycle_plan(*, role: str | None, window: str | None, meta: dict | None,
             return PLAN_NUDGE
         return PLAN_COMPACT_EXIT if uc_exit_sec() > 0 else PLAN_HANDOFF_EXIT
     if r in WORKER_ROLES:
-        return PLAN_NUDGE if tasks_alive else PLAN_HANDOFF_EXIT
+        if not tasks_alive:
+            return PLAN_HANDOFF_EXIT
+        return PLAN_HANDOFF_EXIT if nudge_capped else PLAN_NUDGE
     return PLAN_HANDOFF_EXIT
 
 
@@ -840,8 +935,25 @@ def _maybe_recycle_leased(cfg: Any, slug: str, sid: str, row: dict, md_path,
         tasks_alive = worker_tasks_alive(
             cfg, slug, bound_task_ids(row, meta), role=role,
             initiative=(row.get("initiative") or meta.get("initiative")))
+    # T-0948: the streak is re-checked against the ticket BEFORE the plan is
+    # taken, so a session that reported progress since its last nudge has its
+    # streak cleared and is never escalated on a stale count.
+    _reset_streak_if_progressed(cfg, slug, row, meta, role=role)
+    nudge_capped = worker_nudge_capped(meta, role)
     plan = recycle_plan(role=role, window=window, meta=meta, attached=attached,
-                        tasks_alive=tasks_alive)
+                        tasks_alive=tasks_alive, nudge_capped=nudge_capped)
+    if (plan == PLAN_HANDOFF_EXIT and nudge_capped and tasks_alive
+            and idle_due(_idle_age(row, meta, user_home, now),
+                         worker_nudge_sec(role))):
+        # Page the owner ONCE, at the moment the cap converts the nudge loop
+        # into an exit — "N nudges produced no progress" is the fact nobody was
+        # ever told before, and an exit nobody hears about is a silent give-up.
+        #
+        # Gated on the same idle condition the nudge itself uses, so the page
+        # means "nudge N+1 was due right now and we are stopping instead" — a
+        # session that has gone back to work is not paged for a stale count it
+        # will clear the moment it reports.
+        _escalate_nudge_cap(cfg, slug, sid, row, meta, md_path, role=role)
 
     # An in-flight compact-and-stay finalizes first whatever the plan says now:
     # a `/compact` has already been sent and abandoning the wait would let the
@@ -1776,29 +1888,237 @@ def _maybe_keepalive_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
 # is left here is only the cadence and the injection.
 
 
-def _worker_nudge_text(role: str | None) -> str:
+def _escape_hint(task_id: str | None, status: str | None) -> str:
+    """The «how do I stop this» half of the nudge, naming a transition the
+    write boundary will actually ACCEPT.
+
+    T-0948: the old text told every session to «set the ticket to
+    blocked_on_user». `task_states.TRANSITIONS` has that edge only from
+    `in_progress` — from `open`, `reopened` and `paused` it does not exist, so
+    the one escape the system offered a stuck session was refused by the very
+    validator it was told to call. The path is now read off the graph, so it
+    cannot drift from it again.
+    """
+    tid = task_id or "<id>"
+    path = task_states.legal_block_escape(status)
+    if not path:
+        return (f" If you cannot move {tid} yourself, say so on the ticket "
+                f"(`bsq ticket note {tid} <why>`) and tell your team-lead "
+                f"(`bsq peer send <TL-SID> ...`) — do not sit.")
+    if len(path) == 1:
+        return (f" If you are genuinely blocked on the stakeholder, "
+                f"`bsq ticket update {tid} blocked_on_user` — that stops this "
+                f"nudge and lets the system handle the wait properly.")
+    return (f" If you are genuinely blocked on the stakeholder, "
+            f"blocked_on_user is not a legal move from {status!r}: go "
+            f"`bsq ticket update {tid} {path[0]}` first, then "
+            f"`bsq ticket update {tid} blocked_on_user`. That stops this nudge "
+            f"and lets the system handle the wait properly.")
+
+
+def _worker_nudge_text(role: str | None, *, task_id: str | None = None,
+                       status: str | None = None, streak: int = 0,
+                       cap: int = 0) -> str:
     base = ("continue — продолжай. Your ~1h cache window is idling toward "
             "expiry and the system is nudging you instead of recycling you, "
             "because you still hold live work.")
-    if (role or "") == "teamlead":
+    # T-0948: the cap is stated IN the nudge. A session about to be handed off
+    # and exited should learn that from the nudge, not from the exit — and the
+    # cheapest way out is the one drift enforcement already asks for, so name
+    # it.
+    if cap > 0:
+        left = max(0, cap - (streak + 1))
+        base += (f" This is nudge {streak + 1} of {cap} with nothing reported "
+                 f"on the ticket in between; after {left} more the system "
+                 f"stops nudging, has you write `## Context` and exits you, "
+                 f"and pages your owner. A `bsq ticket note` resets that "
+                 f"count.")
+    if (role or "") in COORDINATOR_ROLES:
         return base + (
-            " At least one task in your scope is still open (not to_accept/"
-            "totest/closed/blocked_on_user). If you are waiting on a dev, "
-            "check its state (`bsq team status`) rather than sitting; if the "
-            "wait is on the stakeholder, move the ticket to blocked_on_user "
-            "— that stops this nudge and lets the system handle the wait "
-            "properly.")
-    return base + (
-        " Your bound task is not yet in to_accept/totest/closed. If you are "
-        "genuinely blocked on the stakeholder, set the task to "
-        "blocked_on_user instead of sitting idle (`bsq ticket update <id> "
-        "blocked_on_user`) — that stops this nudge and lets the system "
-        "handle the wait properly.")
+            " At least one task in your initiative is still yours to drive "
+            "(not to_accept/totest/closed/blocked_on_user/paused — those are "
+            "the operator's, the human's, or parked). If a subtask has no dev "
+            "on it, dispatch one; if you are waiting on a dev, check its state "
+            "(`bsq team status`) rather than sitting; if the work should stop "
+            "for now, park it (`bsq ticket update <id> paused`) — that is a "
+            "legal move from in_progress and it stops this nudge.")
+    return (base + " Your bound task is not yet delivered (to_accept/totest/"
+            "closed), not paused, and not waiting (blocked_on_user)."
+            + _escape_hint(task_id, status))
 
 
 def _send_dev_nudge(sid: str, text: str) -> None:
     from bot_squad_worker.actions import _action_inject_input
     _action_inject_input({"sid": sid, "text": text})
+
+
+# --- T-0948: the no-progress streak ----------------------------------------
+#
+# Three flat scalar md fields, for the same reason the recycle machine's are
+# flat: the line-based `session_start.sh` reader cannot hold a nested mapping.
+# They are completed-FACT stamps rather than in-flight state, so (like
+# `dev_nudge_last_at`, whose shape they follow) they are deliberately NOT in
+# `_RECYCLE_FIELDS` and survive every hook fire.
+_NUDGE_STREAK_FIELDS = ("dev_nudge_streak", "dev_nudge_streak_at",
+                        "dev_nudge_escalated_at")
+
+
+def _bound_ticket_touch(cfg: Any, slug: str, task_ids: list[str]) -> float | None:
+    """Newest "someone wrote on one of these tickets" epoch, or None.
+
+    Reads `drift._ticket_last_touch` — the frontmatter ``updated:`` and the last
+    ``## Progress`` note — rather than a fourth local parser, so "reported
+    progress" means the same thing to the nudge cap as it does to drift
+    enforcement. That matters: the cap's escape is the note drift already
+    demands, so the two instruments cannot disagree about whether a session is
+    reporting.
+    """
+    from bot_squad_worker import drift as _drift
+    from bot_squad_worker import frontmatter as _fm
+    backlog = cfg.data_dir / slug / "backlog"
+    if not backlog.is_dir():
+        return None
+    best: float | None = None
+    for tid in task_ids:
+        path = _fm.resolve_id_file(backlog, tid)
+        if path is None:
+            continue
+        t = _drift._ticket_last_touch(path)
+        if t is not None and (best is None or t > best):
+            best = t
+    return best
+
+
+def _initiative_touch(cfg: Any, slug: str, initiative: Any) -> float | None:
+    """Newest touch across every ticket in ``initiative`` — the task-less TL's
+    analogue of :func:`_bound_ticket_touch`.
+
+    Deliberately counts a touch on ANY of the initiative's tickets, including
+    ones a dev wrote: a TL's progress IS its devs moving, so a note landing on
+    a subtask is the coordinator working, even though the TL typed none of it.
+    """
+    from bot_squad_worker import drift as _drift
+    from bot_squad_worker import frontmatter as _fm
+    from bot_squad_worker.actions import normalize_id
+    target = normalize_id(str(initiative or "").strip())
+    if not target or target == "~":
+        return None
+    backlog = cfg.data_dir / slug / "backlog"
+    if not backlog.is_dir():
+        return None
+    best: float | None = None
+    for md in sorted(backlog.glob("*.md")):
+        try:
+            parsed = _fm.parse_or_none(md.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if not parsed:
+            continue
+        fm_meta = parsed[0] or {}
+        if normalize_id(str(fm_meta.get("initiative") or "").strip()) != target:
+            continue
+        t = _drift._ticket_last_touch(md)
+        if t is not None and (best is None or t > best):
+            best = t
+    return best
+
+
+def _reset_streak_if_progressed(cfg: Any, slug: str, row: dict, meta: dict,
+                                *, role: str | None) -> bool:
+    """Clear the no-progress streak when one of the session's tickets has been
+    touched since the streak started. Returns True when it cleared something.
+
+    The streak has to measure CONSECUTIVE nudges that produced nothing, not
+    nudges in total — otherwise a healthy dev that works, pauses, works again
+    accumulates a count across a whole day and is eventually exited for being
+    productive. Anchored on the streak's FIRST nudge (``dev_nudge_streak_at``),
+    so any report during the streak resets the whole thing.
+    """
+    if (role or "") not in WORKER_ROLES:
+        return False
+    if not meta.get("dev_nudge_streak") and not meta.get("dev_nudge_streak_at"):
+        return False
+    started = sessions._parse_ts_epoch(meta.get("dev_nudge_streak_at"))
+    if started is None:
+        # A streak with no anchor cannot be judged; drop it rather than let it
+        # accumulate toward an exit on an unmeasurable count.
+        for k in _NUDGE_STREAK_FIELDS:
+            meta.pop(k, None)
+        return True
+    task_ids = bound_task_ids(row, meta)
+    if task_ids:
+        touched = _bound_ticket_touch(cfg, slug, task_ids)
+    else:
+        # A task-less TL has no bound ticket to touch, so a bound-only check
+        # could never reset its streak — the cap would degrade into a plain
+        # 4h timer that exits every coordinator regardless of whether it is
+        # productively dispatching devs. Its work is the INITIATIVE, so that
+        # is what has to show a sign of life. Same shape as
+        # `worker_tasks_alive`, which reads the initiative for exactly this
+        # session shape.
+        touched = _initiative_touch(
+            cfg, slug, row.get("initiative") or meta.get("initiative"))
+    if touched is None or touched <= started:
+        return False
+    for k in _NUDGE_STREAK_FIELDS:
+        meta.pop(k, None)
+    return True
+
+
+def _escalate_nudge_cap(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
+                        md_path, *, role: str | None) -> None:
+    """Page the session's OWNER once, at the moment the cap turns the nudge
+    loop into an exit.
+
+    "Stop paying" without telling anyone is a silent give-up: the session
+    disappears and the ticket sits in_progress with nobody informed that N
+    wake-ups produced nothing. A dev's owner is its team-lead (the T-0034
+    idle-vs-page routing — a quiet stuck dev is the TL's to unblock, never the
+    stakeholder's); a TL's owner is the operator.
+    """
+    if meta.get("dev_nudge_escalated_at"):
+        return
+    cap = worker_nudge_max()
+    task_ids = bound_task_ids(row, meta)
+    target = (meta.get("parent_sid") or "").strip()
+    if not target or target == "~":
+        target = "operator" if (role or "") in COORDINATOR_ROLES else "teamlead"
+    what = ", ".join(task_ids) if task_ids else (
+        str(row.get("initiative") or meta.get("initiative") or "its scope"))
+    text = (f"⚠️ nudge cap reached for {sid} ({role or 'worker'}) on {what}: "
+            f"{cap} consecutive «продолжай» nudges produced no progress note "
+            f"on the ticket. The system has stopped nudging — the session is "
+            f"being handed off (its forward-state goes to `## Context`) and "
+            f"exited, so it stops burning a warm window. Nothing is closed: "
+            f"re-drive it from the ticket when it is unblocked, or find out "
+            f"what it is stuck on.")
+    try:
+        from bot_squad_worker import intersession as _inter
+        # The user scope for a role fan-out is parsed from `from_sid`, and
+        # "S-idle-timeout" is not a session — pass the STUCK session's own
+        # linux user explicitly so a multi-user project pages ITS team-lead
+        # rather than nobody.
+        scope = _inter._linux_user_from_sid(sid) or None
+        out = _inter.send(cfg, slug, to=target, text=text,
+                          from_sid="S-idle-timeout", user=scope)
+        if not (out or {}).get("delivered_to") and target != "operator":
+            # No live TL to hear it. An escalation nobody receives is the
+            # silent give-up this exists to prevent, so fall back to the
+            # "needs a human look" target `recovery._do_park` already uses.
+            _inter.send(cfg, slug, to="operator", text=text,
+                        from_sid="S-idle-timeout")
+    except Exception:
+        log.exception("idle_timeout: nudge-cap escalation notify failed for %s", sid)
+    meta["dev_nudge_escalated_at"] = _now_iso()
+    try:
+        sessions._write_session_metadata(md_path, meta, atomic=True)
+    except OSError:
+        log.exception("idle_timeout: could not stamp nudge-cap escalation for %s", sid)
+    lifecycle_events.emit(cfg, slug, sid, lifecycle_events.SESSION_TIMEOUT,
+                          reason="worker_nudge_cap_reached")
+    log.warning("idle_timeout: %s hit the worker-nudge cap (%d no-progress "
+                "nudges) — escalating to %s and handing off instead of nudging "
+                "again", sid, cap, target)
 
 
 def _maybe_worker_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
@@ -1810,7 +2130,14 @@ def _maybe_worker_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
     never terminates. ``dev_nudge_last_at`` bounds it to at most once per
     cadence window, mirroring :func:`keepalive_due`; the field keeps its
     T-0930 name (it is a per-session stamp, and renaming it would strand the
-    guard on every live session md mid-flight)."""
+    guard on every live session md mid-flight).
+
+    T-0948: it no longer "never terminates". Each delivered nudge increments
+    ``dev_nudge_streak``; at :func:`worker_nudge_max` the plan taken one level
+    up flips to ``handoff_exit`` and the owner is paged, so this function stops
+    being reached. The streak is cleared by
+    :func:`_reset_streak_if_progressed` the moment the session reports on its
+    ticket."""
     cadence = worker_nudge_sec(role)
     idle_age = _idle_age(row, meta, user_home, now)
     if not idle_due(idle_age, cadence):
@@ -1828,13 +2155,32 @@ def _maybe_worker_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
             slug=slug):
         return False
 
+    # T-0948: name the bound ticket's REAL status so the escape the text
+    # recommends is an edge the write boundary accepts, and state the cap.
+    task_ids = bound_task_ids(row, meta)
+    primary = task_ids[0] if task_ids else None
+    status = recovery.read_task_status(cfg, slug, primary) if primary else ""
     try:
-        _send_dev_nudge(sid, _worker_nudge_text(role))
+        streak = int(meta.get("dev_nudge_streak") or 0)
+    except (TypeError, ValueError):
+        streak = 0
+    try:
+        _send_dev_nudge(sid, _worker_nudge_text(
+            role, task_id=primary, status=status, streak=streak,
+            cap=worker_nudge_max()))
     except Exception:
         log.exception("idle_timeout: worker nudge send failed for %s "
                       "(will retry)", sid)
         return False
     meta["dev_nudge_last_at"] = _now_iso()
+    # The streak counts nudges that were actually DELIVERED. A deferred nudge
+    # (tracked long job, busy composer, cadence not due) must never push a
+    # session toward an exit it was never told about — every increment here has
+    # a matching «продолжай» in the pane, and the reset half lives in
+    # :func:`_reset_streak_if_progressed`.
+    meta["dev_nudge_streak"] = streak + 1
+    if not meta.get("dev_nudge_streak_at"):
+        meta["dev_nudge_streak_at"] = meta["dev_nudge_last_at"]
     sessions._write_session_metadata(md_path, meta, atomic=True)
     lifecycle_events.emit(cfg, slug, sid, lifecycle_events.SESSION_TIMEOUT,
                           now=now, reason="idle_window_dev_nudge")

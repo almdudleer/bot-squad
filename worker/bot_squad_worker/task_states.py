@@ -118,3 +118,133 @@ ACTIVE_STATES: frozenset[str] = frozenset(TICKET_STATUSES) - PARKED_STATES
 
 def is_parked(status: str) -> bool:
     return status in PARKED_STATES
+
+
+# --- T-0948: the session-lifecycle predicates -------------------------------
+#
+# `PARKED_STATES` above answers "is this ORCHESTRATION LOAD" (budding's spawn
+# triggers). The two predicates below answer the two DIFFERENT questions the
+# recycle/nudge/respawn path asks, and they live here — beside the graph whose
+# edges they have to stay consistent with — rather than as a third and fourth
+# local copy in `idle_timeout` / `recovery` / `graceful_exit`.
+#
+# The T-0948 defect was exactly that drift: `idle_timeout.task_alive` derived
+# "alive" as `not DONE and not WAITING`, so every OTHER status read as live
+# work BY OMISSION — `paused` among them, which this module's own
+# `PARKED_STATES` defines as "no session is or should be engaged". A dev on a
+# ticket an operator had deliberately paused was therefore nudged «продолжай»
+# every five minutes forever, and the escape the nudge named
+# (`blocked_on_user`) is not even an edge out of `paused` in TRANSITIONS above.
+#
+# `to_accept`/`totest`/`closed` are DELIVERED (someone else's queue since
+# T-0944), `blocked_on_user` WAITS on the human, `paused` was STOPPED on
+# purpose. None of them is work a bound session can move.
+#
+# `planned` is deliberately NOT in this set, though :data:`PARKED_STATES` above
+# does contain it — and the difference is not an inconsistency, it is the two
+# sets answering their two different questions.
+#
+# `PARKED_STATES` is asked by budding: "should I SPAWN a session for this?" A
+# `planned` ticket with nothing bound to it is not orchestration load, so no.
+# This set is asked about a ticket that ALREADY HAS a session bound to it, and
+# there the binding IS the queueing act — `planned` then means only that
+# nobody updated the label, not that the work was stood down.
+#
+# That distinction is load-bearing rather than theoretical. Measured on the
+# live fleet 2026-09-06 while building this fix: FOUR of the seven live
+# task-bound dev sessions were on `planned` tickets (T-0942, T-0948, T-0949,
+# T-0959 — this very ticket among them). Treating `planned` as "no session
+# should be engaged" would have marked most of the working fleet as holding no
+# live work and handed off and exited them on the next tick — a fleet-wide dev
+# wipe wearing the costume of a token-economy fix, which is precisely the
+# class of defect T-0948 exists to remove.
+#
+# And the REASON they sat there is the part worth keeping, because the obvious
+# reading of it ("devs forget to update the label") was measured and is wrong.
+# Those sessions TRIED: `planned -> in_progress` is refused unless the ticket
+# carries a real `## Verbatim request`, and they had been dispatched with the
+# `task_new` placeholder still in it. That guard is correct and stays (T-0483).
+# So a status label can be pinned by a control that knows nothing about whether
+# work is happening — which is the general reason a liveness predicate must not
+# be derived from the board label alone. See T-0973, and `dispatch`/
+# `session_history_ts`, which already records when a session was bound and
+# answers "is anything working this ticket" without consulting status at all.
+#
+# `paused` differs in kind and stays: it is an explicit human decision to STOP,
+# taken about a ticket that usually DOES have a session on it, and overriding
+# that decision every five minutes is the defect itself.
+NO_OWN_SESSION_STATES: frozenset[str] = frozenset({
+    "to_accept", "totest", "closed",     # delivered — the operator's/human's
+    "blocked_on_user",                   # waiting on the human
+    "paused",                            # stopped on purpose, by a person
+})
+
+# The COORDINATOR's question is a THIRD one: a task-less team-lead is bound to
+# an INITIATIVE, and this set says which of that initiative's tickets are still
+# its to drive. Delivered work is the operator's or the human's, a blocked
+# ticket waits on the human, and a paused ticket was deprioritised on purpose —
+# a TL cannot move any of them. `planned` counts: queueing and dispatching an
+# unstarted subtask IS the coordination job.
+#
+# That makes it EQUAL to NO_OWN_SESSION_STATES as both sets stand today, and it
+# is still a separate name on purpose. The two answer different questions about
+# different things — one about a ticket a session is bound to, one about a
+# ticket in an initiative a TL coordinates — and they have already diverged
+# once: this counter sat on `closed`-only for the whole stretch T-0944 was
+# redefining what `totest` and `to_accept` mean, which is half of what T-0948
+# had to repair. Collapsing them to one name would make the next such
+# divergence invisible instead of impossible.
+NO_COORDINATOR_WORK_STATES: frozenset[str] = frozenset({
+    "to_accept", "totest", "closed", "blocked_on_user", "paused",
+})
+
+
+def demands_own_session(status: str | None) -> bool:
+    """True when a session BOUND to this ticket still has work it can move.
+
+    The alive-signal behind `idle_timeout.task_alive` (keep nudging / keep the
+    session) and `recovery` (respawn a crashed one). An unknown/absent status
+    is NOT work: there is nothing for a "продолжай" to point at.
+
+    Note this is NOT `not is_parked(status)` — see the comment on
+    :data:`NO_OWN_SESSION_STATES` for why `planned` parts company with
+    `PARKED_STATES` here, and what it cost to find out.
+    """
+    st = (status or "").strip().lower()
+    if not st:
+        return False
+    return st not in NO_OWN_SESSION_STATES
+
+
+def demands_coordinator(status: str | None) -> bool:
+    """True when this ticket is still a task-less team-lead's to drive.
+
+    The per-ticket half of `graceful_exit.count_pending_initiative_tasks`.
+    """
+    st = (status or "").strip().lower()
+    if not st:
+        return False
+    return st not in NO_COORDINATOR_WORK_STATES
+
+
+def legal_block_escape(status: str | None) -> tuple[str, ...]:
+    """The transitions that actually EXIST out of ``status`` toward "stop
+    driving me" — read off :data:`TRANSITIONS` rather than asserted in prose.
+
+    T-0948: the worker nudge told every session to «set the ticket to
+    blocked_on_user» to stop the nudges. From `in_progress` that is a real
+    edge; from `open`, `reopened`, `paused`, `to_accept` and `totest` it is
+    not, so the one escape the system offered a stuck session was a transition
+    the write boundary refuses. Returning the real path (possibly two hops)
+    keeps the nudge text honest by construction — if an edge is amended above,
+    the text follows.
+    """
+    st = (status or "").strip().lower()
+    if st not in TRANSITIONS:
+        return ()
+    if "blocked_on_user" in TRANSITIONS[st]:
+        return ("blocked_on_user",)
+    for mid in sorted(TRANSITIONS[st]):
+        if "blocked_on_user" in TRANSITIONS.get(mid, frozenset()):
+            return (mid, "blocked_on_user")
+    return ()

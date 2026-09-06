@@ -114,7 +114,7 @@ def test_count_pending_initiative_tasks(tmp_path):
     (backlog / "T-0001-a.md").write_text(
         "---\nid: T-0001\ntitle: A\nstatus: open\ninitiative: my-init.md\n---\n\nx\n")
     (backlog / "T-0002-b.md").write_text(
-        "---\nid: T-0002\ntitle: B\nstatus: totest\ninitiative: my-init\n---\n\nx\n")
+        "---\nid: T-0002\ntitle: B\nstatus: in_progress\ninitiative: my-init\n---\n\nx\n")
     (backlog / "T-0003-c.md").write_text(
         "---\nid: T-0003\ntitle: C\nstatus: closed\ninitiative: my-init.md\n---\n\nx\n")
     (backlog / "T-0004-d.md").write_text(
@@ -122,10 +122,32 @@ def test_count_pending_initiative_tasks(tmp_path):
     (backlog / "T-0005-e.md").write_text(
         "---\nid: T-0005\ntitle: E\nstatus: open\ninitiative: my-init.md\n"
         "archived: true\n---\n\nx\n")
-    # T-0001 (open) and T-0002 (totest, bare-stem match) count; T-0003
-    # (closed), T-0004 (other initiative), T-0005 (archived) don't.
-    assert GE.count_pending_initiative_tasks(cfg, "bot-squad", "my-init.md") == 2
-    assert GE.count_pending_initiative_tasks(cfg, "bot-squad", "my-init") == 2
+    # T-0948: DELIVERED and PARKED subtasks are no longer the TL's pending
+    # work. This block used to count `totest` (the pin below asserted 2 with a
+    # totest ticket in the set) on the T-0930 rationale that a totest task was
+    # "still the TL's to review/close" — T-0944 made totest the HUMAN's queue
+    # and to_accept the OPERATOR's, and leaving the counter behind is what kept
+    # a task-less TL nudged «продолжай» every 40 min all weekend over work it
+    # had already delivered and could not legally move.
+    (backlog / "T-0006-f.md").write_text(
+        "---\nid: T-0006\ntitle: F\nstatus: totest\ninitiative: my-init.md\n---\n\nx\n")
+    (backlog / "T-0007-g.md").write_text(
+        "---\nid: T-0007\ntitle: G\nstatus: to_accept\ninitiative: my-init.md\n---\n\nx\n")
+    (backlog / "T-0008-h.md").write_text(
+        "---\nid: T-0008\ntitle: H\nstatus: blocked_on_user\ninitiative: my-init.md\n---\n\nx\n")
+    (backlog / "T-0009-i.md").write_text(
+        "---\nid: T-0009\ntitle: I\nstatus: paused\ninitiative: my-init.md\n---\n\nx\n")
+    # ...but `planned` DOES count: queueing and dispatching an unstarted
+    # subtask is the coordination work itself, which is why this predicate is
+    # deliberately not the same one `task_alive` uses for a BOUND ticket.
+    (backlog / "T-0010-j.md").write_text(
+        "---\nid: T-0010\ntitle: J\nstatus: planned\ninitiative: my-init.md\n---\n\nx\n")
+    # T-0001 (open), T-0002 (in_progress, bare-stem match) and T-0010 (planned)
+    # count; T-0003 (closed), T-0004 (other initiative), T-0005 (archived),
+    # T-0006 (totest), T-0007 (to_accept), T-0008 (blocked_on_user) and
+    # T-0009 (paused) don't.
+    assert GE.count_pending_initiative_tasks(cfg, "bot-squad", "my-init.md") == 3
+    assert GE.count_pending_initiative_tasks(cfg, "bot-squad", "my-init") == 3
     assert GE.count_pending_initiative_tasks(cfg, "bot-squad", "other-init") == 1
     assert GE.count_pending_initiative_tasks(cfg, "bot-squad", None) == 0
     assert GE.count_pending_initiative_tasks(cfg, "bot-squad", "~") == 0

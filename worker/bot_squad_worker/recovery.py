@@ -70,11 +70,18 @@ from pathlib import Path
 from typing import Any, Optional
 
 from bot_squad_worker import recycle_gate
+from bot_squad_worker import task_states as _task_states
 
 log = logging.getLogger(__name__)
 
 # Canonical task statuses (see reference_task_status_schema).
-ACTIVE_STATUSES = {"open", "in_progress", "reopened", "paused"}  # still needs work → recover
+# T-0948: `paused` LEFT this set. It was the same taxonomy gap as
+# `idle_timeout.task_alive`'s — `task_states.PARKED_STATES` defines `paused`
+# as "no session is or should be engaged", so respawning a crashed session
+# onto a ticket an operator deliberately parked re-creates, at full
+# fresh-context cost, exactly the session the pause was meant to stand down.
+# See PARKED_STATUSES below, which classify() now treats like WAITING.
+ACTIVE_STATUSES = {"open", "in_progress", "reopened"}  # still needs work → recover
 # T-0945 lifecycle coupling for T-0944's new `to_accept`: a dev that reaches it
 # has DELIVERED — the ticket is now the operator's to accept and `totest` is the
 # human's queue beyond that — so the deliverable exists and nothing should
@@ -90,6 +97,18 @@ DONE_STATUSES = {"to_accept", "totest", "closed"}      # deliverable exists → 
 # WAITING session's handoff+compact+exit artifact must not trigger a generic
 # dead-pane respawn — resume is T-0930's dedicated wait-state path, not this).
 WAITING_STATUSES = {"blocked_on_user"}
+# T-0948: stopped by an explicit human decision — `paused`. It is not "done",
+# so it is deliberately NOT in DONE_STATUSES; but nothing should be respawned
+# onto it, so classify() returns "none" for it exactly as it does for WAITING.
+# Derived from `task_states.NO_OWN_SESSION_STATES` rather than spelled out, so
+# the recycle path and the respawn path cannot drift apart again — that drift
+# is the defect T-0948 was filed for.
+#
+# `planned` is deliberately NOT here, though `task_states.PARKED_STATES` does
+# contain it: see the comment on NO_OWN_SESSION_STATES for why a ticket that
+# already HAS a session bound to it is a different question, and what
+# measuring the live fleet said about getting it wrong.
+PARKED_STATUSES = set(_task_states.NO_OWN_SESSION_STATES) - DONE_STATUSES - WAITING_STATUSES
 
 
 def recovery_enabled() -> bool:
@@ -109,6 +128,85 @@ def respawn_bound() -> int:
     except (TypeError, ValueError):
         return 2
     return v if v > 0 else 2
+
+
+def respawn_window_sec() -> float:
+    """T-0948: the window the respawn bound is counted OVER.
+
+    The bound used to be uncountable in practice: the counter was keyed by the
+    DEAD session's sid while every respawn mints a NEW sid, so each crashed
+    generation restarted at 0 and `park` was reachable only when a spawn call
+    itself raised twice. A deterministically-crashing session was therefore
+    respawned on every tick forever, each link the most expensive kind of turn
+    (a full fresh-context boot, zero cache reuse).
+
+    Keying the counter by LINEAGE (see :func:`lineage_key`) fixes the count but
+    would make the bound permanent — a task that burned its two respawns in
+    March could never be recovered again. So the count decays: attempts older
+    than this window no longer count, making the real rule "at most
+    ``BOT_SQUAD_RESPAWN_MAX`` respawns per lineage per window". ``<=0``
+    disables the decay (the bound becomes absolute).
+    """
+    try:
+        return float(os.environ.get("BOT_SQUAD_RESPAWN_WINDOW_SEC", 3600))
+    except (TypeError, ValueError):
+        return 3600.0
+
+
+def lineage_key(row: dict) -> str:
+    """The identity of a respawn CHAIN, stable across incarnations.
+
+    A sid is not it: `_do_respawn` spawns a successor with a brand-new sid and
+    archives the predecessor, so a sid-keyed counter counts one generation and
+    can never reach the bound. What survives the respawn is what the successor
+    is booted FROM — the bound task, or the role artifact, which
+    `assignment.role_artifact` deliberately resolves to the same file across
+    pane incarnations (T-0573) and which `_retire_dead` deliberately does not
+    reap. Both are already on the row, so no state has to be threaded through
+    `sessions.spawn`.
+
+    Falls back to the window, then the sid — the pre-T-0948 behaviour, which is
+    a lower bound on the count rather than a wrong one.
+    """
+    slug = str(row.get("slug") or "")
+    task_id = str(row.get("task_id") or "").strip()
+    if task_id and task_id != "~":
+        return f"{slug}|task:{task_id}"
+    art = str(row.get("artifact_path") or "").strip()
+    if art:
+        return f"{slug}|artifact:{art}"
+    window = str(row.get("window") or "").strip()
+    if window:
+        return f"{slug}|window:{window}"
+    return f"{slug}|sid:{row.get('sid')}"
+
+
+def _attempts(state: dict, key: str, now: float) -> int:
+    """Respawn attempts recorded for ``key`` that still count at ``now``.
+
+    Accepts both the current ``{"count": n, "at": epoch}`` shape and the
+    pre-T-0948 bare int (sid-keyed state files written by a running worker),
+    which is read as "n attempts, age unknown" and therefore never decayed
+    away silently.
+    """
+    rec = state.get(key)
+    if isinstance(rec, int):
+        return max(0, rec)
+    if not isinstance(rec, dict):
+        return 0
+    try:
+        count = int(rec.get("count", 0))
+    except (TypeError, ValueError):
+        return 0
+    window = respawn_window_sec()
+    if window > 0:
+        try:
+            at = float(rec.get("at", 0.0))
+        except (TypeError, ValueError):
+            at = 0.0
+        if at > 0 and (now - at) > window:
+            return 0
+    return max(0, count)
 
 
 def stale_cutoff_sec() -> float:
@@ -202,6 +300,12 @@ def classify(*, pane_live: bool, task_status: str, has_artifact: bool,
         return "none"  # deliverable exists → leave to stale-archive
     if task_status in WAITING_STATUSES:
         return "none"  # T-0931: blocked on the stakeholder → leave to the wait-state resume, not a generic respawn
+    if task_status in PARKED_STATUSES:
+        # T-0948: parked on purpose (`paused`). The has_artifact branch below
+        # would otherwise respawn here — a crashed session with a role artifact
+        # and a PAUSED ticket used to come straight back, which is the
+        # operator's parking decision undone by the recovery tick.
+        return "none"
     recoverable = (task_status in ACTIVE_STATUSES) or has_artifact
     if not recoverable:
         return "none"
@@ -222,6 +326,30 @@ def _load_state(cfg: Any) -> dict:
         return d if isinstance(d, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def _prune_state(state: dict, now: float) -> dict:
+    """Drop attempt records far past the decay window so the lineage-keyed
+    state file stays bounded (a sid-keyed one grew without limit and was never
+    read twice; a lineage-keyed one is read forever, which is the point, so it
+    has to be swept). Kept at 24x the window so a decayed-but-recent lineage is
+    still visible to an operator reading the file.
+    """
+    window = respawn_window_sec()
+    if window <= 0:
+        return state
+    horizon = window * 24
+    out = {}
+    for k, v in state.items():
+        if isinstance(v, dict):
+            try:
+                at = float(v.get("at", 0.0))
+            except (TypeError, ValueError):
+                at = 0.0
+            if at > 0 and (now - at) > horizon:
+                continue
+        out[k] = v
+    return out
 
 
 def _save_state(cfg: Any, state: dict) -> None:
@@ -326,7 +454,9 @@ def _nonempty(path: Path) -> bool:
 def _retire_dead(cfg: Any, slug: str, sid: str) -> None:
     """Archive the dead predecessor md so the next pass / boot does not recover
     it again. Best-effort — a failed archive must not block the re-drive (the
-    respawn bound caps any resulting churn). Reaps only the chat/telemetry
+    respawn bound caps any resulting churn; T-0948 made that true across
+    generations by keying the bound on :func:`lineage_key` rather than on the
+    dead sid, which every respawn replaces). Reaps only the chat/telemetry
     sidecars, NOT the role artifact (which the fresh incarnation still reads)."""
     from bot_squad_worker import sessions as _sessions
     try:
@@ -439,12 +569,15 @@ def boot_reconcile(cfg: Any) -> dict:
 def _run(cfg: Any, source: str = "tick", now: Optional[float] = None) -> dict:
     bound = respawn_bound()
     state = _load_state(cfg)
+    now_epoch = now if now is not None else time.time()
     acted: list = []
     for row in _gather(cfg, now):
         sid = row.get("sid")
         if not sid:
             continue
-        count = int(state.get(sid, 0))
+        # T-0948: the bound is counted over the CHAIN, not over one sid.
+        key = lineage_key(row)
+        count = _attempts(state, key, now_epoch)
         action = classify(pane_live=row["pane_live"], task_status=row["task_status"],
                           has_artifact=row.get("has_artifact", False),
                           respawn_count=count, bound=bound,
@@ -456,9 +589,16 @@ def _run(cfg: Any, source: str = "tick", now: Optional[float] = None) -> dict:
             except Exception:
                 log.exception("recovery: respawn failed for %s", sid)
                 acted.append(("respawn-failed", sid))
-            state[sid] = count + 1  # count the attempt toward the bound either way
+            # count the attempt toward the bound either way, against the
+            # lineage — the successor carries a different sid, so a per-sid
+            # stamp here would be written once and never read again.
+            state[key] = {"count": count + 1, "at": now_epoch}
         elif action == "park":
-            _do_park(cfg, row, reason=f"respawn bound {bound} reached")
+            _do_park(cfg, row, reason=(
+                f"respawn bound {bound} reached for this lineage "
+                f"({key}) — {count} respawn(s) in the last "
+                f"{int(respawn_window_sec())}s did not produce a session that "
+                f"stayed up"))
             acted.append(("park", sid))
         elif action == "archive":
             # T-0618: abandoned, not a restart casualty — defuse the fuel so
@@ -468,5 +608,5 @@ def _run(cfg: Any, source: str = "tick", now: Optional[float] = None) -> dict:
                         sid, row.get("role"))
             _retire_dead(cfg, row["slug"], sid)
             acted.append(("stale-archive", sid))
-    _save_state(cfg, state)
+    _save_state(cfg, _prune_state(state, now_epoch))
     return {"enabled": True, "source": source, "acted": acted}

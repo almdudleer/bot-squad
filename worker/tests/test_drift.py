@@ -31,7 +31,8 @@ def _setup(tmp_path: Path, *, updated_ago_min: int, activity_ago_sec: int,
            role: str = "dev", status: str = "active", task_id: str = "T-0149",
            drift_enforcement: bool = True, owner: str = "",
            session_initiative: str = "", ticket_initiative: str = "",
-           drift_paused: bool = False, ticket_status: str = "in_progress"):
+           drift_paused: bool = False, ticket_status: str = "in_progress",
+           started_ago_sec: int = 3 * 3600):
     """Build cfg + a backlog ticket + a session md, return (cfg, slug, now, ticket).
 
     drift_enforcement defaults True so the legacy fire-tests keep firing under
@@ -68,7 +69,7 @@ def _setup(tmp_path: Path, *, updated_ago_min: int, activity_ago_sec: int,
     row = {
         "sid": SID, "status": status, "role": role, "task_id": task_id,
         "activity_at": now - activity_ago_sec, "cwd": "/repo",
-        "claude_uuid": "uuid-1", "started_at": _iso(now - 3 * 3600),
+        "claude_uuid": "uuid-1", "started_at": _iso(now - started_ago_sec),
         "owner": owner, "initiative": session_initiative, "extra_initiatives": [],
     }
 
@@ -547,3 +548,84 @@ def test_index_not_built_when_nothing_is_stale(tmp_path, monkeypatch):
                         lambda c, s: calls.append(s) or {})
     drift.drift_check(cfg, slug)
     assert calls == []
+
+
+# --- T-0948: the stale clock must not out-age the session it measures -------
+
+def test_fresh_session_on_an_old_ticket_is_not_nagged(tmp_path, monkeypatch):
+    """RED when drift nags a session that has not existed long enough to be
+    stale.
+
+    Measured live on 2026-09-06: `last_touch = _ticket_last_touch or
+    started_at` let a six-day-old ticket's `updated:` win over the start of a
+    two-minute-old session, so freshly spawned lanes were told they had been
+    silent for ~8581 minutes and nagged on their first turn. Eight lanes hit
+    it; drift was switched off fleet-wide because of it. The anchor is now the
+    LATEST of the two — a session cannot have failed to report for longer than
+    it has existed.
+    """
+    cfg, slug, now, ticket, patch = _setup(
+        tmp_path, updated_ago_min=8581, activity_ago_sec=30,
+        started_ago_sec=120)
+    patch(monkeypatch)
+    monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
+    monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
+    delivered: list = []
+    monkeypatch.setattr(S, "_deliver_prompt",
+                        lambda pane, text, **_kw: delivered.append((pane, text)))
+    res = drift.drift_check(cfg, slug)
+    assert res["nudged"] == [] and delivered == [], (
+        "a two-minute-old session was nagged with the ticket's age")
+
+
+def test_old_session_on_the_same_old_ticket_is_still_nagged(tmp_path, monkeypatch):
+    """POSITIVE CONTROL for the test above — the identical ticket, the identical
+    spy, only the session's own age changed. Without this the max could have
+    been written as "never nag" and both would pass."""
+    cfg, slug, now, ticket, patch = _setup(
+        tmp_path, updated_ago_min=8581, activity_ago_sec=30,
+        started_ago_sec=8581 * 60)
+    patch(monkeypatch)
+    monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
+    monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
+    delivered: list = []
+    monkeypatch.setattr(S, "_deliver_prompt",
+                        lambda pane, text, **_kw: delivered.append((pane, text)))
+    res = drift.drift_check(cfg, slug)
+    assert len(res["nudged"]) == 1 and res["nudged"][0]["signal"] == "stale"
+    assert delivered
+
+
+def test_failed_inject_still_stamps_the_cooldown(tmp_path, monkeypatch):
+    """RED when a delivery that FAILED is re-attempted on the next tick.
+
+    `_deliver_prompt` raises when the paste never lands or the composer never
+    clears — a busy pane. The old `except: continue` skipped the cooldown
+    stamp, so a failing nudge had no rate limit at all and re-fired every tick:
+    two parked nudges two minutes apart were read out of one live pane on
+    2026-09-06. A failed nudge is the case that most needs rate-limiting.
+    """
+    cfg, slug, now, ticket, patch = _setup(tmp_path, updated_ago_min=90,
+                                           activity_ago_sec=30)
+    patch(monkeypatch)
+    monkeypatch.setenv("BOT_SQUAD_DRIFT_MINUTES", "45")
+    monkeypatch.setenv("BOT_SQUAD_DRIFT_COOLDOWN_MINUTES", "30")
+    monkeypatch.setattr(drift, "_recent_write_targets", lambda *_a, **_k: [])
+    attempts: list = []
+
+    def _boom(pane, text, **_kw):
+        attempts.append(pane)
+        raise RuntimeError("paste never appeared in the composer within 8s")
+    monkeypatch.setattr(S, "_deliver_prompt", _boom)
+
+    res = drift.drift_check(cfg, slug)
+    assert res["nudged"] == []          # nothing was actually delivered...
+    assert len(attempts) == 1
+    md = cfg.data_dir / slug / "sessions" / f"{SID}.md"
+    assert S._read_session_metadata(md).get("drift_checked_at"), (
+        "a failed inject left no cooldown — the tick will re-fire immediately")
+
+    # ...and the very next pass, inside the cooldown, does not try again.
+    res2 = drift.drift_check(cfg, slug)
+    assert res2["nudged"] == []
+    assert len(attempts) == 1, "the failed nudge was retried inside its cooldown"

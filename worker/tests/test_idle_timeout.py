@@ -1597,10 +1597,28 @@ def test_dev_drive_unmet_helper(tmp_path, seams):
     assert IT.task_alive(cfg, "bot-squad", "T-9999-missing") is False
 
 
-def test_dev_drive_unmet_false_for_done_and_waiting(tmp_path):
+def test_dev_drive_unmet_false_for_done_waiting_and_parked(tmp_path):
+    """T-0948 CHANGED the `paused` row of this table from True to False, and
+    added `planned`.
+
+    The old pin was not a decision about parked semantics — the test was named
+    "done_and_waiting" and enumerated the complement of two sets, so every
+    other status read as LIVE WORK by omission. `task_states.PARKED_STATES`
+    says the opposite about `paused`: "no session is or should be engaged". The
+    session on the wrong side of that omission was nudged «продолжай» every
+    five minutes forever, told to continue work an operator had deliberately
+    parked, and offered an escape (`blocked_on_user`) that is not an edge out
+    of `paused` in the transition graph.
+
+    `planned` stays True and that is deliberate — see
+    `test_a_dev_on_a_planned_ticket_is_still_nudged` below for the measurement
+    that decided it.
+    """
     for status, expected in (("totest", False), ("closed", False),
-                             ("blocked_on_user", False), ("open", True),
-                             ("in_progress", True), ("paused", True)):
+                             ("to_accept", False), ("blocked_on_user", False),
+                             ("paused", False),
+                             ("planned", True), ("open", True),
+                             ("in_progress", True), ("reopened", True)):
         tp = tmp_path / status
         tp.mkdir()
         cfg, data = _make_cfg(tp, sid="S-almdudleer-bot-squad-demo-p5",
@@ -1904,6 +1922,15 @@ def test_recycle_plan_table():
     assert _plan("dev", tasks_alive=False) == IT.PLAN_HANDOFF_EXIT
     assert _plan("teamlead", tasks_alive=True) == IT.PLAN_NUDGE
     assert _plan("teamlead", tasks_alive=False) == IT.PLAN_HANDOFF_EXIT
+    # T-0948: ...unless the nudges stopped producing anything. The escalation
+    # is a real terminal action, not a longer cadence.
+    assert IT.recycle_plan(role="dev", window="demo", meta={}, attached=False,
+                           tasks_alive=True, nudge_capped=True) == IT.PLAN_HANDOFF_EXIT
+    assert IT.recycle_plan(role="teamlead", window="demo", meta={}, attached=False,
+                           tasks_alive=True, nudge_capped=True) == IT.PLAN_HANDOFF_EXIT
+    # ...and the cap never overrides the human's own pane.
+    assert IT.recycle_plan(role="dev", window="demo", meta={}, attached=True,
+                           tasks_alive=True, nudge_capped=True) == IT.PLAN_STAY
     # anything unrecognised keeps the pre-T-0945 default
     assert _plan("", tasks_alive=True) == IT.PLAN_HANDOFF_EXIT
     assert _plan("some-future-role") == IT.PLAN_HANDOFF_EXIT
@@ -2262,3 +2289,298 @@ def test_prod_teamlead_initiative_branch_matches_the_plain_teamlead(tmp_path, se
     for role in ("dev", "qa"):
         assert IT.worker_tasks_alive(cfg, "bot-squad", [], role=role,
                                      initiative="I-0001") is False, role
+
+
+# --- T-0948: the nudge must NOT fire at sessions that should not be nudged --
+#
+# The stakeholder-side acceptance condition for this ticket, stated by the
+# operator dispatching it: "a nudge mechanism must have a test that goes RED
+# when it fires against a session that should not be nudged. A test proving it
+# fires correctly is not the guard here — every version of this fired correctly
+# by its own lights, including the one running this morning."
+#
+# So each guard below asserts an ABSENCE, and each one carries its own positive
+# control in the same test: the identical fixture with the one defect-bearing
+# property changed back, proving the spy would have recorded a send if one had
+# happened. An absence asserted with a broken instrument is a well-formed
+# empty, not a result.
+
+def test_parked_ticket_dev_is_never_nudged(tmp_path, dev_nudge_seams):
+    """RED when a «продолжай» reaches a dev whose ticket an operator parked.
+
+    The T-0948 headline defect: `paused` read as live work, so the plan was
+    NUDGE and the dev was woken every 5 minutes indefinitely to continue a task
+    an operator had explicitly stood down. (`planned` is NOT part of this —
+    see `test_a_dev_on_a_planned_ticket_is_still_nudged`, which fails if the
+    two are ever treated alike.)
+    """
+    tp = tmp_path / "paused"
+    tp.mkdir()
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tp, sid=sid, window="demo", task_id="T-0042",
+                          task_status="paused")
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    dev_nudge_seams["calls"]["dev_nudge"].clear()
+    IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                     user_home="/home/x")
+    assert dev_nudge_seams["calls"]["dev_nudge"] == [], (
+        "a dev on a paused ticket was nudged to continue it")
+
+    # POSITIVE CONTROL — the same fixture, the same spy, one property changed:
+    # an `in_progress` ticket DOES produce exactly one nudge. Without this the
+    # assertions above would also pass against a spy that never records.
+    tp = tmp_path / "control"
+    tp.mkdir()
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tp, sid=sid, window="demo", task_id="T-0042",
+                          task_status="in_progress")
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    dev_nudge_seams["calls"]["dev_nudge"].clear()
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert len(dev_nudge_seams["calls"]["dev_nudge"]) == 1
+
+
+def test_parked_ticket_dev_is_handed_off_not_left_running(tmp_path, dev_nudge_seams):
+    """Not-nudged must not mean not-handled: the parked-ticket dev takes the
+    handoff_exit path, so parking a ticket actually stops paying for its
+    session instead of leaving it alive and silent."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="paused")
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert dev_nudge_seams["calls"]["dev_nudge"] == []
+    # The exit is the whole point: parking a ticket has to stop paying for its
+    # session, not just stop talking to it.
+    assert dev_nudge_seams["calls"]["terminate"] == [sid]
+
+
+def test_worker_nudge_cap_stops_nudging_escalates_and_exits(tmp_path, dev_nudge_seams,
+                                                            monkeypatch):
+    """RED when the nudge keeps firing at a session that has been told
+    «продолжай» `cap` times with nothing to show for it.
+
+    The operator's second hard condition: an escalation that ends in "keep
+    nudging forever, quieter" is the same bug. So this pins all three halves of
+    the end state — the nudges STOP, the owner is PAGED once, and the session
+    takes a terminal action (handoff_exit) rather than a slower cadence.
+    """
+    monkeypatch.setenv("BOT_SQUAD_WORKER_NUDGE_MAX", "3")
+    notices: list[tuple[str, str]] = []
+    from bot_squad_worker import intersession as _inter
+    monkeypatch.setattr(_inter, "send",
+                        lambda cfg, slug, *, from_sid, to, text, **kw:
+                        notices.append((to, text)) or {"ok": True,
+                                                       "delivered_to": [to]})
+
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="in_progress",
+                          extra_md={"parent_sid": "S-almdudleer-bot-squad-tl-p1"})
+    md = data / "bot-squad" / "sessions" / f"{sid}.md"
+    row = _row(sid, cwd_repo=data.parent / "repo")
+
+    # Each tick is a fresh cadence window (the once-per-cadence guard is not
+    # what is under test here), and nothing is ever reported on the ticket.
+    for i in range(3):
+        now = time.time() + i * 10_000
+        assert IT.maybe_recycle(cfg, "bot-squad", row, now=now,
+                                user_home="/home/x") is True
+    assert len(dev_nudge_seams["calls"]["dev_nudge"]) == 3
+    assert S._read_session_metadata(md)["dev_nudge_streak"] == 3
+    assert notices == []            # nothing escalated while under the cap
+
+    # The 4th tick is the cap. No further nudge; the TL is paged once; the
+    # session is put on the handoff path.
+    dev_nudge_seams["calls"]["dev_nudge"].clear()
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time() + 40_000,
+                            user_home="/home/x") is True
+    assert dev_nudge_seams["calls"]["dev_nudge"] == [], (
+        "the cap was reached and the session was nudged anyway")
+    assert len(notices) == 1
+    assert notices[0][0] == "S-almdudleer-bot-squad-tl-p1"
+    assert "nudge cap reached" in notices[0][1]
+    # A terminal action, not a slower nudge: the session is actually exited.
+    assert dev_nudge_seams["calls"]["terminate"] == [sid]
+
+    # ...and the page is sent ONCE, not on every subsequent tick.
+    IT.maybe_recycle(cfg, "bot-squad", row, now=time.time() + 50_000,
+                     user_home="/home/x")
+    assert len(notices) == 1
+
+
+def test_worker_nudge_streak_resets_when_the_ticket_is_touched(tmp_path,
+                                                               dev_nudge_seams,
+                                                               monkeypatch):
+    """A dev that reports progress is never escalated. The streak counts
+    CONSECUTIVE no-progress nudges — a total count would eventually exit a
+    session for being productive across a long day."""
+    monkeypatch.setenv("BOT_SQUAD_WORKER_NUDGE_MAX", "3")
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="in_progress")
+    md = data / "bot-squad" / "sessions" / f"{sid}.md"
+    ticket = data / "bot-squad" / "backlog" / "T-0042-demo.md"
+    row = _row(sid, cwd_repo=data.parent / "repo")
+
+    for i in range(2):
+        IT.maybe_recycle(cfg, "bot-squad", row, now=time.time() + i * 10_000,
+                         user_home="/home/x")
+    assert S._read_session_metadata(md)["dev_nudge_streak"] == 2
+
+    # The dev files a progress note — the exact escape the nudge text names,
+    # and the one drift enforcement already demands.
+    later = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                          time.gmtime(time.time() + 20_000))
+    ticket.write_text(ticket.read_text() +
+                      f"\n## Progress\n\n- {later} · {sid} · still on it\n")
+
+    IT.maybe_recycle(cfg, "bot-squad", row, now=time.time() + 30_000,
+                     user_home="/home/x")
+    meta = S._read_session_metadata(md)
+    assert meta["dev_nudge_streak"] == 1, "the report did not reset the streak"
+    assert not meta.get("dev_nudge_escalated_at")
+
+
+def test_nudge_text_only_names_transitions_the_graph_allows(tmp_path):
+    """RED when the nudge recommends a move `task_states` refuses.
+
+    T-0948: the text told every session to «set the ticket to blocked_on_user».
+    That edge exists only from `in_progress`; from `open`, `reopened` and
+    `paused` the write boundary rejects it, so the one escape the system
+    offered a stuck session was a dead end. The text now reads the path off the
+    graph, and this asserts every hop of it is a real edge.
+    """
+    from bot_squad_worker import task_states as TS
+    for status in TS.TICKET_STATUSES:
+        path = TS.legal_block_escape(status)
+        cur = status
+        for hop in path:
+            assert TS.is_valid_transition(cur, hop), (
+                f"nudge would recommend an illegal {cur} -> {hop}")
+            cur = hop
+        if path:
+            assert cur == "blocked_on_user"
+    # The statuses a nudged session can actually be in all have SOME path.
+    for status in ("open", "in_progress", "reopened"):
+        assert TS.legal_block_escape(status), status
+    # ...and the text renders that path rather than the flat old claim.
+    text = IT._worker_nudge_text("dev", task_id="T-1", status="open")
+    assert "bsq ticket update T-1 in_progress" in text
+    assert "then `bsq ticket update T-1 blocked_on_user`" in text
+
+
+def test_nudge_cap_escalation_falls_back_to_the_operator(tmp_path, dev_nudge_seams,
+                                                         monkeypatch):
+    """An escalation nobody receives is the silent give-up the cap exists to
+    prevent. With no live team-lead the role fan-out delivers to nothing, so
+    the page falls back to the operator — the same "needs a human look" target
+    `recovery._do_park` uses."""
+    monkeypatch.setenv("BOT_SQUAD_WORKER_NUDGE_MAX", "1")
+    sent: list[tuple[str, list]] = []
+    from bot_squad_worker import intersession as _inter
+
+    def _send(cfg, slug, *, from_sid, to, text, **kw):
+        # the teamlead fan-out resolves to no live session; operator does
+        delivered = [] if to == "teamlead" else ["S-op"]
+        sent.append((to, delivered))
+        return {"ok": True, "delivered_to": delivered}
+    monkeypatch.setattr(_inter, "send", _send)
+
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="in_progress")   # no parent_sid on the md
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                     user_home="/home/x")
+    IT.maybe_recycle(cfg, "bot-squad", row, now=time.time() + 10_000,
+                     user_home="/home/x")
+    assert [t for t, _ in sent] == ["teamlead", "operator"], sent
+
+
+def test_a_dev_on_a_planned_ticket_is_still_nudged(tmp_path, dev_nudge_seams):
+    """RED if `planned` is ever folded in with `paused` — the guard against
+    curing the nudge loop by wiping the fleet.
+
+    `task_states.PARKED_STATES` contains BOTH, so the obvious fix was to
+    exclude both. Measured on the live fleet 2026-09-06 while T-0948 was being
+    built: FOUR of the seven live task-bound dev sessions were bound to tickets
+    still labelled `planned` (T-0942, T-0948, T-0949, T-0959 — the ticket this
+    test ships on among them). Excluding `planned` would have marked most of
+    the working fleet as holding no live work and handed off and exited it on
+    the next worker tick.
+
+    WHY they were stuck there matters, because the first explanation offered
+    (including by this test, until it was measured) was "devs do not always
+    move the label" — and that is FALSE. The sessions tried and the system
+    refused them: `planned -> in_progress` is gated on the ticket carrying a
+    real `## Verbatim request`, and these had been dispatched with the
+    `task_new` placeholder still in it. The guard is correct and is not the
+    thing to relax (T-0483 — sessions drifting off the ask). The point for
+    THIS predicate is the stronger one: a ticket's status label can be pinned
+    by a guard that has nothing to do with whether work is happening, so a
+    liveness question must never be answered from it alone.
+
+    The principle, not just the escape: `PARKED_STATES` answers "should I SPAWN
+    a session for this ticket" and a `planned` ticket with nothing bound to it
+    is correctly not load. THIS question is asked about a ticket that already
+    HAS a session bound, and there the binding is the queueing act — `planned`
+    then means the label is stale, not that the work was stood down. `paused`
+    is a person deciding to STOP, which is a different fact.
+    """
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="planned")
+    row = _row(sid, cwd_repo=data.parent / "repo")
+    assert IT.task_alive(cfg, "bot-squad", "T-0042") is True
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert len(dev_nudge_seams["calls"]["dev_nudge"]) == 1, (
+        "a dev on a planned ticket was treated as holding no live work")
+    assert dev_nudge_seams["calls"]["terminate"] == []
+
+
+def test_taskless_tl_streak_resets_from_its_initiative(tmp_path, dev_nudge_seams,
+                                                       monkeypatch):
+    """RED if a coordinator's cap degrades into a plain timer.
+
+    A task-less TL has no bound ticket, so a bound-only reset check could never
+    clear its streak and the cap would exit every TL after `cap` nudges however
+    productively it was dispatching devs. Its work is the INITIATIVE, so a note
+    landing on any of that initiative's tickets — including one a DEV wrote —
+    is the coordinator working.
+    """
+    monkeypatch.setenv("BOT_SQUAD_WORKER_NUDGE_MAX", "3")
+    sid = "S-almdudleer-bot-squad-tl-p7"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="tl", task_id=None,
+                          extra_md={"role": "teamlead", "initiative": "my-init.md"})
+    backlog = data / "bot-squad" / "backlog"
+    backlog.mkdir(parents=True, exist_ok=True)
+    sub = backlog / "T-0500-sub.md"
+    sub.write_text("---\nid: T-0500\ntitle: Sub\nstatus: in_progress\n"
+                   "initiative: my-init.md\n---\n\n## Context\n\nx\n")
+    row = {"sid": sid, "status": "active", "window": "tl", "task_id": None,
+           "role": "teamlead", "cwd": str(data.parent / "repo"),
+           "claude_uuid": "uuid-" + sid, "linux_user": "",
+           "initiative": "my-init.md"}
+    md = data / "bot-squad" / "sessions" / f"{sid}.md"
+
+    for i in range(2):
+        IT.maybe_recycle(cfg, "bot-squad", row, now=time.time() + i * 100_000,
+                         user_home="/home/x")
+    assert S._read_session_metadata(md)["dev_nudge_streak"] == 2
+
+    # a DEV files a note on one of the initiative's subtasks
+    later = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                          time.gmtime(time.time() + 150_000))
+    sub.write_text(sub.read_text() +
+                   f"\n## Progress\n\n- {later} · S-some-dev-p9 · shipped it\n")
+
+    IT.maybe_recycle(cfg, "bot-squad", row, now=time.time() + 200_000,
+                     user_home="/home/x")
+    meta = S._read_session_metadata(md)
+    assert meta["dev_nudge_streak"] == 1, (
+        "a coordinator's streak did not reset on its initiative's progress")
+    assert not meta.get("dev_nudge_escalated_at")

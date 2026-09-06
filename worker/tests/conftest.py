@@ -1,6 +1,7 @@
 """Worker test fixtures."""
 from __future__ import annotations
 
+import importlib.util
 import os
 import tempfile
 from pathlib import Path
@@ -224,3 +225,49 @@ def tmp_config_dir(tmp_path: Path) -> Path:
         'auth_age_max = 86400\n'
     )
     return cfg
+
+
+# --- T-1002: an incomplete substrate must refuse to be read as a result -------
+#
+# `worker/tests/` gets run under the bot-squad-api image / a bare api[dev]
+# install, because conftest and much of the worker are stdlib-clean and four
+# lint-CI steps rely on exactly that. But apscheduler is a worker dependency
+# the api tree does not declare, and `ScheduleTrigger.__init__` imports it
+# LAZILY — so that substrate produces a plausible 122 passed / 5 failed rather
+# than a broken harness, and every schedule-trigger path in it is UNMEASURED
+# while the 122 gets cited as coverage. Same shape as T-0824's 22 phantom
+# failures from a missing `rsync`.
+#
+# The hooks below annotate such a run: a banner in the terminal summary and a
+# one-line trailer AFTER pytest's own count, so the caveat travels with
+# whichever line a reader copies. See tests/substrate.py for the classifier
+# (property-conditioned — no name list to drift) and its stated limits.
+# tests/test_substrate_refusal.py pins both the fire and the no-fire cases.
+_substrate_spec = importlib.util.spec_from_file_location(
+    "bot_squad_test_substrate", Path(__file__).resolve().parent / "substrate.py"
+)
+substrate = importlib.util.module_from_spec(_substrate_spec)
+_substrate_spec.loader.exec_module(substrate)
+
+
+def pytest_exception_interact(node, call, report):
+    """Every exception that reaches the reporting layer passes through here."""
+    if call.excinfo is not None:
+        substrate.record_exception(call.excinfo.value)
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    if not substrate.any_gap():
+        return
+    terminalreporter.write_sep("=", substrate.BANNER_TITLE, red=True, bold=True)
+    for line in substrate.banner_lines():
+        terminalreporter.write_line(line, red=True)
+
+
+def pytest_unconfigure(config):
+    if not substrate.any_gap():
+        return
+    reporter = config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is None:  # -p no:terminal, or an embedding harness
+        return
+    reporter.write_line(substrate.trailer_line(), red=True, bold=True)

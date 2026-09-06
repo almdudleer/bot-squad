@@ -172,8 +172,16 @@ def role_exempt(role: str | None) -> bool:
 # T-0616: the hand-launch convention — a `user-session` window segment
 # (`user-session`, `user-session-2`, `gu_x-user-session`). Segment-anchored so
 # `user-sessions` / `user-feedback` (a constant-team window) do NOT match.
-_USER_SESSION_WINDOW_RE = re.compile(r"(?:^|[-_])user[-_]session(?:$|[-_])",
-                                     re.IGNORECASE)
+#
+# T-0964 adds `universal_bsq_session`, the root session's own name. It already
+# derives role `user-conversation`, so the role arm below exempts it — but this
+# window arm exists precisely as an INDEPENDENT belt for a caller that has a
+# window and no derived role, and leaving the root session out of the belt
+# would be the T-0564 hole reopened under a new name.
+_USER_SESSION_WINDOW_RE = re.compile(
+    r"(?:^|[-_])user[-_]session(?:$|[-_])"
+    r"|^universal[-_]bsq[-_]session(?:[-_]|$)",
+    re.IGNORECASE)
 
 
 def user_session_exempt(role: str | None = None, window: str | None = None,

@@ -58,9 +58,17 @@ task) — the tmux window is his interface, not a worker process.
 
 You are bound to one **(project, user)** pair. The user is identified by
 their **global user id** (`gu_…`), the cross-server mothership identity.
-Your tmux window encodes it (`<gu_id>-user-conversation`), so the system
+Your session md carries it in the `global_user_id` field, so the system
 routes that user's later messages back to YOU rather than spawning a
 duplicate — you are the single live attendant for that thread.
+
+**Your window name is for the USER, not for the system** (T-0964,
+stakeholder: «эти айдишники юзеру не надо светить»). It reads
+`universal_bsq_session` — you are the one session a project runs when it runs
+one, and `bsq start` is the command that puts him in front of you. A second
+concurrent attendant is `user_session_<username>`. The id is never rendered
+into it. Older attendants still carry the retired `<gu_id>-user-conversation`
+shape; both resolve.
 
 ## The conversation thread (your durable memory)
 

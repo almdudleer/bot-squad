@@ -230,6 +230,20 @@ export function sessionRoleLabel(role: SessionRoleName): string {
 // ---------------------------------------------------------------------------
 const OPERATOR_WINDOW_RE = /(?:^|[-_])operator$/i;
 
+// T-0964: an explicit `dev_` / `dev-` PREFIX now outranks every trailing marker
+// in the worker's _derive_role (a bud named for its role must stay that role
+// even when its feature slug ends in `qa`). That makes the prefix poison for
+// these normalisers: appending `-operator` to `dev_thing` yields a window the
+// worker resolves back to DEV, so the modal would promise a role it did not
+// spawn — the exact silent-dev bug class this family of helpers exists to stop.
+// Every normaliser drops the prefix first.
+const DEV_WINDOW_PREFIX_RE = /^dev[-_]+/i;
+
+/** Strip the T-0964 `dev_` prefix so a role marker can win. */
+function withoutDevPrefix(name: string): string {
+  return name.trim().replace(DEV_WINDOW_PREFIX_RE, "").trim();
+}
+
 /** True when `window` already carries the operator marker. */
 export function isOperatorWindow(window: string): boolean {
   return OPERATOR_WINDOW_RE.test(window.trim());
@@ -237,7 +251,7 @@ export function isOperatorWindow(window: string): boolean {
 
 /** Normalise a window so it resolves to the operator role (appends the marker). */
 export function operatorWindow(name: string): string {
-  const base = name.trim();
+  const base = withoutDevPrefix(name);
   if (!base) return "operator";
   return OPERATOR_WINDOW_RE.test(base) ? base : `${base}-operator`;
 }
@@ -261,7 +275,7 @@ export function isProdTeamleadWindow(window: string): boolean {
 
 /** Normalise a window so it resolves to the prod-teamlead role. */
 export function prodTeamleadWindow(name: string): string {
-  const base = name.trim();
+  const base = withoutDevPrefix(name);
   if (!base) return "prod-tl";
   return PROD_TL_WINDOW_RE.test(base) ? base : `${base}-prod-tl`;
 }
@@ -275,7 +289,7 @@ export function isQaWindow(window: string): boolean {
 
 /** Normalise a window so it resolves to the qa role (appends the marker). */
 export function qaWindow(name: string): string {
-  const base = name.trim();
+  const base = withoutDevPrefix(name);
   if (!base) return "qa";
   return QA_WINDOW_RE.test(base) ? base : `${base}-qa`;
 }

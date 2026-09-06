@@ -45,6 +45,25 @@ CASES=(
     "gu_qa-user-conversation	user-conversation"            # gid containing 'qa' ⟹ still user-conversation (suffix wins)
     "user-conversation-extra	dev"                          # marker must be a suffix
     "conversation	dev"                                     # 'user' stem required
+    # --- T-0964: the names the USER sees --------------------------------
+    "universal_bsq_session	user-conversation"              # the root/universal session
+    "universal-bsq-session	user-conversation"              # dash spelling
+    "UNIVERSAL_BSQ_SESSION	user-conversation"              # case-insensitive
+    "user_session	user-conversation"                       # the post-budding / hand-launched shape
+    "user-session-2	user-conversation"                     # T-0616 convention, numbered
+    "user_session_flomaster	user-conversation"             # a second user's attendant
+    "user-sessions	dev"                                    # segment-anchored: a different word
+    "user-feedback	dev"                                    # …and so is this
+    "dev_add_ui_button	dev"                                # a dev bud, his own spelling
+    "dev-add-ui-button	dev"                                # dash spelling
+    "dev_move_the_qa	dev"                                  # PREFIX beats a trailing marker…
+    "dev_drop_the_operator	dev"                            # …for every role…
+    "dev_rewrite_the_tl	dev"                               # …including tl
+    "develop-qa	qa"                                        # 'dev' must be a whole segment
+    "make-the-operator	operator"                           # the bare slug that mis-derives —
+    "improve-the-qa	qa"                                    # ordinary ticket titles, which is
+    "rewrite-the-teamlead	teamlead"                        # why the dev_ prefix exists
+    "operator-drive-mechanism-undisclosed-sta	dev"         # BEGINS with a role word ⟹ still dev
 )
 
 fail=0

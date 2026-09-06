@@ -378,7 +378,50 @@ def attendant_window(gid: str) -> str:
         return ""
 
 
-def is_attendant_answer(author: str, attendant_win: str) -> bool:
+def attendant_windows(cfg: Any, slug: str, gid: str) -> set[str]:
+    """EVERY tmux window this gid's attendant lineage has ever carried.
+
+    T-0964 broke the one-window assumption on purpose: an attendant is no longer
+    named ``<gid>-user-conversation`` but ``universal_bsq_session`` /
+    ``user_session_<who>``, with the gid moved to the ``global_user_id`` md
+    field. A single window string can therefore no longer decide "is this reply
+    from the attendant" — and getting that wrong is not a cosmetic miss: this
+    module would read every answer a post-rename attendant gave as silence and
+    re-drive a conversation that was answered.
+
+    So the lineage is the union of two readings, both of which must keep
+    working while sessions from both eras are on disk:
+
+      * the legacy window (:func:`attendant_window`), for SIDs minted before
+        the rename — their md may be long gone, but their SID still spells it;
+      * the ``window`` of every session md on this board whose
+        ``global_user_id`` is this gid, live or suspended.
+
+    Returns an empty set for a gid no attendant could ever have had.
+    """
+    from bot_squad_worker import sessions as S
+    wins: set[str] = set()
+    legacy = attendant_window(gid)
+    if legacy:
+        wins.add(legacy)
+    try:
+        sess_dir = Path(cfg.data_dir) / slug / "sessions"
+        mds = sorted(sess_dir.glob("*.md")) if sess_dir.exists() else []
+    except (AttributeError, OSError, TypeError):
+        return wins
+    for md in mds:
+        meta = S._read_session_metadata(md)
+        if not meta or S.session_global_user_id(meta) != str(gid or "").strip():
+            continue
+        win = str(meta.get("window") or "").strip()
+        if not win:
+            win = S._window_from_sid(str(meta.get("sid") or md.stem))
+        if win:
+            wins.add(win)
+    return wins
+
+
+def is_attendant_answer(author: str, attendant_win: str | set[str]) -> bool:
     """Whether ``author`` is a reply from THIS conversation's attendant lineage.
 
     Uses :func:`sessions._window_from_sid`, the derivation
@@ -390,10 +433,13 @@ def is_attendant_answer(author: str, attendant_win: str) -> bool:
     if not attendant_win or not str(author or "").startswith("session:"):
         return False
     from bot_squad_worker import sessions as S
-    return S._window_from_sid(str(author)[len("session:"):]) == attendant_win
+    wins = ({attendant_win} if isinstance(attendant_win, str)
+            else set(attendant_win))
+    return S._window_from_sid(str(author)[len("session:"):]) in wins
 
 
-def _newest_attendant_ts(records: list[dict], attendant_win: str) -> str:
+def _newest_attendant_ts(records: list[dict],
+                         attendant_win: str | set[str]) -> str:
     """Newest timestamp among ``records`` authored by this gid's ATTENDANT
     lineage, or ``""``. Deliberately narrower than :func:`_newest_session_ts`:
     that one asks "does this log record answers AT ALL" (the PROBE-BROKEN
@@ -677,7 +723,8 @@ def check_project(cfg: Any, slug: str, *, now: float | None = None) -> dict:
     # The newest ATTENDANT answer anywhere in each gid's conversation — see the
     # docstring for why only a ROOT log is allowed to consult it, and why the
     # author must be the attendant rather than any session at all.
-    attendant_wins = {c["gid"]: attendant_window(c["gid"]) for c in logs}
+    attendant_wins = {c["gid"]: attendant_windows(cfg, slug, c["gid"])
+                      for c in logs}
     newest_answer: dict[str, str] = {}
     for c in logs:
         ts = _newest_attendant_ts(records[c["key"]], attendant_wins[c["gid"]])

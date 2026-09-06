@@ -110,6 +110,25 @@ WINDOWS: tuple[tuple[str, str], ...] = (
     ("adhoc-notes", "dev"),
     ("bsq-role-from-sid-has-diverged-from-the-", "dev"),
     ("", "dev"),
+    # --- T-0964: the names the USER sees ---------------------------------
+    ("universal_bsq_session", "user-conversation"),
+    ("universal-bsq-session", "user-conversation"),
+    ("UNIVERSAL_BSQ_SESSION", "user-conversation"),
+    ("user_session", "user-conversation"),
+    ("user-session-2", "user-conversation"),
+    ("user_session_flomaster", "user-conversation"),
+    ("user-sessions", "dev"),                   # segment-anchored: another word
+    ("user-feedback", "dev"),
+    ("dev_add_ui_button", "dev"),
+    ("dev-add-ui-button", "dev"),
+    ("dev_move_the_qa", "dev"),                 # PREFIX beats a trailing marker
+    ("dev_drop_the_operator", "dev"),
+    ("dev_rewrite_the_tl", "dev"),
+    ("develop-qa", "qa"),                       # `dev` must be a whole segment
+    ("make-the-operator", "operator"),          # the bare slug that mis-derives
+    ("improve-the-qa", "qa"),
+    ("rewrite-the-teamlead", "teamlead"),
+    ("operator-drive-mechanism-undisclosed-sta", "dev"),  # BEGINS with a role word
 )
 
 # bsq's public entry point takes a SID, the worker's takes a window. Both halves
@@ -166,10 +185,21 @@ def test_empty_and_unparseable_sids_are_dev() -> None:
 # a hardcoded if-chain; bsq keeps an ordered tuple. This is the one place the
 # correspondence is written down, and it is compared against BOTH sides below.
 WORKER_MARKERS_IN_PRECEDENCE_ORDER: tuple[tuple[str, str], ...] = (
+    # T-0964: the `dev_` PREFIX arm is first and authoritative. The worker
+    # applies it with `.match`; bsq's table is `.search`-only, which is why the
+    # pattern itself carries the `^` — the two are equivalent under search, and
+    # writing the anchor into the pattern is what lets this equality check keep
+    # comparing pattern SOURCES rather than trusting a comment.
+    ("dev", "_DEV_WINDOW_RE"),
     ("operator", "_OPERATOR_WINDOW_RE"),
     ("prod-teamlead", "_PROD_TL_WINDOW_RE"),
     ("qa", "_QA_WINDOW_RE"),
+    # One role, three markers: the legacy `<gid>-user-conversation` plus the
+    # two T-0964 user-facing names. They are disjoint, so their order among
+    # themselves does not matter — but their position as a group does.
     ("user-conversation", "_USERCONV_WINDOW_RE"),
+    ("user-conversation", "_UNIVERSAL_WINDOW_RE"),
+    ("user-conversation", "_USER_SESSION_WINDOW_RE"),
     ("teamlead", "_TL_WINDOW_RE"),
 )
 
@@ -319,6 +349,14 @@ def test_positive_control_table_catches_the_pre_fix_implementation() -> None:
     wrong. Low reach in practice (a real UC window is
     ``<gu_id>-user-conversation``, which the old arm did match), but the
     correct answer changes, so it is pinned rather than tolerated.
+
+    T-0964 WIDENED THIS, and re-measuring rather than re-scoping is the point.
+    The pre-fix implementation predates the user-facing names too, so the new
+    table rows show it failing on those as well — and in a direction the
+    original three did not contain: `dev_drop_the_operator` answers `operator`
+    where the correct answer is `dev`, because pre-fix bsq had no `dev_` prefix
+    arm and every marker was a suffix match. That row is the one worth keeping
+    in the control, because it is the class this ticket found in the wild.
     """
     divergent = {
         w: (_pre_fix_role_from_window(w), sessions._derive_role(w, None, None))
@@ -331,10 +369,17 @@ def test_positive_control_table_catches_the_pre_fix_implementation() -> None:
     )
     got_wrong = {old for old, _ in divergent.values()}
     should_be = {new for _, new in divergent.values()}
-    assert should_be == {"prod-teamlead", "qa", "user-conversation"}, (
+    assert should_be == {"prod-teamlead", "qa", "user-conversation", "dev"}, (
         f"control caught a different divergence set than the measured one: {should_be}"
     )
-    assert got_wrong == {"teamlead", "dev"}, (
+    assert got_wrong == {"teamlead", "dev", "operator"}, (
         f"unexpected pre-fix answers: {got_wrong}"
     )
+    # T-0778's three, still individually named so a re-measure cannot quietly
+    # drop one into the set totals above.
     assert divergent["user_conversation"] == ("dev", "user-conversation")
+    assert divergent["prod-tl"] == ("teamlead", "prod-teamlead")
+    assert divergent["qa"] == ("dev", "qa")
+    # T-0964's: the user-facing name, and the prefix-vs-suffix reversal.
+    assert divergent["universal_bsq_session"] == ("dev", "user-conversation")
+    assert divergent["dev_drop_the_operator"] == ("operator", "dev")

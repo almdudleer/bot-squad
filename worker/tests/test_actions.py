@@ -2094,8 +2094,9 @@ def test_ensure_user_conversation_missing_required(tmp_path, monkeypatch):
 
 
 def test_ensure_user_conversation_spawns_when_none_live(tmp_path, monkeypatch):
-    """No live attendant ⟹ spawn one in a gid-keyed user-conversation window
-    that derives the user-conversation role, with the boot prompt threaded."""
+    """No live attendant ⟹ spawn one under the USER-FACING window (T-0964)
+    that derives the user-conversation role, with the gid on the md field and
+    the boot prompt threaded."""
     import bot_squad_worker.actions as A
     import bot_squad_worker.sessions as S
 
@@ -2103,7 +2104,8 @@ def test_ensure_user_conversation_spawns_when_none_live(tmp_path, monkeypatch):
     captured = {}
 
     def fake_spawn(cfg, slug, window, initial_prompt=None, **kw):
-        captured.update(slug=slug, window=window, initial_prompt=initial_prompt)
+        captured.update(slug=slug, window=window, initial_prompt=initial_prompt,
+                        **kw)
         return {"ok": True, "sid": f"S-u-{window}-p3"}
 
     monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: None)
@@ -2115,14 +2117,18 @@ def test_ensure_user_conversation_spawns_when_none_live(tmp_path, monkeypatch):
     })
     assert result["ok"] is True
     assert result["spawned"] is True
-    assert captured["window"] == "gu_a1b2c3-user-conversation"
+    # T-0964: the name the USER reads — never the gu_… id.
+    assert captured["window"] == S.UNIVERSAL_WINDOW == "universal_bsq_session"
+    assert "gu_a1b2c3" not in captured["window"]
+    # …and the gid it used to carry now rides the md field instead.
+    assert captured["global_user_id"] == "gu_a1b2c3"
     # The window must derive the new role (end-to-end with _derive_role).
     assert S._derive_role(captured["window"], None, None) == "user-conversation"
     # Boot prompt orients the session: brief + verbatim mandate + the message.
     assert "bsq brief" in captured["initial_prompt"]
     assert "VERBATIM" in captured["initial_prompt"]
     assert "please add dark mode" in captured["initial_prompt"]
-    assert result["sid"] == "S-u-gu_a1b2c3-user-conversation-p3"
+    assert result["sid"] == "S-u-universal_bsq_session-p3"
 
 
 def test_ensure_user_conversation_injects_group_prompt(tmp_path, monkeypatch):
@@ -2496,12 +2502,18 @@ def test_ensure_user_conversation_concurrent_no_fanout(tmp_path, monkeypatch):
     def fake_spawn(cfg, slug, window, initial_prompt=None, **kw):
         # Mirror real spawn: write the seed md + mark the pane live so the reuse
         # md-scan can find a JUST-spawned attendant; the sleep widens the race.
+        # T-0964: the seed md carries `global_user_id` — that field, not the
+        # window, is what the reuse scan matches now, so a fake that omits it
+        # models a producer that no longer exists and fans out here.
         with lk:
             n = len(spawn_calls) + 1
             spawn_calls.append(window)
         _time.sleep(0.05)
         sid = f"S-u-{window}-p{n}"
-        (sess_dir / f"{sid}.md").write_text(f"---\nsid: {sid}\n---\n")
+        gid_line = (f"global_user_id: {kw['global_user_id']}\n"
+                    if kw.get("global_user_id") else "")
+        (sess_dir / f"{sid}.md").write_text(
+            f"---\nsid: {sid}\nwindow: {window}\n{gid_line}---\n")
         live.add(sid)
         return {"ok": True, "sid": sid}
 
@@ -2525,7 +2537,7 @@ def test_ensure_user_conversation_concurrent_no_fanout(tmp_path, monkeypatch):
     assert len(sids) == 1, f"two different attendants: {sids}"
     assert sorted([results[1]["spawned"], results[2]["spawned"]]) == [False, True]
     mds = [p for p in sess_dir.glob("*.md")
-           if S._window_from_sid(p.stem) == "gu_race-user-conversation"]
+           if S.session_global_user_id(S._read_session_metadata(p)) == "gu_race"]
     assert len(mds) == 1, f"expected 1 user-conversation md, got {len(mds)}"
 
 

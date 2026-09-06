@@ -199,3 +199,40 @@ describe("sessionNeedsInput", () => {
     expect(sessionNeedsInput({})).toBe(false);
   });
 });
+
+// T-0964 — the worker's _derive_role now checks an explicit `dev_` PREFIX
+// FIRST and lets it outrank every trailing marker (a bud named for its role
+// stays that role even when its feature slug ends in `qa`). That makes the
+// prefix poison for these normalisers: `dev_thing` + `-operator` is a window
+// the worker resolves back to DEV, so the New-session modal would promise a
+// role it did not spawn — the exact silent-dev bug this family exists to stop.
+describe("T-0964 dev_ prefix must not survive a role normaliser", () => {
+  it("operatorWindow drops it", () => {
+    expect(operatorWindow("dev_thing")).toBe("thing-operator");
+    expect(operatorWindow("dev-thing")).toBe("thing-operator");
+  });
+
+  it("qaWindow drops it", () => {
+    expect(qaWindow("dev_thing")).toBe("thing-qa");
+  });
+
+  it("prodTeamleadWindow drops it", () => {
+    expect(prodTeamleadWindow("dev_thing")).toBe("thing-prod-tl");
+  });
+
+  it("a name that is ONLY the prefix falls back to the bare role marker", () => {
+    expect(operatorWindow("dev_")).toBe("operator");
+    expect(qaWindow("dev-")).toBe("qa");
+  });
+
+  it("leaves a word merely starting with 'dev' alone", () => {
+    expect(operatorWindow("develop")).toBe("develop-operator");
+  });
+});
+
+// T-0964 — the user-facing role labels the sessions list renders.
+describe("T-0964 user-facing session roles", () => {
+  it("labels the universal/user session as the human's own chat", () => {
+    expect(sessionRoleLabel("user-conversation")).toBe("User chat");
+  });
+});

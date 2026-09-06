@@ -2461,14 +2461,23 @@ the product/protocol. Your mandate, in short:
 # see ``idle_timeout.recycle_plan`` / ``PLAN_COMPACT_EXIT``.
 
 
-def _find_suspended_user_conversation(cfg: Any, slug: str, window: str) -> str | None:
+def _find_suspended_user_conversation(
+    cfg: Any, slug: str, window: str, global_user_id: str = "",
+) -> str | None:
     """SID of the most recently suspended, resumable user-conversation session
-    for this gid's window, else None. Scans the session mds (the same store
+    for this user, else None. Scans the session mds (the same store
     ``live_user_conversation_sid`` reads); requires a real ``claude_uuid`` —
     without one ``resume`` cannot ``--resume`` and a fresh spawn is strictly
-    better than resurrecting an empty shell."""
+    better than resurrecting an empty shell.
+
+    T-0964: matched on the ``global_user_id`` md field when one is given, with
+    the legacy ``<gid>-user-conversation`` ``window`` match kept as the fallback
+    — the same two-way match as ``live_user_conversation_sid``, and for the same
+    reason: attendants suspended before the rename carry the gid only in their
+    window, attendants suspended after it carry it only in the field."""
     from bot_squad_worker import sessions as _sessions
 
+    gid = str(global_user_id or "").strip()
     sess_dir = cfg.data_dir / slug / "sessions"
     if not sess_dir.exists():
         return None
@@ -2477,7 +2486,8 @@ def _find_suspended_user_conversation(cfg: Any, slug: str, window: str) -> str |
         meta = _sessions._read_session_metadata(md)
         if not meta:
             continue
-        if str(meta.get("window") or "") != window:
+        md_gid = _sessions.session_global_user_id(meta)
+        if not ((gid and md_gid == gid) or str(meta.get("window") or "") == window):
             continue
         if str(meta.get("status") or "") != "suspended":
             continue
@@ -2546,9 +2556,12 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
     # before this change.
     thread_id = params.get("thread_id")
 
-    # Validate the gid up front (raises on a crafted value): it is both the
-    # spawn window AND the per-(slug,gid) lock-file segment below, so it must be
-    # a single safe path/shell segment before either side effect.
+    # Validate the gid up front (raises on a crafted value): it is the
+    # per-(slug,gid) lock-file segment below, so it must be a single safe
+    # path/shell segment before any side effect. T-0964: it is no longer the
+    # spawn window — `window` here is the LEGACY shape, kept because the
+    # suspended-attendant lookup still matches it for sessions that predate the
+    # rename. The name a fresh spawn gets is chosen at the spawn call below.
     window = _sessions.user_conversation_window(gid)
 
     # T-0478 (REOPENED) fix — serialize the WHOLE check-and-spawn under a
@@ -2609,7 +2622,7 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
         # spawn reading the store cannot match. Best-effort: any resume
         # failure falls through to the fresh spawn below (the message is
         # already durable in the store; routing never breaks on a revive).
-        suspended = _find_suspended_user_conversation(cfg, slug, window)
+        suspended = _find_suspended_user_conversation(cfg, slug, window, gid)
         if suspended is not None:
             try:
                 wake = ("Your conversation resumed — a new message arrived in "
@@ -2623,15 +2636,18 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
                     "ensure_user_conversation: resume of %s failed — "
                     "falling back to a fresh spawn", suspended)
 
-        # Spawn: no live or resumable attendant → open one in the gid-keyed
-        # window.
+        # Spawn: no live or resumable attendant → open one under the
+        # USER-FACING name (T-0964: `universal_bsq_session`, or
+        # `user_session_<who>` when this project already has an attendant up for
+        # someone else). The gid rides the md field, not the window.
         result = _sessions.spawn(
             cfg,
             slug,
-            window,
+            _sessions.user_facing_window(cfg, slug, gid),
             _user_conversation_boot_prompt(cfg, slug, gid, message_ref, thread_id),
             model=params.get("model"),
             dispatched_by="ensure_user_conversation",  # T-0909: attributable
+            global_user_id=gid,
         )
         return {"ok": True, "sid": result["sid"], "spawned": True}
     finally:

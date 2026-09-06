@@ -195,6 +195,22 @@ export function Help() {
           restart needed.
         </p>
 
+        <h3 id="start-a-session">Getting an agent — <code>bsq start</code></h3>
+        <p>
+          One command, run over SSH from anywhere inside the project:{" "}
+          <code>bsq start</code>. If the project has no session running it launches
+          the universal one — <code>universal_bsq_session</code>, the agent that helps
+          you work with the system — and drops you straight into it. If one is already
+          running it tells you where it is and prints the{" "}
+          <code>tmux a -t …</code> to reach it, without starting a second.
+        </p>
+        <p>
+          Sessions are named for their ROLE, so a glance at <code>tmux ls</code> says who
+          is who: <code>universal_bsq_session</code> (yours),{" "}
+          <code>operator</code>, <code>dev_add_ui_button</code> (a dev working that
+          ticket), <code>user_session_&lt;name&gt;</code> (another person&apos;s).
+        </p>
+
         <h3 id="tmux-cheatsheet">Tmux cheatsheet</h3>
         <p>
           Sessions run inside <code>tmux</code> on the server. Connect over SSH and use these
@@ -202,6 +218,7 @@ export function Help() {
           (press the prefix, release, then press the next key).
         </p>
         <ul>
+          <li><code>bsq start</code> — launch (or find) the project&apos;s session.</li>
           <li><code>tmux ls</code> — list sessions on this host.</li>
           <li><code>tmux a -t &lt;name&gt;</code> — attach to a session by name.</li>
           <li><code>Ctrl-b d</code> — detach from the current session (leaves it running).</li>

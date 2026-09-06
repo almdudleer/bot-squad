@@ -688,6 +688,54 @@ _QA_WINDOW_RE = re.compile(r"(?:^|[-_])qa$", re.IGNORECASE)
 # is irrelevant.
 _USERCONV_WINDOW_RE = re.compile(r"(?:^|[-_])user[-_]conversation$", re.IGNORECASE)
 
+# ---------------------------------------------------------------------------
+# T-0964 — THE NAMES THE USER SEES.
+#
+# Stakeholder (2026-09-06): «сейчас из конкретных жалоб
+# gu_dc8262b6cea9098d98e04d7e-user-conversation -- вообще не понятно что это,
+# эти айдишники юзеру не надо светить, для юзера должно быть четко
+# universal_bsq_session, если budding, то уже по ролям кто есть кто,
+# dev_add_ui_button, operator, user_session и т.п.»
+#
+# The window name is the ONE string the user reads in `tmux ls`, in the
+# sessions list and in every attach hint, so it is the naming surface — not a
+# separate "display name" layer that the tmux status bar would still contradict.
+#
+#   universal_bsq_session   the root session while it does everything (L0-solo)
+#   user_session[_<who>]    the root after it budded work off (L1/L2), and any
+#                           additional per-user attendant
+#   dev_<feature-slug>      a dev bud                       (`bsq spawn`)
+#   operator                an operator bud                 (unchanged)
+#
+# WHAT THIS COSTS, AND WHERE THE COST WAS PAID. The gid used to ride IN the
+# window precisely so a user-conversation session was self-identifying from its
+# immutable SID alone. Dropping the gid from the window means the (slug, gid)
+# pair has to live somewhere else: it is now the ``global_user_id`` md field
+# (see :func:`session_global_user_id`), stamped at spawn and carried through
+# every md rebuild the way ``owner_user`` / ``model`` are. The legacy window
+# shape is still matched, so attendants spawned before this change keep
+# resolving.
+#: The root/universal session — one command (`bsq start`, T-0963) puts the user
+#: in front of it, and it is what a project with nothing else running IS.
+UNIVERSAL_WINDOW = "universal_bsq_session"
+#: The root once it has budded, and the per-user attendant shape.
+USER_SESSION_WINDOW = "user_session"
+#: Prefix for a dev bud's window (`dev_add_ui_button`).
+DEV_WINDOW_PREFIX = "dev_"
+
+_UNIVERSAL_WINDOW_RE = re.compile(r"^universal[-_]bsq[-_]session(?:[-_]|$)",
+                                  re.IGNORECASE)
+# Segment-anchored, mirroring recycle_gate's T-0616 convention regex, so
+# `user-sessions` / `user-feedback` do NOT match while `user_session`,
+# `user-session-2` and `user_session_flomaster` all do.
+_USER_SESSION_WINDOW_RE = re.compile(r"(?:^|[-_])user[-_]session(?:$|[-_])",
+                                     re.IGNORECASE)
+# T-0964: an explicit `dev_`/`dev-` prefix is AUTHORITATIVE and tested first, so
+# a feature slug that happens to end in a role marker (`dev_move_the_qa`,
+# `dev_drop_the_operator`) is a dev — which is the whole point of naming buds
+# by role. Before this, the marker regexes below silently reclassified them.
+_DEV_WINDOW_RE = re.compile(r"^dev[-_]", re.IGNORECASE)
+
 # T-0176 #3: grouping bucket for sessions with no live tmux session — keeps the
 # sessions-list grouping honest against `tmux list-sessions`.
 _NO_TMUX_SESSION = "(no tmux session)"
@@ -710,8 +758,10 @@ def _derive_role(
          → ``prod-teamlead`` (T-0197 — BEFORE plain TL, since a prod-tl window
          also ends in `tl`)
       3. qa window marker (`qa`, `<x>-qa`) → ``qa`` (T-0197)
-      4. user-conversation marker (`user-conversation`, `<gu_id>-user-conversation`)
-         → ``user-conversation`` (T-0478 — the system-spawned intake session)
+      4. user-conversation marker — the legacy `<gu_id>-user-conversation`
+         (T-0478, the system-spawned intake session) plus the T-0964
+         user-facing names `universal_bsq_session` and `user_session[_<who>]`
+         → ``user-conversation``
       5. explicit TL window marker (`<x>-TL`, `<x>_teamlead`, …) → ``teamlead``
       6. default → ``dev``
 
@@ -724,13 +774,21 @@ def _derive_role(
     `~` is the registry's "unset" sentinel and is treated as absent.
     """
     w = (window or "").strip()
+    # T-0964 (0.): an explicit `dev_` prefix wins outright — see _DEV_WINDOW_RE.
+    if _DEV_WINDOW_RE.match(w):
+        return "dev"
     if _OPERATOR_WINDOW_RE.search(w):
         return "operator"
     if _PROD_TL_WINDOW_RE.search(w):
         return "prod-teamlead"
     if _QA_WINDOW_RE.search(w):
         return "qa"
-    if _USERCONV_WINDOW_RE.search(w):
+    # T-0964: the user-facing names join the legacy `<gid>-user-conversation`
+    # marker. `user_session` was already the human's own hand-launch convention
+    # (recycle_gate._USER_SESSION_WINDOW_RE, T-0616) — it is the SAME role, and
+    # deriving it here is what makes those sessions read their own contract.
+    if (_USERCONV_WINDOW_RE.search(w) or _UNIVERSAL_WINDOW_RE.match(w)
+            or _USER_SESSION_WINDOW_RE.search(w)):
         return "user-conversation"
     if _TL_WINDOW_RE.search(w):
         return "teamlead"
@@ -1893,6 +1951,15 @@ def suspend(cfg: Any, slug: str, sid: str, *,
         "owner_user": owner_user_val,
         "tmux_session": tmux_sess_val,
     }
+    # T-0964: the (slug, gid) key a user-conversation session is addressed by.
+    # This whitelist is a REBUILD, so an unlisted field is silently dropped —
+    # exactly how `model` was lost across suspend until T-0678. Dropping this
+    # one un-keys a suspended attendant from its user, so
+    # `_find_suspended_user_conversation` would never resume it and every
+    # inbound message would spawn a fresh attendant instead.
+    gid_val = existing.get(GLOBAL_USER_ID_FIELD)
+    if gid_val and gid_val != "~":
+        meta[GLOBAL_USER_ID_FIELD] = str(gid_val)
     provider_val = existing.get("provider")
     if provider_val in _agent_provider.PROVIDERS:
         meta["provider"] = provider_val
@@ -2795,6 +2862,7 @@ def spawn(
     effort: str | None = None,
     model_reason: str | None = None,
     dispatched_by: str | None = None,
+    global_user_id: str | None = None,
 ) -> dict:
     """Spawn a new Claude session in the project's repo.
 
@@ -3151,6 +3219,13 @@ def spawn(
         seed_meta.setdefault("owner", owner)
     if owner_user:
         seed_meta.setdefault("owner_user", owner_user)
+    # T-0964: the (slug, gid) key a user-conversation session used to carry in
+    # its window. It has to be stamped HERE, at spawn, for the same reason the
+    # window worked: `live_user_conversation_sid` must be able to find this
+    # attendant before the SessionStart hook has ever fired, or the very next
+    # inbound message spawns a duplicate.
+    if global_user_id:
+        seed_meta.setdefault(GLOBAL_USER_ID_FIELD, str(global_user_id).strip())
     if initiative:
         seed_meta.setdefault("initiative", initiative)
     # T-0678: an EXPLICIT `model` arg (not the role-based/settings.json
@@ -3465,18 +3540,82 @@ _GLOBAL_USER_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
 
 
 def user_conversation_window(global_user_id: str) -> str:
-    """The tmux window name for ``global_user_id``'s user-conversation session.
+    """The LEGACY ``<gid>-user-conversation`` window name — and, still, the gid
+    validator every caller relies on.
+
+    T-0964 retired this as the name a NEW attendant is spawned under (the user
+    must never be shown a ``gu_…`` id — :func:`user_facing_window` picks the
+    name now), but it is NOT dead code and must keep producing the exact same
+    string: :func:`live_user_conversation_sid` and
+    ``_find_suspended_user_conversation`` match it as the fallback that keeps
+    attendants spawned before the rename resolving to their user, and
+    :mod:`uc_redrive` derives the same shape.
 
     Always ends in the ``user-conversation`` marker so ``_derive_role`` maps it
     to the user-conversation role regardless of the gid prefix. Raises on a gid
     that isn't a single safe segment (so a crafted value can't smuggle a shell /
-    tmux metacharacter into the spawn command or a path).
+    tmux metacharacter into the spawn command or a path) — which is why every
+    caller still runs the value through here even when it discards the result.
     """
     gid = str(global_user_id or "").strip()
     if not _GLOBAL_USER_ID_RE.match(gid):
         from bot_squad_worker.actions import ActionError
         raise ActionError(f"invalid global_user_id {global_user_id!r}")
     return f"{gid}-user-conversation"
+
+
+#: T-0964: the md field that carries the (slug, gid) pairing now that the gid
+#: is no longer spelled into the window. Whitelisted through every md rebuild
+#: (``suspend``, ``resume``) the way ``owner_user`` and ``model`` are — a
+#: rebuild that drops it un-keys a live attendant from its user.
+GLOBAL_USER_ID_FIELD = "global_user_id"
+
+
+def session_global_user_id(meta: dict | None) -> str:
+    """The global user id a user-conversation session attends, or "".
+
+    Reads the T-0964 md field, treating the registry's ``~`` unset sentinel and
+    a missing field as absent — the same shape as :func:`_parent_sid_of`.
+    """
+    if not meta:
+        return ""
+    val = meta.get(GLOBAL_USER_ID_FIELD)
+    if not val or val == "~":
+        return ""
+    return str(val).strip()
+
+
+def _mothership_users(cfg: Any) -> list[dict]:
+    """The mothership user records, or [] when the store is absent/unreadable.
+
+    Read straight off disk (``data/_mothership/users.json``) rather than through
+    the API: the worker has no HTTP client for its own API, and every caller
+    here degrades to a name without a username rather than failing.
+    """
+    try:
+        path = Path(cfg.data_dir) / "_mothership" / "users.json"
+        data = json.loads(path.read_text())
+    except (OSError, ValueError, AttributeError, TypeError):
+        return []
+    users = data.get("users") if isinstance(data, dict) else None
+    return [u for u in users if isinstance(u, dict)] if isinstance(users, list) else []
+
+
+def username_for_global_user_id(cfg: Any, global_user_id: str) -> str:
+    """``gu_…`` → that user's username, or "" when unknown.
+
+    T-0964: used ONLY to build a readable window suffix for a SECOND concurrent
+    attendant (``user_session_flomaster``). The id itself is never rendered —
+    an unresolvable gid falls back to a positional suffix, never to the gid.
+    """
+    gid = str(global_user_id or "").strip()
+    if not gid:
+        return ""
+    for u in _mothership_users(cfg):
+        if str(u.get("id") or "") == gid:
+            name = str(u.get("username") or "").strip()
+            return _sanitise_window(name) if name else ""
+    return ""
 
 
 def _window_from_sid(sid: str) -> str:
@@ -3520,8 +3659,15 @@ def live_user_conversation_sid(
     ``status: active`` yet, so an md-status gate would reopen the very race the
     per-(slug,gid) flock in ``_action_ensure_user_conversation`` closes).
     Tolerant of a missing sessions dir / broken tmux server (→ None).
+
+    T-0964 — TWO ways to match, because the key moved. The gid now lives in the
+    md's ``global_user_id`` field (the window is a user-facing name and no
+    longer spells it), and that is tried first; the legacy
+    ``<gid>-user-conversation`` window match is kept as the fallback so an
+    attendant spawned before this change still resolves to its user.
     """
     want = user_conversation_window(global_user_id)  # validates gid
+    gid = str(global_user_id).strip()
     sess_dir = Path(cfg.data_dir) / slug / "sessions"
     if not sess_dir.exists():
         return None
@@ -3534,11 +3680,93 @@ def live_user_conversation_sid(
         if meta is None:
             continue
         sid = str(meta.get("sid") or md.stem)
-        if _window_from_sid(sid) != want:
+        if session_global_user_id(meta) != gid and _window_from_sid(sid) != want:
             continue
         if sid in live:
             return sid
     return None
+
+
+def live_user_conversation_sids(cfg: Any, slug: str) -> list[dict]:
+    """Every LIVE user-facing session on this project.
+
+    T-0963/T-0964: this is the "how many universal sessions is this project
+    running" read — what ``bsq start`` asks before it decides between launching
+    one and telling the user where the running one is, and what
+    :func:`user_facing_window` asks before it decides between
+    ``universal_bsq_session`` and a per-user ``user_session_<who>``.
+
+    A row is ``{sid, window, tmux_session, global_user_id}``. Role is derived
+    the same way everything else derives it (:func:`_role_of`), so a session
+    that MORPHED into ``user-conversation`` (the T-0932 «отделение себя в
+    юзер-сессию» half of budding) counts — its window may still say
+    ``universal_bsq_session`` at that moment.
+
+    Tolerant of a missing sessions dir / broken tmux server (→ []).
+    """
+    sess_dir = Path(cfg.data_dir) / slug / "sessions"
+    if not sess_dir.exists():
+        return []
+    try:
+        live = _live_agent_sids()
+    except Exception:  # noqa: BLE001 — a tmux hiccup must not break the read
+        return []
+    rows: list[dict] = []
+    for md in sorted(sess_dir.glob("*.md")):
+        meta = _read_session_metadata(md)
+        if meta is None:
+            continue
+        sid = str(meta.get("sid") or md.stem)
+        if sid not in live:
+            continue
+        window = str(meta.get("window") or _window_from_sid(sid) or "")
+        if _role_of(meta, window=window) != "user-conversation":
+            continue
+        rows.append({
+            "sid": sid,
+            "window": window,
+            "tmux_session": str(meta.get("tmux_session") or ""),
+            "global_user_id": session_global_user_id(meta),
+        })
+    return rows
+
+
+def user_facing_window(cfg: Any, slug: str, global_user_id: str) -> str:
+    """T-0964: the window name a NEW attendant for ``(slug, gid)`` should carry.
+
+    ``universal_bsq_session`` when this project is running none — the ordinary
+    case, and the one the stakeholder named. When one is already up for a
+    DIFFERENT user, the newcomer gets ``user_session_<username>`` so two panes
+    are tellable apart; an unresolvable username degrades to a positional
+    ``user_session_2``, never to the gid (rendering the id is the thing this
+    ticket exists to stop).
+
+    Validates the gid via :func:`user_conversation_window` — the value still
+    reaches a flock filename and a spawn command, so the safe-segment check has
+    to keep happening even though the gid no longer lands in the window.
+    """
+    legacy = user_conversation_window(global_user_id)  # validates the gid
+    gid = str(global_user_id).strip()
+    # "Someone ELSE's attendant" has to mean the same thing here as it does in
+    # `live_user_conversation_sid`, or the two disagree about whose session is
+    # on screen. Measured on the live install: filtering on the md field ALONE
+    # read the stakeholder's own pre-rename attendant (window-keyed, no field)
+    # as a stranger and offered him `user_session_alexey` instead of
+    # `universal_bsq_session`. So both matchers, same as there.
+    existing = [r for r in live_user_conversation_sids(cfg, slug)
+                if r.get("global_user_id") != gid
+                and r.get("window") != legacy]
+    if not existing:
+        return UNIVERSAL_WINDOW
+    name = username_for_global_user_id(cfg, global_user_id)
+    if name:
+        return f"{USER_SESSION_WINDOW}_{name}"
+    taken = {r.get("window") for r in existing}
+    for n in range(2, 100):
+        cand = f"{USER_SESSION_WINDOW}_{n}"
+        if cand not in taken:
+            return cand
+    return USER_SESSION_WINDOW
 
 
 def project_of_sid(cfg: Any, sid: str) -> str:

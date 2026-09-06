@@ -1432,6 +1432,84 @@ def _post_spawn_session(params: dict) -> dict:
         return post("spawn_session", legacy, timeout=90)
 
 
+# T-0964 — a session's window says WHICH ROLE IT IS, in the user's words:
+# «если budding, то уже по ролям кто есть кто, dev_add_ui_button, operator,
+# user_session и т.п.». The window is the only name the user ever reads (tmux,
+# the sessions list, every attach hint), so the marker goes there rather than
+# into a parallel display field the tmux status bar would contradict.
+#
+# It also closes a gap the `--role` flag documented and left open: `--role` only
+# selected which contract text got inlined into the brief and «does NOT name the
+# window», so a `--role teamlead` spawn came up with a marker-less window and
+# `_derive_role` called it a dev — the spawned session then read dev.md on its
+# own `bsq brief`. Deriving the window FROM the role makes the two agree by
+# construction.
+#
+# Each produced name must derive back to its own role through
+# `sessions._derive_role` / `scripts/hooks/derive_role.sh`; that round trip is
+# what `test_bsq_role_window_round_trip` pins.
+_ROLE_WINDOW_AFFIX = {
+    "dev": ("dev_", ""),
+    "tl": ("", "_tl"),
+    "teamlead": ("", "_tl"),
+    "prod-teamlead": ("", "_prod_tl"),
+    "qa": ("", "_qa"),
+}
+#: Singleton roles are named for the role alone — there is one operator per
+#: board, and the feature slug would only make it harder to find.
+_ROLE_WINDOW_FIXED = {"operator": "operator", "user-conversation": "user_session"}
+_WINDOW_MAX = 40
+
+
+def role_window(role: str, feature: str, ticket: str = "") -> str:
+    """The default tmux window for a `role` session working on `feature`.
+
+    `dev_add_ui_button`, `add_ui_button_tl`, `add_ui_button_qa`, `operator`.
+    Underscore-separated (the stakeholder's own spelling), lowercase, and capped
+    at 40 chars INCLUDING the affix — the cap is on the whole name because it
+    is a SID segment, and a truncation that ate the trailing marker would hand
+    the session someone else's role.
+
+    Long titles are cut at a WORD boundary, never mid-word. `dev_add_ui_button`
+    is short because that example task was short; real ticket titles are not,
+    and a hard slice produced `dev_work_state_doc_replaces_operator_sta` on a
+    live spawn — legible-ish, but the whole ask here is that a human can read
+    the name. A whole-word cut costs a few characters and reads as a phrase.
+    """
+    role = (role or "dev").strip()
+    if role in _ROLE_WINDOW_FIXED:
+        return _ROLE_WINDOW_FIXED[role]
+    prefix, suffix = _ROLE_WINDOW_AFFIX.get(role, ("dev_", ""))
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", str(feature or "")).strip("_").lower()
+    if not slug:
+        slug = re.sub(r"[^A-Za-z0-9]+", "_", str(ticket or "")).strip("_").lower()
+    room = _WINDOW_MAX - len(prefix) - len(suffix)
+    slug = _fit_words(slug, room)
+    return f"{prefix}{slug}{suffix}"
+
+
+def _fit_words(slug: str, room: int) -> str:
+    """As many whole `_`-separated words of `slug` as fit in `room` chars.
+
+    Falls back to a hard slice only when the FIRST word alone is over the
+    budget — an unsplittable name still has to be capped, and returning nothing
+    would leave a bare `dev_` that names no task at all.
+    """
+    if room <= 0:
+        return ""
+    if len(slug) <= room:
+        return slug
+    kept = ""
+    for word in slug.split("_"):
+        if not word:
+            continue
+        nxt = f"{kept}_{word}" if kept else word
+        if len(nxt) > room:
+            break
+        kept = nxt
+    return kept or slug[:room].rstrip("_")
+
+
 def cmd_spawn(args) -> None:
     # T-0892: WHICH project's T-NNNN. Resolving it by `$PWD` spawned a paid
     # session onto the same-numbered ticket of another board — the shared
@@ -1441,10 +1519,11 @@ def cmd_spawn(args) -> None:
         args.ticket, getattr(args, "slug", None), verb="spawn")
     fm = read_frontmatter(path)
 
-    # window: feature slug after the ticket id, overridable.
+    # window: role marker + feature slug after the ticket id, overridable.
     stem = path.stem  # e.g. T-0146-slim-cli-for-agents
     feature = stem.split("-", 2)[2] if stem.count("-") >= 2 else stem
-    window = args.window or feature[:40]
+    window = args.window or role_window(
+        getattr(args, "role", "dev") or "dev", feature, ticket)
 
     initiative = args.initiative or fm.get("initiative") or None
     # T-0160: the extra (bundled) tickets to BIND after the session comes up.
@@ -2594,13 +2673,20 @@ Run `bsq --help` for the full verb reference."""
 # fixed. Any change here must be made in all three copies.
 # --------------------------------------------------------------------------
 _ROLE_WINDOW_RES: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    # T-0964: an explicit `dev_`/`dev-` PREFIX is authoritative and comes
+    # FIRST, so a bud named for its role stays that role even when its feature
+    # slug ends in another marker (`dev_move_the_qa`).
+    ("dev", re.compile(r"^dev[-_]", re.IGNORECASE)),
     ("operator", re.compile(r"(?:^|[-_])operator$", re.IGNORECASE)),
     # T-0197: BEFORE plain TL — a `prod-tl` window also ends in `tl`.
     ("prod-teamlead", re.compile(r"(?:^|[-_])prod[-_](?:tl|teamlead)$", re.IGNORECASE)),
     ("qa", re.compile(r"(?:^|[-_])qa$", re.IGNORECASE)),
-    # T-0478: system-spawned user-conversation intake session. Its window is
-    # `<gu_id>-user-conversation`, so the marker is matched as a SUFFIX.
+    # T-0478: system-spawned user-conversation intake session. Its legacy
+    # window is `<gu_id>-user-conversation`, so the marker is matched as a
+    # SUFFIX. T-0964 adds the two user-facing names beside it.
     ("user-conversation", re.compile(r"(?:^|[-_])user[-_]conversation$", re.IGNORECASE)),
+    ("user-conversation", re.compile(r"^universal[-_]bsq[-_]session(?:[-_]|$)", re.IGNORECASE)),
+    ("user-conversation", re.compile(r"(?:^|[-_])user[-_]session(?:$|[-_])", re.IGNORECASE)),
     ("teamlead", re.compile(r"(?:^|[-_])(?:tl|teamlead)$", re.IGNORECASE)),
 )
 
@@ -3734,6 +3820,180 @@ def cmd_send_input(args) -> None:
               f"deferred: {res.get('reason')} (delivers when composer is ready)")
     else:
         print(f"queued for {args.sid} (depth {queued}, author={author})")
+
+
+# --------------------------------------------------------------------------
+# T-0963 — `bsq start`: the ONE command a user runs.
+#
+# Stakeholder (2026-09-06): «под универсальную одну сессию бот-сквода, когда по
+# проекту их запущено 0, должна быть простая команда юзеру bsq start, и юзеру
+# должно быть моментально запущено агент, который ему поможет работать с
+# системой (или команда скажет юзеру, куда идти, если этот агент уже работает)».
+#
+# Two branches and nothing else. Zero running → launch one and put him in it.
+# One already running → say WHERE, and do not touch it.
+#
+# It is a thin front for `ensure_user_conversation`, deliberately: that action
+# already holds the per-(slug,gid) flock, the reuse check and the
+# resume-a-suspended-attendant path, so a second launcher here would be a
+# second answer to "is one already running" — the exact fan-out T-0478 closed.
+# What this adds is the two things a HUMAN at a shell has and an inbound TG
+# message does not: no gid to name, and a terminal to be dropped into.
+# --------------------------------------------------------------------------
+
+#: statuses that still have a pane a user can attach to. `paused` is one: the
+#: pane is open and the user can type into it, it is only Ctrl-C'd.
+_ATTACHABLE_STATUSES = ("active", "paused")
+
+
+def _mothership_users() -> list[dict]:
+    """The mothership user records, or [] when the store is unreadable."""
+    try:
+        data = json.loads(
+            (Path(BOT_SQUAD) / "data" / "_mothership" / "users.json").read_text())
+    except (OSError, ValueError):
+        return []
+    users = data.get("users") if isinstance(data, dict) else None
+    return [u for u in users if isinstance(u, dict)] if isinstance(users, list) else []
+
+
+def _resolve_start_user(username: str | None) -> dict:
+    """Which mothership user `bsq start` is starting a session FOR.
+
+    `--user <name>` when given. Otherwise: the single user if there is only
+    one, else the super-admin. Anything else is genuinely ambiguous — two
+    ordinary members and no super-admin — and is refused by NAMING the
+    candidates, because guessing here silently hands one person's conversation
+    thread to another.
+    """
+    users = _mothership_users()
+    if not users:
+        die("no mothership users found — cannot tell whose session to start. "
+            f"Expected {BOT_SQUAD}/data/_mothership/users.json")
+    if username:
+        want = username.strip().lower()
+        for u in users:
+            if str(u.get("username") or "").strip().lower() == want:
+                return u
+        names = ", ".join(sorted(str(u.get("username") or "?") for u in users))
+        die(f"no such user {username!r}. Known users: {names}")
+    if len(users) == 1:
+        return users[0]
+    supers = [u for u in users if u.get("is_super_admin")]
+    if len(supers) == 1:
+        return supers[0]
+    names = ", ".join(sorted(str(u.get("username") or "?") for u in users))
+    die(f"several users on this install and no single super-admin — say whose "
+        f"session to start: bsq start --user <name>. Known users: {names}")
+
+
+def _attach_target(row: dict) -> str:
+    """`<tmux-session>:<window>` for a session row, or "" when it has no pane."""
+    sess = str(row.get("tmux_session") or "").strip()
+    win = str(row.get("window") or "").strip()
+    if not sess or sess.startswith("("):  # "(no tmux session)" bucket
+        return ""
+    return f"{sess}:{win}" if win else sess
+
+
+def _universal_sessions(slug: str) -> list[dict]:
+    """Live user-facing sessions on this board — the ones `bsq start` counts.
+
+    Role, not window: a session that MORPHED into `user-conversation` (the
+    T-0932 budding half) is the user's session whatever its window still says,
+    and a `dev_*` window is never one however it was launched.
+    """
+    rows = post("list_sessions", {"slug": slug}).get("sessions", [])
+    return [r for r in rows
+            if r.get("role") == "user-conversation"
+            and str(r.get("status") or "") in _ATTACHABLE_STATUSES
+            # `activity` is derived from the PANE and is forced to "suspended"
+            # for every md-only row, so it is the one field that separates a
+            # live session from a ZOMBIE — an md still claiming `status:
+            # active` whose window the user closed. Without this, `bsq start`
+            # answers "already running, go here" and points at a pane that is
+            # gone, which is the one answer worse than either real branch.
+            and str(r.get("activity") or "") != "suspended"
+            and not r.get("archived")]
+
+
+def _go_there(target: str, attach: bool) -> None:
+    """Print the attach command, and — only for a real interactive terminal —
+    actually take the user there.
+
+    The TTY test is the whole safety story: an agent's tool call, a pipe or a
+    cron run has no terminal, prints the command and returns, so nothing can
+    hijack a non-interactive caller's process. Inside tmux we `switch-client`
+    (attaching from within tmux is refused by tmux itself); outside it we
+    `exec` the attach so the user's shell is replaced by the session rather
+    than left waiting behind it.
+    """
+    print(f"\n  tmux a -t {target}\n")
+    if not attach or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    if os.environ.get("TMUX"):
+        subprocess.run(["tmux", "switch-client", "-t", target], check=False)
+        return
+    try:
+        os.execvp("tmux", ["tmux", "attach", "-t", target])
+    except OSError as e:  # noqa: BLE001 — no tmux on PATH; the line above stands
+        print(f"bsq: could not attach ({e}) — run the command above",
+              file=sys.stderr)
+
+
+def cmd_start(args) -> None:
+    """T-0963: launch the project's universal session, or say where it is."""
+    slug = args.slug or resolve_slug()
+    attach = not getattr(args, "no_attach", False)
+
+    running = _universal_sessions(slug)
+    if running:
+        # Already working — the ask is to TELL him where to go, not to spawn a
+        # second one. Plural is reported honestly rather than collapsed: two
+        # attendants on one board is a state he should see, not one we pick from.
+        head = running[0]
+        if len(running) > 1:
+            print(f"{len(running)} sessions are already running for {slug}:")
+            for r in running:
+                print(f"  {r.get('window')}  ({r.get('sid')})"
+                      f"  -> tmux a -t {_attach_target(r) or '?'}")
+            return
+        print(f"already running for {slug}: {head.get('window')} "
+              f"({head.get('sid')})")
+        target = _attach_target(head)
+        if not target:
+            print("bsq: that session has no live tmux pane — "
+                  f"`bsq team resurrect {head.get('sid')}` to bring it back",
+                  file=sys.stderr)
+            return
+        _go_there(target, attach)
+        return
+
+    user = _resolve_start_user(getattr(args, "user", None))
+    gid = str(user.get("id") or "")
+    if not gid:
+        die("the resolved mothership user has no id — cannot start a session")
+    print(f"no session running for {slug} — starting one for "
+          f"{user.get('username') or gid} …")
+    res = post("ensure_user_conversation", {"slug": slug, "global_user_id": gid})
+    sid = res.get("sid")
+    if not sid:
+        die("the worker did not return a session id — nothing was started")
+
+    # Re-read the roster for the pane it actually landed in: `spawn` routes the
+    # window into a per-initiative sibling tmux session, so the target is not
+    # derivable from the slug.
+    target = ""
+    for r in _universal_sessions(slug):
+        if r.get("sid") == sid:
+            target = _attach_target(r)
+            break
+    print(f"started {sid}")
+    if not target:
+        print("bsq: started, but its tmux pane is not visible yet — "
+              "`bsq team status` in a moment", file=sys.stderr)
+        return
+    _go_there(target, attach)
 
 
 def cmd_user_session(args) -> None:
@@ -7754,6 +8014,21 @@ def build_parser() -> argparse.ArgumentParser:
     si.add_argument("--author", default=None,
                     help="caption for who wrote this (default: this session's SID)")
     si.set_defaults(func=cmd_send_input)
+
+    # start (T-0963) — the one command a user runs to get an agent.
+    st = sub.add_parser(
+        "start",
+        help="launch the project's universal session when none is running, or "
+             "say where the running one is")
+    st.add_argument("slug", nargs="?", default=None,
+                    help="project slug (default: derived from cwd)")
+    st.add_argument("--user", default=None,
+                    help="mothership username to start the session for "
+                         "(default: the only user, else the super-admin)")
+    st.add_argument("--no-attach", action="store_true", dest="no_attach",
+                    help="print the attach command only; never take over this "
+                         "terminal")
+    st.set_defaults(func=cmd_start)
 
     # user-session (T-0508, M11/F11.1 AP#3) — launch/reuse a dedicated user session
     us = sub.add_parser(

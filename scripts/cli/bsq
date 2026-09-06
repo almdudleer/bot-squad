@@ -4939,6 +4939,116 @@ def _patch_target_rels(patch_text: str) -> list[str]:
     return rels
 
 
+# T-0959: how far behind origin a clone may drift before a commit says so.
+# "A small number" — the shared dev clone reached 75/75 unnoticed over nineteen
+# days, so the bar is deliberately low: 5 is a normal morning's peer traffic,
+# and anything past it means this session is committing onto a base the deploy
+# does not ship.
+_DRIFT_BEHIND_LIMIT = 5
+
+
+def _drift_state(repo_root: str, timeout: float = 25.0) -> dict:
+    """Measure this clone against the REAL origin tip, refusing to guess.
+
+    Returns {"status": "ok"|"unknown", ...}. `unknown` carries `reason` and is
+    NEVER reported as "in sync": the whole failure this guards against is a
+    guard a stale clone can satisfy. `origin/<branch>` is a local cache that a
+    clone which never fetches keeps forever, so checking it alone answers
+    "0 behind" for a clone two weeks out of date. We fetch first, and when the
+    fetch cannot run we say UNKNOWN rather than pass.
+
+    On success:
+      behind   — commits on origin/<branch> that this clone does not have.
+      unshipped— commits here whose CONTENT is on no origin commit (`git cherry`
+                 `+` lines). SHA-only divergence does not count: work replayed
+                 upstream under another SHA ships fine, and counting it is how
+                 the deploy's own advisory became 94% noise and got read past.
+    """
+    def _git(*args, **kw):
+        return subprocess.run(["git", *args], cwd=repo_root, capture_output=True,
+                              text=True, timeout=kw.get("timeout", 15))
+    try:
+        branch = _git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        if not branch or branch == "HEAD":
+            return {"status": "unknown", "reason": "detached HEAD — no branch to compare"}
+        upstream = f"origin/{branch}"
+        fetch = _git("fetch", "--quiet", "origin", branch, timeout=timeout)
+        if fetch.returncode != 0:
+            return {
+                "status": "unknown", "branch": branch,
+                "reason": (fetch.stderr.strip().splitlines() or ["git fetch failed"])[-1][:200],
+            }
+        if _git("rev-parse", "--verify", "--quiet", upstream).returncode != 0:
+            return {"status": "unknown", "branch": branch,
+                    "reason": f"no {upstream} after fetch — branch not published yet"}
+        counts = _git("rev-list", "--left-right", "--count", f"HEAD...{upstream}")
+        if counts.returncode != 0:
+            return {"status": "unknown", "branch": branch, "reason": "rev-list failed"}
+        ahead_s, _, behind_s = counts.stdout.strip().partition("\t")
+        cherry = _git("cherry", upstream, "HEAD", timeout=timeout)
+        unshipped = [ln for ln in cherry.stdout.splitlines() if ln.startswith("+ ")]
+        return {
+            "status": "ok", "branch": branch, "upstream": upstream,
+            "ahead": int(ahead_s or 0), "behind": int(behind_s or 0),
+            "unshipped": len(unshipped) if cherry.returncode == 0 else None,
+        }
+    except subprocess.TimeoutExpired:
+        return {"status": "unknown", "reason": f"git did not answer within {timeout:.0f}s"}
+    except Exception as exc:  # never let the advisory break a commit
+        return {"status": "unknown", "reason": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+def _drift_message(st: dict) -> str | None:
+    """Render `_drift_state` into the advisory, or None when there is nothing
+    to say. Split from the measurement so the wording is testable without git."""
+    if st.get("status") == "unknown":
+        return (
+            "\n*** CLONE DRIFT: UNKNOWN (T-0959) ***\n"
+            f"Could not measure this clone against origin: {st.get('reason', 'unspecified')}\n"
+            "This is NOT 'in sync'. A clone that cannot reach origin cannot know whether\n"
+            "the commit you just made will ship — the deploy builds from origin/<branch>,\n"
+            "not from here. Re-run `git fetch origin` before you report READY.\n"
+        )
+    behind, unshipped = st.get("behind", 0), st.get("unshipped")
+    if behind <= _DRIFT_BEHIND_LIMIT and not unshipped:
+        return None
+    lines = ["\n*** CLONE DRIFT (T-0959) ***"]
+    if behind > _DRIFT_BEHIND_LIMIT:
+        lines.append(
+            f"This clone is {behind} commit(s) BEHIND {st['upstream']}. You just committed "
+            f"onto a base\nthe deploy does not ship, so your tests ran against code the "
+            f"install does not have."
+        )
+    if unshipped:
+        lines.append(
+            f"{unshipped} commit(s) here have NO equivalent on origin — including, most "
+            f"likely, the one\nyou just made. A deploy ships origin/{st['branch']}; those "
+            f"commits are not on the install\nand nothing will put them there on its own."
+        )
+    lines.append(
+        "Reconcile before you report READY: `git merge origin/" + st["branch"] + "` here, "
+        "then have\nyour TL push. Do NOT cherry-pick onto a branch cut from origin and push "
+        "that — that is\nexactly what diverged this clone by 75 commits over nineteen days "
+        "while every\nindividual release looked green.\n"
+    )
+    return "\n".join(lines)
+
+
+def _warn_clone_drift(repo_root: str) -> None:
+    """Post-commit advisory: has this clone drifted from what deploys?
+
+    Runs where `_verify_commit_scope` runs and for the same reason — the fact is
+    only useful at the moment a session believes it has delivered something.
+    Advisory, never a refusal: the drift is usually not this session's doing and
+    blocking its commit would strand the work in the working tree instead.
+    """
+    if os.environ.get("BOT_SQUAD_SKIP_DRIFT_CHECK") == "1":
+        return
+    msg = _drift_message(_drift_state(repo_root))
+    if msg:
+        print(msg, file=sys.stderr)
+
+
 def _verify_commit_scope(repo_root: str, expected: list[str]) -> None:
     """T-0732: print what actually landed, and SHOUT if it isn't what we meant.
 
@@ -5046,6 +5156,7 @@ def _commit_patch_via_temp_index(
             except OSError:
                 pass
     _verify_commit_scope(repo_root, expected_rels)
+    _warn_clone_drift(repo_root)
 
 
 def _commit_hunks_from_patch(args, repo_root: str) -> None:
@@ -5453,6 +5564,45 @@ def _dev_clone_hint() -> str:
     return "the project's dev clone (see repo_path in projects.toml)"
 
 
+def cmd_drift(args) -> None:
+    """T-0959: answer "is this tree what deploys?" on demand.
+
+    The commit-time advisory catches the session that is WRITING. It does
+    nothing for the session that is READING — and that turned out to be the
+    sharper harm: on 2026-09-06 the operator grading a delivered P1 grepped the
+    shared clone for the two tests its DoD cited, found neither, ran a positive
+    control that proved the grep worked, and was about to record that the
+    delivery had fabricated its citations. Both tests exist; the whole file was
+    absent locally because three origin commits were not ancestors of local
+    HEAD. Twice in ten minutes, same session. A diverged clone does not merely
+    strand work — it is an instrument that returns confident, well-formed FALSE
+    NEGATIVES about live code, and nothing about the answer looks wrong.
+
+    So: one command, before you trust a grep of this tree.
+    """
+    repo_root = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True
+    ).stdout.strip()
+    if not repo_root:
+        die("not inside a git repo")
+    st = _drift_state(repo_root)
+    if st.get("status") != "ok":
+        print(_drift_message(st), file=sys.stderr)
+        sys.exit(2)
+    print(
+        f"clone   {repo_root}\n"
+        f"branch  {st['branch']}  vs  {st['upstream']}\n"
+        f"ahead   {st['ahead']} commit(s) here that origin does not have "
+        f"({st['unshipped']} of them carry content that is on NO origin commit)\n"
+        f"behind  {st['behind']} commit(s) on origin that this tree does not have"
+    )
+    msg = _drift_message(st)
+    if msg:
+        print(msg, file=sys.stderr)
+        sys.exit(1)
+    print("\nThis tree matches what a deploy ships. A grep of it can be trusted.")
+
+
 def cmd_commit(args) -> None:
     repo_root = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True
@@ -5517,6 +5667,7 @@ def cmd_commit(args) -> None:
         )
     if rc == 0:
         _verify_commit_scope(repo_root, [_repo_relpath(repo_root, f) for f in args.files])
+        _warn_clone_drift(repo_root)
     sys.exit(rc)
 
 
@@ -7784,6 +7935,12 @@ def build_parser() -> argparse.ArgumentParser:
              "HEAD (never the shared index)")
     cm.add_argument("files", nargs="*", help="explicit file paths to stage + commit")
     cm.set_defaults(func=cmd_commit)
+
+    cd_ = sub.add_parser(
+        "clone-drift",
+        help="T-0959: is this clone what deploys? (fetches origin — a stale "
+             "remote-tracking ref cannot answer this)")
+    cd_.set_defaults(func=cmd_drift)
 
     return p
 

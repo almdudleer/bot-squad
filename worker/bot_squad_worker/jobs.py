@@ -414,6 +414,23 @@ def _run_project_deploy(cfg: Config, slug: str, project: object) -> None:
             f" — ⚠️ this run passed its {_secs(result.budget_s)} wall-clock budget "
             f"and was allowed to continue (the budget is a notice, not a kill)"
         )
+    # T-0959: a release that LEFT COMMITTED WORK BEHIND says so here. The
+    # omission was already detected and already logged at WARNING — it fired on
+    # every deploy from 2026-08-18 to 2026-09-06 and reached nobody, because the
+    # journal is not a human. Folded into `suffix` for the same reason the budget
+    # notice is: `suffix` rides EVERY terminal line below, including the plain
+    # green SUCCESS, which is precisely the branch where "your commit did not
+    # ship" must not be missing. Counted by content, so a clone that has merely
+    # diverged (patch-equivalent SHAs, all shipping) stays silent.
+    if result.omitted_count:
+        first = result.omitted_commits.splitlines()[:3]
+        more = result.omitted_count - len(first)
+        named = "; ".join(c[:80] for c in first) + (f"; +{more} more" if more > 0 else "")
+        suffix += (
+            f" — ⚠️ this release OMITTED {result.omitted_count} committed change(s) "
+            f"that are not on origin: {named}. They are NOT on the install. "
+            f"Push them and re-deploy."
+        )
     if result.ok:
         # T-0446: echo WHICH commit shipped + the worker-restart decision, so a
         # green SUCCESS that precedes the async detached restart is self-explaining

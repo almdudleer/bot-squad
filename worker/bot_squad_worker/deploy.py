@@ -997,6 +997,17 @@ class DeployResult:
     # head, which is not necessarily what actually failed once a wedge fails the
     # whole blocked queue in one sweep).
     target: str = ""
+    # T-0959: committed work this release LEFT BEHIND. A deploy-clone release
+    # ships origin/<branch>; anything committed only in the shared editing clone
+    # is omitted, and until now that fact existed solely as a WARNING line in the
+    # journal. It fired on every deploy for nineteen days and reached nobody, so
+    # a session that committed, saw green and reported READY was telling the
+    # truth about its clone and something false about the install. Counted by
+    # CONTENT (`git cherry`), not by SHA — see `_unshipped_commits`.
+    omitted_count: int = 0
+    # The same commits as "<sha> <subject>" lines, so the alert can NAME them
+    # rather than hand a number nobody can act on.
+    omitted_commits: str = ""
 
     # -- T-0919 / T-0920 field contract -------------------------------------
     # Everything the reporting half (jobs.py) needs so a human reading the alert
@@ -1615,17 +1626,37 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
     #     whenever any one team has committed-but-unpushed WIP on the shared
     #     clone (the multi-team stall). So log a loud advisory naming the omitted
     #     commits (so the deployer can push) and PROCEED from origin.
+    # T-0959: the two paths need DIFFERENT units, and conflating them is what
+    # made this notice unreadable.
+    #   - Block path (ff-only in place): ANY local-only SHA breaks the merge,
+    #     patch-equivalent or not, so it counts SHAs (`_local_only_commits`).
+    #   - Omit path (deploy clone): nothing is destroyed; what is lost is
+    #     CONTENT that is not on origin. A commit already replayed upstream
+    #     under a different SHA ships fine and must not be named — 70 of the
+    #     75 SHAs on the shared clone were exactly that on 2026-09-06.
+    omitted: list[str] = []
     local_only = _local_only_commits(edit_repo)
+    if uses_deploy:
+        omitted = _unshipped_commits(edit_repo) if local_only else []
     if local_only:
         if uses_deploy:
-            log.warning(
-                "deploy.run_next: %s/%s — %d commit(s) on the editing clone %s are NOT on "
-                "origin and will be OMITTED from this release (the deploy ships origin/%s from "
-                "the deploy clone, which never touches the shared editing tree):\n    %s\n"
-                "Push them if they belong in this deploy; proceeding from origin/%s.",
-                slug, target, len(local_only), edit_repo, project.deploy_branch,
-                "\n    ".join(local_only), project.deploy_branch,
-            )
+            if omitted:
+                log.warning(
+                    "deploy.run_next: %s/%s — %d commit(s) on the editing clone %s are NOT on "
+                    "origin and will be OMITTED from this release (the deploy ships origin/%s from "
+                    "the deploy clone, which never touches the shared editing tree):\n    %s\n"
+                    "Push them if they belong in this deploy; proceeding from origin/%s.",
+                    slug, target, len(omitted), edit_repo, project.deploy_branch,
+                    "\n    ".join(omitted), project.deploy_branch,
+                )
+            else:
+                log.info(
+                    "deploy.run_next: %s/%s — the editing clone %s carries %d local-only "
+                    "SHA(s), but every one has a patch-equivalent commit on origin/%s, so "
+                    "this release omits no content. The clone has diverged (T-0959) without "
+                    "losing work; reconcile it, but nothing is missing from this deploy.",
+                    slug, target, edit_repo, len(local_only), project.deploy_branch,
+                )
         elif os.environ.get("BOT_SQUAD_DEPLOY_ALLOW_LOCAL_COMMITS") != "1":
             log.error(
                 "deploy.run_next: %s/%s REFUSED — %d local-only commit(s) on %s not pushed to origin "
@@ -1919,6 +1950,8 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
         worker_boot_sha=boot_git_sha() if worker_stale else "",
         requested_by=payload.get("requested_by", "") or "",
         target=target,
+        omitted_count=len(omitted),
+        omitted_commits="\n".join(omitted),
     )
 
 
@@ -3002,6 +3035,84 @@ def _local_only_commits(repo_path: Path) -> list[str]:
         return [ln for ln in log_proc.stdout.splitlines() if ln.strip()]
     except Exception:
         log.exception("deploy._local_only_commits: git failed for %s", repo_path)
+        return []
+
+
+def _unshipped_commits(repo_path: Path) -> list[str]:
+    """Commits on HEAD whose CONTENT is not on origin/<branch> — what a
+    deploy-clone release actually omits.
+
+    T-0959. `_local_only_commits` counts SHAs, and a SHA is the wrong unit for
+    "will this work ship?". The shared dev clone diverged on 2026-08-18 and by
+    2026-09-06 carried 75 local-only SHAs — of which 70 were byte-identical
+    (same `git patch-id`) to a commit already on origin, replayed there by a
+    session that cherry-picked onto a branch cut from origin and never merged
+    back. A notice that says "75 commits will be OMITTED" when 4 are is not a
+    signal a human can act on; it is the reason this one was read past for
+    nineteen days.
+
+    `git cherry` is exactly this measurement: it marks `-` for a commit that
+    HAS a patch-equivalent upstream and `+` for one that does not. Only the
+    `+` set is genuinely unshipped.
+
+    The remote-tracking ref is refreshed first, best-effort: a clone that never
+    fetches keeps a stale `origin/<branch>` and would report "nothing omitted"
+    forever — the guard satisfied by staleness, which is the failure this
+    ticket exists about. A fetch touches refs/remotes only, never the shared
+    index or worktree, so it is safe in a clone other sessions are editing.
+    When the fetch fails we still measure against the ref we have rather than
+    returning nothing: a possibly-understated list beats a silent empty.
+
+    Returns "<short-sha> <subject>" strings, oldest first. Empty when in sync,
+    when no matching origin ref exists, or when git misbehaves (fail-open, same
+    contract as `_local_only_commits` — an unreachable origin must not wedge
+    deploys).
+    """
+    try:
+        branch_proc = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(repo_path), capture_output=True, text=True, timeout=15,
+        )
+        if branch_proc.returncode != 0:
+            return []
+        branch = branch_proc.stdout.strip()
+        if not branch or branch == "HEAD":
+            return []
+        upstream = f"origin/{branch}"
+        try:
+            subprocess.run(
+                ["git", "fetch", "--quiet", "origin", branch],
+                cwd=str(repo_path), capture_output=True, text=True, timeout=60,
+            )
+        except Exception:
+            log.warning(
+                "deploy._unshipped_commits: fetch failed for %s — measuring against "
+                "the remote-tracking ref as it stands, which may understate the omission",
+                repo_path,
+            )
+        verify = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", upstream],
+            cwd=str(repo_path), capture_output=True, text=True, timeout=15,
+        )
+        if verify.returncode != 0:
+            return []
+        cherry = subprocess.run(
+            ["git", "cherry", "-v", upstream, "HEAD"],
+            cwd=str(repo_path), capture_output=True, text=True, timeout=60,
+        )
+        if cherry.returncode != 0:
+            return []
+        out: list[str] = []
+        for ln in cherry.stdout.splitlines():
+            # "+ <40-sha> <subject>" — unshipped. "- ..." has a twin upstream.
+            if not ln.startswith("+ "):
+                continue
+            rest = ln[2:].strip()
+            sha, _, subject = rest.partition(" ")
+            out.append(f"{sha[:9]} {subject}".rstrip())
+        return out
+    except Exception:
+        log.exception("deploy._unshipped_commits: git failed for %s", repo_path)
         return []
 
 

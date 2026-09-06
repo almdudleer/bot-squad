@@ -999,6 +999,13 @@ def tick(cfg: Any, slug: str, *, now: Optional[datetime] = None) -> dict:
     capacity backpressure leaves ``next_run_at`` unchanged so a later tick
     retries. Returns ``{checked, spawned, fired:[ids]}``.
     """
+    # T-0929 — THE automation gate. Every mechanism that makes an agent work
+    # reads the one pause SSOT here, so "stop the auto-drive" stops all of them
+    # and not just the three that used to check.
+    from bot_squad_worker import automation as _automation
+    if not _automation.gate(cfg, slug, "routines"):
+        return {"checked": 0, "spawned": 0, "fired": [], "paused": True}
+
     now = now or _utcnow()
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -1587,6 +1594,13 @@ def monitor_sweep(cfg: Any, slug: str, *, now: Optional[datetime] = None) -> dic
     Returns ``{checked, probed, fired: [ids]}``. One bad monitor never kills
     the sweep — same contract as every sibling tick.
     """
+    # T-0929 — THE automation gate. Every mechanism that makes an agent work
+    # reads the one pause SSOT here, so "stop the auto-drive" stops all of them
+    # and not just the three that used to check.
+    from bot_squad_worker import automation as _automation
+    if not _automation.gate(cfg, slug, "routines_monitor"):
+        return {"checked": 0, "probed": 0, "fired": [], "paused": True}
+
     now = now or _utcnow()
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)

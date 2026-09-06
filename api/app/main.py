@@ -87,6 +87,11 @@ def build_app() -> FastAPI:
     # T-0511 (M11-F11.4): unified read-only system-transparency surface.
     from app.routes_transparency import router as transparency_router
     app.include_router(transparency_router, prefix="/api")
+    # T-0929: the project's drive state + the ultimate off-switch. Separate from
+    # transparency because that surface is strictly read-only and this one
+    # writes (and must reach the worker to stop running autopilots).
+    from app.routes_automation import router as automation_router
+    app.include_router(automation_router, prefix="/api")
     app.include_router(runs_router, prefix="/api")
     app.include_router(messages_router, prefix="/api")
     app.include_router(scheduler_router, prefix="/api")

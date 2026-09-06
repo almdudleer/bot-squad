@@ -313,11 +313,17 @@ def tick(cfg: Any) -> None:
     """
     if not stall_sweep_enabled():
         return
+    from bot_squad_worker import automation as _automation
     from bot_squad_worker import sessions
     now = time.time()
     pane_map = sessions.live_pane_map()
     cur_user = sessions._get_current_user()
     for slug in cfg.projects:
+        # T-0929 — THE automation gate. Every mechanism that makes an agent
+        # work reads the one pause SSOT here, so "stop the auto-drive" stops
+        # all of them and not just the three that used to check.
+        if not _automation.gate(cfg, slug, "stall_sweep"):
+            continue
         try:
             rows = sessions.list_sessions(cfg, slug)
         except Exception:

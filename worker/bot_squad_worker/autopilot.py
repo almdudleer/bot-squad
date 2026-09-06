@@ -423,8 +423,24 @@ def start(
     Resolves the target TL (spawning one for session/project level when no live
     coordinator exists), delivers the brief, and persists state. Returns
     ``{ok, key, target_sid, expires_at, spawned, delivery}``.
+
+    **Refuses while the drive state is off** (T-0929). Pausing already ends every
+    running autopilot, but nothing stopped a NEW one from being started a second
+    later — and an autopilot is the mechanism that most directly produces "I
+    regularly find the sessions working when earlier on I've explicitly asked
+    them to stop". Refusing loudly (rather than starting a run the gate would
+    then silently neuter) is the point: a surface that accepts a start and does
+    nothing is the same defect in the other direction.
     """
     from bot_squad_worker.actions import ActionError
+    from bot_squad_worker import automation as _automation
+
+    if not _automation.allowed(cfg, slug):
+        raise ActionError(
+            f"autopilot: the drive state for {slug!r} is OFF — nothing automatic "
+            f"runs while the switch is engaged. Set a drive state first "
+            f"(`bsq pace state all_tasks`), then start the autopilot."
+        )
 
     if cfg.projects.get(slug) is None:
         raise ActionError(f"autopilot.start: unknown project slug {slug!r}")
@@ -658,6 +674,15 @@ def tick(cfg: Any, slug: str) -> dict:
     each autopilot is only *evaluated* every ``watchdog_minutes`` and only
     *re-pinged* when the no-progress window has reached ``stall_minutes``.
     """
+    # T-0929 — THE automation gate. Every mechanism that makes an agent work
+    # reads the one pause SSOT here, so "stop the auto-drive" stops all of them
+    # and not just the three that used to check. Pausing already ends every
+    # RUNNING autopilot (operator_redrive.pause); this is the other half — while
+    # the switch is off, the watchdog re-pings nobody.
+    from bot_squad_worker import automation as _automation
+    if not _automation.gate(cfg, slug, "autopilot"):
+        return {"actions": [], "paused": True}
+
     actions: list[dict] = []
     now = time.time()
     for state in list_states(cfg, slug):

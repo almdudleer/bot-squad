@@ -122,6 +122,35 @@ RAW_CASES: list[tuple[str, dict]] = [
     ("unknown FUTURE field beside the known ones",
      {"drive": {"scope": "all", "expires_at": "2026-08-01T00:00:00Z"}}),
     ("whitespace around a valid value", {"drive": {"scope": "  open_reopened  "}}),
+    # T-0929 — the NAMED drive states. `state` is a fourth field on the same
+    # block, so it drifts exactly as the axes do, and one of these shapes is a
+    # hand-edited `off` (which no writer produces and none of the three may
+    # believe — `off` is the pause flag, not a stored value).
+    ("T-0929 state set, axes agree",
+     {"max_in_progress": 0,
+      "drive": {"state": "all_tasks", "scope": "all", "stop_when": "scope_exhausted",
+                "set_by": "web", "set_at": "2026-09-06T13:00:00Z"}}),
+    ("T-0929 finish_up",
+     {"max_in_progress": 0,
+      "drive": {"state": "finish_up", "scope": "in_progress",
+                "stop_when": "scope_exhausted"}}),
+    ("T-0929 one_task carries a WIP cap of 1",
+     {"max_in_progress": 1,
+      "drive": {"state": "one_task", "scope": "all", "stop_when": "scope_exhausted"}}),
+    ("T-0929 pre-state config whose axes MEAN finish_up",
+     {"max_in_progress": 0,
+      "drive": {"scope": "in_progress", "stop_when": "scope_exhausted",
+                "source_text": "закончить всё что в опен"}}),
+    ("T-0929 axes matching no named state read as custom",
+     {"drive": {"scope": "open_reopened"}}),
+    ("T-0929 hand-edited state:off must NOT be believed",
+     {"drive": {"state": "off", "scope": "all", "stop_when": "scope_exhausted"}}),
+    ("T-0929 unknown state value",
+     {"drive": {"state": "turbo", "scope": "all"}}),
+    ("T-0929 state of the wrong TYPE", {"drive": {"state": 7}}),
+    ("T-0929 one_task state but the cap says otherwise (state wins)",
+     {"max_in_progress": 5,
+      "drive": {"state": "one_task", "scope": "all", "stop_when": "scope_exhausted"}}),
 ]
 
 CASE_IDS = [name for name, _ in RAW_CASES]
@@ -216,6 +245,38 @@ def test_the_closed_sets_themselves_are_identical():
     assert (WPACE.DRIVE_PROVENANCE_FIELDS
             == ART._DRIVE_PROVENANCE_FIELDS
             == BSQ._PACE_DRIVE_PROVENANCE_FIELDS)
+    # T-0929 — the named states, their axis mapping and their human copy. The
+    # LABELS matter as much as the values: three surfaces each inventing their
+    # own sentence for `finish_up` is the T-0828 finding (agreeing normalisation
+    # still permits contradictory copy) with a new field to hang it on.
+    assert WPACE.DRIVE_STATES == ART._DRIVE_STATES == BSQ._PACE_DRIVE_STATES
+    assert (WPACE.DRIVE_STATE_AXES
+            == ART._DRIVE_STATE_AXES
+            == BSQ._PACE_DRIVE_STATE_AXES)
+    assert (WPACE.DRIVE_STATE_DEFAULT
+            == ART._DRIVE_STATE_DEFAULT
+            == BSQ._PACE_DRIVE_STATE_DEFAULT)
+    assert (WPACE.DRIVE_STATE_CUSTOM
+            == ART._DRIVE_STATE_CUSTOM
+            == BSQ._PACE_DRIVE_STATE_CUSTOM)
+    assert (WPACE.DRIVE_STATE_LABELS
+            == ART._DRIVE_STATE_LABELS
+            == BSQ._PACE_DRIVE_STATE_LABELS)
+
+
+def test_the_effective_state_helper_agrees_across_the_three():
+    """`off` is the pause FLAG, not a stored value, so every surface has to fuse
+    the two the same way. A surface that reads the block alone prints a mode
+    beside an engaged switch — the exact "unclear and uncontrollable" report."""
+    for drive in ({"state": "finish_up"}, {"state": "all_tasks"}, {}):
+        for paused in (True, False):
+            got = {
+                "worker/pace.py": WPACE.effective_drive_state(drive, paused),
+                "api/routes_transparency.py": ART._effective_drive_state(drive, paused),
+                "scripts/cli/bsq": BSQ._pace_effective_state(drive, paused),
+            }
+            assert len(set(got.values())) == 1, (drive, paused, got)
+            assert (got["worker/pace.py"] == "off") is paused
 
 
 def test_every_default_is_itself_a_member_of_its_closed_set():

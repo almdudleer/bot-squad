@@ -77,6 +77,11 @@ def test_absent_drive_block_reads_as_todays_behaviour(cfg_slug):
             "source_text": None,
             "configured": False,
             "invalid": {},
+            # T-0929: the NAMED state. An unconfigured project reads as the
+            # default state, not as "custom" — saying "custom" about a project
+            # nobody configured would report a deliberate choice that was never
+            # made, which is the same misreport `configured` exists to prevent.
+            "state": "all_tasks",
         }
     # The defaults are the documented constants, not numbers repeated by hand.
     assert pace.DRIVE_DEFAULTS == {

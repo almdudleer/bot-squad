@@ -582,8 +582,12 @@ def tick(cfg: Any, slug: str) -> dict:
     if not _enabled():
         return {"action": "disabled"}
 
-    # STOP re-driving when the user has paused (clarification-01).
-    if is_paused(cfg, slug):
+    # STOP re-driving when the user has paused (clarification-01). T-0929 routes
+    # it through the shared gate so `automation.MECHANISMS` and its source-scan
+    # test can see this mechanism — same predicate, same behaviour, one call
+    # shape across all of them.
+    from bot_squad_worker import automation as _automation
+    if not _automation.gate(cfg, slug, "operator_redrive"):
         return {"action": "paused"}
 
     # "When on, it always has a task to clear the backlog"; an empty backlog

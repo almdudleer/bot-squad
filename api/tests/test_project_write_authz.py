@@ -63,6 +63,9 @@ _PHASE1 = [
     # T-0572: PUT /repo-agents-md CUT with the Workflow page (route removed).
     ("post", f"{_P}/autopilot/start", {"kind": "project", "prompt": "x"}),
     ("post", f"{_P}/autopilot/stop", {"key": "x"}),
+    # T-0929: changing a project's drive state (incl. the ultimate off-switch)
+    # is orchestration control in the same class as autopilot start/stop.
+    ("post", f"{_P}/automation/state", {"state": "off"}),
     ("post", f"{_P}/sessions", {"window": "x"}),                # spawn agent
     ("post", f"{_P}/dev-spawn-request", {"tl_sid": "S-x", "instructions": "x"}),
     ("delete", f"{_P}/backlog/T-0001", None),                   # destructive

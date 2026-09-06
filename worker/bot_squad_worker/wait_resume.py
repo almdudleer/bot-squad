@@ -107,8 +107,14 @@ def tick(cfg: Any) -> None:
     idle_timeout/graceful_exit."""
     if not wait_resume_enabled():
         return
+    from bot_squad_worker import automation as _automation
     cur_user = sessions._get_current_user()
     for slug in cfg.projects:
+        # T-0929 — THE automation gate. Waking a suspended session is automatic
+        # activity; while the switch is off it stays suspended, and the first
+        # tick after he turns the drive back on resumes it.
+        if not _automation.gate(cfg, slug, "wait_resume"):
+            continue
         try:
             sessions_dir = cfg.data_dir / slug / "sessions"
             if not sessions_dir.exists():

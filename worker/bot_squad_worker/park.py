@@ -160,6 +160,7 @@ def _retry_parked(cfg: Any, now_epoch: Optional[float] = None) -> list:
     if not d.exists():
         return []
     now = now_epoch if now_epoch is not None else _now_epoch()
+    from bot_squad_worker import automation as _automation
     from bot_squad_worker import backoff as _backoff
     from bot_squad_worker import sessions as _sessions
     pressure = session_pressure(cfg, now_epoch=now)
@@ -179,6 +180,13 @@ def _retry_parked(cfg: Any, now_epoch: Optional[float] = None) -> list:
             continue  # not yet
         if live >= effective:
             continue  # no slot — try a later tick
+        # T-0929 — THE automation gate, on the RESUME half only. Parking is a
+        # STOP and stays ungated (a paused project must still free its slots);
+        # putting a parked session back to work is automatic activity, so it
+        # waits for the switch. The marker is deliberately left in place, so the
+        # resume happens on the first tick after he turns the drive back on.
+        if not _automation.gate(cfg, data.get("slug"), "park_resume"):
+            continue
         try:
             _sessions.resume(cfg, data.get("slug"), sid)
             resumed.append(sid)

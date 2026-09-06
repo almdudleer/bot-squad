@@ -166,6 +166,141 @@ def validate_drive_value(field: str, value: Any) -> str:
     return sval
 
 
+# ---------------------------------------------------------------------------
+# Drive STATES (T-0929) — the named, user-facing modes
+# ---------------------------------------------------------------------------
+# > "There should be drive states like 'work on one task', 'finish up (i.e.
+# > close all in progress)', and the main one with the set of tasks which need
+# > to be done. And there should be explicit UI state where I could easily turn
+# > them off for a project, just stop any automatic activity all at once."
+# > — the stakeholder, 2026-08-28 (T-0929).
+#
+# The axes above (scope x stop_when) are the MECHANISM. They are not what he
+# asked for: he asked for a small closed set of NAMED states he can read off a
+# surface and set with one click. A user who has to compose
+# ``scope=in_progress`` + ``stop_when=scope_exhausted`` in his head to express
+# "finish up" is being shown the mechanism instead of the state — which is the
+# "now that's all very unclear there" half of the report.
+#
+# So ``state`` is a FOURTH field on the same block, and it is the INTENT: the
+# axes become derived and are applied when the state is set. It is stored, not
+# computed, because "he chose all_tasks" and "the axes happen to look like
+# all_tasks" are different facts and the surfaces must not conflate them (the
+# same explicit-over-inferred rule ``configured`` exists for).
+
+#: The settable states, in the stakeholder's own bullet order (``off`` last —
+#: it is the switch, not a mode).
+DRIVE_STATES = ("one_task", "finish_up", "all_tasks", "off")
+
+#: Reported for a config whose axes were set directly (the pre-T-0929 surface)
+#: and do not match any named state. NOT settable — you cannot ask for "custom",
+#: you can only end up there by setting axes by hand.
+DRIVE_STATE_CUSTOM = "custom"
+
+#: ``off`` is NOT one of these, and that is the whole design: it is not stored
+#: in this block at all. It is the pause flag (``operator_redrive``, the SSOT
+#: three modules already read), so there is exactly ONE "is automation running"
+#: bit rather than a stored state that can disagree with a flag file. Setting
+#: ``off`` engages the pause and LEAVES the previous state stored, so resuming
+#: returns to the mode he was in rather than to a default he never chose.
+DRIVE_STATE_AXES: dict[str, dict] = {
+    # "work on one task" — the board is capped at a single in-progress task, so
+    # the drive finishes one thing before it is allowed to start another.
+    "one_task": {"scope": "all", "stop_when": "scope_exhausted",
+                 "max_in_progress": 1},
+    # "finish up (i.e. close all in progress)" — nothing new is picked up; the
+    # drive drains what is already in flight and then stops.
+    "finish_up": {"scope": "in_progress", "stop_when": "scope_exhausted",
+                  "max_in_progress": 0},
+    # "the main one with the set of tasks which need to be done" — everything
+    # takeable, end to end, while tasks exist (his 2026-09-06 re-drive
+    # requirement: «система должна обеспечивать выполнение всех задач end2end
+    # пока они есть»).
+    "all_tasks": {"scope": "all", "stop_when": "scope_exhausted",
+                  "max_in_progress": 0},
+}
+
+#: The state an unconfigured project reads as — same behaviour a project that
+#: never set anything has always had (drive everything), so this ships as a
+#: no-op by construction, exactly as T-0828's defaults did.
+DRIVE_STATE_DEFAULT = "all_tasks"
+
+#: Human copy for each state, keyed by the stored value. Lives beside the set so
+#: three surfaces (UI card, ``bsq pace show``, the TG report) cannot each invent
+#: their own wording for the same state — the T-0828 finding was that agreeing
+#: normalisation still permits contradictory sentences.
+#:
+#: Each label is the EXPLANATION ONLY and deliberately does not repeat the state
+#: name: every surface renders it as "<state> — <label>", and a label carrying
+#: the name too produced "off — off — nothing automatic runs" in the walkthrough.
+DRIVE_STATE_LABELS = {
+    "off": "nothing automatic runs",
+    "one_task": "work on one task",
+    "finish_up": "close what is in progress, take nothing new",
+    "all_tasks": "drive the backlog end to end",
+    DRIVE_STATE_CUSTOM: "axes set by hand, no named state",
+}
+
+
+def validate_drive_state(value: Any) -> str:
+    """Return ``value`` iff it is a settable state; else raise.
+
+    :raises DriveModeError: naming the rejected value and the full allowed set.
+        ``custom`` is rejected here on purpose — it is a REPORTED state, never a
+        requested one.
+    """
+    sval = str(value).strip()
+    if sval not in DRIVE_STATES:
+        raise DriveModeError(
+            f"invalid drive state: {value!r} — must be one of: "
+            f"{', '.join(DRIVE_STATES)}"
+        )
+    return sval
+
+
+def derive_drive_state(raw: dict) -> str:
+    """The state a config is IN, for a config that predates the ``state`` field.
+
+    Back-compat only: T-0828 shipped the axes as the user surface and he set
+    them («закончить всё что в опен»), so those projects must read as a named
+    state rather than as ``custom``. Matches on the FULL axis tuple including
+    ``max_in_progress``, because "one task at a time" and "finish up one at a
+    time" differ only in that number — a looser match would print a state he did
+    not set, which is the misreporting this ticket exists to remove.
+
+    Never returns ``off`` (that is the pause flag, not a stored value) and never
+    raises.
+    """
+    src = raw.get("drive")
+    src = src if isinstance(src, dict) else {}
+    if not src:
+        # No drive block at all == the default state, not "custom": an
+        # unconfigured project IS driving all tasks, and saying "custom" about
+        # it would report a deliberate choice nobody made.
+        return DRIVE_STATE_DEFAULT
+    cap = max(0, _coerce_int(raw.get("max_in_progress"), 0))
+    for name, axes in DRIVE_STATE_AXES.items():
+        if (src.get("scope", DRIVE_DEFAULTS["scope"]) == axes["scope"]
+                and src.get("stop_when", DRIVE_DEFAULTS["stop_when"]) == axes["stop_when"]
+                and cap == axes["max_in_progress"]):
+            return name
+    return DRIVE_STATE_CUSTOM
+
+
+def effective_drive_state(drive: dict, paused: bool) -> str:
+    """The state to REPORT: ``off`` whenever the gate is engaged, else the
+    configured state.
+
+    The one function every surface must use, so none of them can print
+    "all_tasks" beside a paused system — "explicitly see if it's happening in
+    the first place" is defeated by a card that shows the mode and not the
+    switch.
+    """
+    if paused:
+        return "off"
+    return str(drive.get("state") or DRIVE_STATE_DEFAULT)
+
+
 def _utc_now_iso() -> str:
     """``set_at`` stamp: second-resolution UTC ISO-8601 with a ``Z``."""
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
@@ -284,6 +419,7 @@ def _normalized_drive(raw: dict) -> dict:
         {
           "scope": str, "stop_when": str, "on_stop": str,   # effective values
           "set_by": str|None, "set_at": str|None, "source_text": str|None,
+          "state": str,              # T-0929 named state; never "off" (see below)
           "configured": bool,        # a `drive` block exists on disk at all
           "invalid": {field: raw},   # stored values NOT in the closed set
         }
@@ -301,11 +437,18 @@ def _normalized_drive(raw: dict) -> dict:
       identically to a real one is the silent-None failure D-0069 calls the most
       dangerous line in the design. The effective value falls back to the
       default AND every surface prints the ``invalid`` entry.
+    * ``state`` (T-0929) is the NAMED mode, stored when he sets one and derived
+      from the axes when the config predates the field. It is never ``off``:
+      that is the pause flag, which this function deliberately cannot see (it is
+      pure over the json, and :func:`read_drive` must stay import-cycle-free for
+      the pickup path). Combine the two with :func:`effective_drive_state` —
+      every surface must, or it will print a mode beside an engaged switch.
     """
     out: dict = dict(DRIVE_DEFAULTS)
     out.update({"set_by": None, "set_at": None, "source_text": None})
     out["configured"] = False
     out["invalid"] = {}
+    out["state"] = DRIVE_STATE_DEFAULT
 
     src = raw.get("drive")
     if not isinstance(src, dict):
@@ -323,6 +466,23 @@ def _normalized_drive(raw: dict) -> dict:
     for field in DRIVE_PROVENANCE_FIELDS:
         v = src.get(field)
         out[field] = str(v) if v is not None else None
+
+    # The stored state wins; an out-of-set stored value is reported through the
+    # SAME `invalid` channel as the axes (never coerced silently), and the
+    # effective value falls back to what the axes actually say.
+    stored = src.get("state")
+    if stored is None:
+        out["state"] = derive_drive_state(raw)
+    elif str(stored).strip() == "off" or str(stored).strip() not in DRIVE_STATE_AXES:
+        # "off" is NOT a storable state — it is the pause flag, and a stored one
+        # would be a second truth that can disagree with the flag (exactly the
+        # "changes state without my confirmation" class). A hand-edited or
+        # future-version value is reported through the same `invalid` channel as
+        # the axes rather than believed.
+        out["invalid"]["state"] = stored
+        out["state"] = derive_drive_state(raw)
+    else:
+        out["state"] = str(stored).strip()
     return out
 
 
@@ -534,3 +694,104 @@ def clear_drive(cfg: Any, slug: str) -> bool:
     _save_raw(cfg, slug, raw)
     log.info("pace[%s]: cleared drive mode (back to defaults)", slug)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Drive STATES — write API (T-0929)
+# ---------------------------------------------------------------------------
+
+def set_drive_state(
+    cfg: Any,
+    slug: str,
+    state: str,
+    *,
+    set_by: str = "user",
+    source_text: Optional[str] = None,
+) -> dict:
+    """Set the project's named drive state — the ONE call the user surfaces make.
+
+    Two things happen and they are deliberately not separable, because the
+    defect being closed is a surface that reports one and does the other:
+
+    * the axes the state MEANS (:data:`DRIVE_STATE_AXES`) are applied, so the
+      mechanism can never disagree with the name shown on the card;
+    * ``off`` engages the global pause (the :mod:`operator_redrive` flag — the
+      single gate every driving tick reads) and stores NOTHING, while any other
+      state RELEASES that pause. So the switch and the mode are one control:
+      picking a mode turns automation back on, and ``off`` stops all of it.
+
+    Setting ``off`` leaves the previously stored state in place, so a later
+    ``all_tasks``/``finish_up``/``one_task`` is a real choice and a bare resume
+    returns him to the mode he was in rather than to a default.
+
+    :returns: the automation view after the write —
+        ``{"state": <effective>, "paused": bool, "drive": <normalised block>,
+        "max_in_progress": int}``.
+    :raises DriveModeError: on a state outside :data:`DRIVE_STATES` (``custom``
+        included — it is reported, never requested).
+    """
+    st = validate_drive_state(state)
+
+    if st == "off":
+        pause(cfg, slug, by=set_by, reason=(source_text or "drive state: off"))
+        return read_automation(cfg, slug)
+
+    axes = DRIVE_STATE_AXES[st]
+    raw = _load_raw(cfg, slug)
+    block = raw.get("drive")
+    block = dict(block) if isinstance(block, dict) else {}
+    block["state"] = st
+    block["scope"] = axes["scope"]
+    block["stop_when"] = axes["stop_when"]
+    block["set_by"] = str(set_by or "user")
+    block["set_at"] = _utc_now_iso()
+    # PROVENANCE BELONGS TO THE REQUEST THAT PRODUCED THIS STATE — so a write
+    # with no words CLEARS the stored ones rather than inheriting them. The
+    # walkthrough for this ticket caught the inheriting version: he set
+    # `finish_up` from «закончить всё что в опен», then clicked "One task" in
+    # the UI (which sends no words), and every surface then read
+    # "one_task … from «закончить всё что в опен»" — a state he chose by button
+    # attributed to words that asked for a different one. That is T-0828's
+    # rejected shape exactly, and `set_by`/`set_at` still record who and when.
+    block["source_text"] = str(source_text) if source_text is not None else None
+    raw["drive"] = block
+    raw["max_in_progress"] = axes["max_in_progress"]
+    _save_raw(cfg, slug, raw)
+
+    # Choosing a mode IS turning it on. A state that left the gate engaged would
+    # be a setting that reports success and changes nothing — the surface defect
+    # D-0069 already ruled against.
+    resume(cfg, slug)
+    log.info("pace[%s]: drive state = %s (by %s)", slug, st, block["set_by"])
+    return read_automation(cfg, slug)
+
+
+def read_automation(cfg: Any, slug: str) -> dict:
+    """The one "is anything automatic running, and in what mode" view.
+
+    Shape::
+
+        {
+          "state": str,            # EFFECTIVE — "off" whenever paused
+          "paused": bool,          # the gate itself
+          "label": str,            # human copy for `state`
+          "max_in_progress": int,  # the cap the state implies (0 = unlimited)
+          "drive": {...},          # the normalised block (configured state, axes,
+                                   # provenance, invalid)
+        }
+
+    Read-only and cheap. Merges the pause flag, so unlike :func:`read_drive` it
+    is NOT safe to call from inside the pickup path — use the gate
+    (:func:`bot_squad_worker.automation.allowed`) there.
+    """
+    raw = _load_raw(cfg, slug)
+    drive = _normalized_drive(raw)
+    paused = _global_paused(cfg, slug)
+    state = effective_drive_state(drive, paused)
+    return {
+        "state": state,
+        "paused": paused,
+        "label": DRIVE_STATE_LABELS.get(state, state),
+        "max_in_progress": max(0, _coerce_int(raw.get("max_in_progress"), 0)),
+        "drive": drive,
+    }

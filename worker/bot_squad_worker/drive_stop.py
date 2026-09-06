@@ -642,11 +642,9 @@ def tick(cfg: Any, slug: str, *, now_epoch: Optional[float] = None) -> dict:
 
     # A user-paused operator is idle BY HIS OWN HAND. The latch is deliberately
     # left alone so resuming into the same idle state does not re-announce it.
-    try:
-        if _pace.read_config(cfg, slug).get("paused"):
-            return {"action": "paused"}
-    except Exception:  # noqa: BLE001
-        log.exception("drive_stop: pause read failed for %s", slug)
+    from bot_squad_worker import automation as _automation
+    if not _automation.gate(cfg, slug, "drive_stop"):
+        return {"action": "paused"}
 
     rec = evaluate(cfg, slug, now_epoch=now_epoch, drive=drive)
     if rec["board_problem"] is not None:

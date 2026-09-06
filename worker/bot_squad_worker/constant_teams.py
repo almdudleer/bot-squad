@@ -535,6 +535,13 @@ def tick(cfg: Any, slug: str) -> dict:
     if _truthy(os.environ.get("BOT_SQUAD_CONSTANT_TEAMS_DISABLED", "")):
         return {"actions": [], "disabled": True}
 
+    # T-0929 — THE automation gate. Every mechanism that makes an agent
+    # work reads the one pause SSOT here, so "stop the auto-drive" stops
+    # all of them and not just the three that used to check.
+    from bot_squad_worker import automation as _automation
+    if not _automation.gate(cfg, slug, "constant_teams"):
+        return {"actions": [], "paused": True}
+
     init_dir = cfg.data_dir / slug / "vision" / "initiatives"
     if not init_dir.exists():
         return {"actions": []}

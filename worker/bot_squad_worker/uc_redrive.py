@@ -701,6 +701,14 @@ def check_project(cfg: Any, slug: str, *, now: float | None = None) -> dict:
       the same hole in the cross-log direction; see the module docstring for
       the 27 non-attendant sids measured in one topic.
     """
+    # T-0929 — THE automation gate. Every mechanism that makes an agent work
+    # reads the one pause SSOT here, so "stop the auto-drive" stops all of them
+    # and not just the three that used to check.
+    from bot_squad_worker import automation as _automation
+    if not _automation.gate(cfg, slug, "uc_redrive"):
+        return {"ok": True, "paused": True, "redriven": [], "probe_broken": [],
+                "aged_out": []}
+
     from bot_squad_worker import sessions as S
     from bot_squad_worker import detector as _detector
     from bot_squad_worker import actions as A

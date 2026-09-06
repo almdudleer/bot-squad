@@ -550,6 +550,13 @@ def budding_check(cfg: Any, slug: str) -> dict:
 
     if not budding_enabled():
         return {"ok": True, "disabled": True, "suggested": []}
+
+    # T-0929 — THE automation gate. Every mechanism that makes an agent
+    # work reads the one pause SSOT here, so "stop the auto-drive" stops
+    # all of them and not just the three that used to check.
+    from bot_squad_worker import automation as _automation
+    if not _automation.gate(cfg, slug, "budding"):
+        return {"ok": True, "paused": True, "suggested": []}
     if cfg.projects.get(slug) is None:
         raise ActionError(f"budding_check: unknown project slug {slug!r}")
 

@@ -151,6 +151,81 @@ mkdir -p "$TMPDIR"
 export GIT_SHA="$(git -C "$INSTALL_DIR" rev-parse HEAD)"
 echo "[bot-squad/staging] building image stamped GIT_SHA=$GIT_SHA"
 
+# T-1001 — KEEP THE IMAGE THE MEASUREMENTS THAT GATED THIS DEPLOY WERE TAKEN IN.
+#
+# `docker compose build` below moves `bot-squad-api:latest` onto a new image.
+# Every api certification is taken in that tag, so the deploy those
+# certifications GATED is the event that makes them uncheckable — not by
+# accident, but every single time we do this correctly. Measured 2026-09-06:
+# `docker image inspect` on 926bf32fcb08 and 8ceaa2fcd999, the two images that
+# carried a whole afternoon's api chain, both returned rc 1. Not untagged:
+# ABSENT.
+#
+# Naming the digest in the report was already the rule and was followed all
+# day; it did not help, because an anchor makes a claim CHECKABLE, not
+# REPRODUCIBLE. And rebuilding from the ref is not the answer either:
+# api/pyproject.toml pins nothing but floors and there is no lockfile, so a
+# rebuild resolves whatever PyPI serves that day — a new environment, not a
+# reproduction. What is left is to keep the artefact, under a name this rebuild
+# cannot move.
+#
+# Bounded, because the disk is a live constraint on this box (it collapsed
+# twice under IO on 2026-09-06) — and the layers are shared with :latest, so
+# the marginal cost is a fraction of the image size. Non-fatal by construction:
+# neither retaining nor reclaiming may redden a healthy deploy.
+# >>> T-1001-IMAGE-RETAIN (extracted verbatim by
+#     worker/tests/test_t1001_image_retain.py — keep the markers)
+RETAIN_KEEP=3
+RETAIN_OLD_ID="$(docker image inspect bot-squad-api:latest --format '{{.Id}}' 2>/dev/null || true)"
+if [ -z "$RETAIN_OLD_ID" ]; then
+    echo "[bot-squad/staging] T-1001: no outgoing bot-squad-api:latest to retain (first build on this host)"
+else
+    # The tag carries BOTH coordinates a later reader needs: WHEN the image was
+    # built (so the set sorts chronologically with no extra bookkeeping) and
+    # WHICH REF it was built from (so a certification naming a sha can be
+    # matched to an image without inspecting every candidate). Derived from the
+    # image itself, never from the clock, so re-running this on an unchanged
+    # image is idempotent rather than a second tag for the same bytes.
+    RETAIN_CREATED="$(docker image inspect bot-squad-api:latest --format '{{.Created}}' 2>/dev/null || true)"
+    # NO `head -1` HERE, and it is not style. The recipe runs under `set -euo
+    # pipefail`: a consumer that exits early SIGPIPEs `sed`, pipefail promotes
+    # that to a non-zero pipeline status, and a failing command substitution
+    # under `set -e` kills the deploy — on an image whose env happens to have
+    # more lines. `sed` reads to EOF; the first line is taken in the shell.
+    RETAIN_REF="$(docker image inspect bot-squad-api:latest \
+                    --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+                  | sed -n 's/^BOT_SQUAD_GIT_SHA=//p' || true)"
+    RETAIN_REF="${RETAIN_REF%%
+*}"
+    RETAIN_STAMP="$(date -u -d "$RETAIN_CREATED" +%Y%m%dT%H%M%SZ 2>/dev/null || true)"
+    [ -n "$RETAIN_STAMP" ] || RETAIN_STAMP="unknown"
+    case "$RETAIN_REF" in
+        ""|unknown) RETAIN_REF="$(printf '%s' "${RETAIN_OLD_ID#sha256:}" | cut -c1-12)" ;;
+        *)          RETAIN_REF="$(printf '%s' "$RETAIN_REF" | cut -c1-12)" ;;
+    esac
+    RETAIN_TAG="bot-squad-api:cert-${RETAIN_STAMP}-${RETAIN_REF}"
+    if docker tag "$RETAIN_OLD_ID" "$RETAIN_TAG" 2>/dev/null; then
+        echo "[bot-squad/staging] T-1001: RETAINED the outgoing api image as $RETAIN_TAG ($RETAIN_OLD_ID)"
+        echo "[bot-squad/staging] T-1001: certifications taken in bot-squad-api:latest before this deploy are re-runnable as $RETAIN_TAG"
+    else
+        echo "[bot-squad/staging] T-1001: WARN could not retain $RETAIN_OLD_ID — certifications taken in it become UNCHECKABLE after this build" >&2
+    fi
+
+    # Reclaim beyond the window — LOUDLY. Silent reclamation is the whole
+    # defect: nobody noticed the afternoon's images going because nothing said
+    # so. Never touch the image :latest currently points at.
+    docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' 'bot-squad-api:cert-*' 2>/dev/null \
+        | sort -r | tail -n +$((RETAIN_KEEP + 1)) \
+        | while read -r _old _oldid; do
+              case "$RETAIN_OLD_ID" in
+                  *"$_oldid"*) echo "[bot-squad/staging] T-1001: keeping $_old — it is the outgoing image"; continue ;;
+              esac
+              echo "[bot-squad/staging] T-1001: RECLAIMING $_old — beyond the $RETAIN_KEEP-deploy retention window; measurements naming it are no longer re-runnable"
+              docker rmi "$_old" >/dev/null 2>&1 || true
+          done || true
+fi
+# <<< T-1001-IMAGE-RETAIN
+
 docker compose build || {
     rc=$?
     echo "[bot-squad/staging] WARN: docker compose build rc=$rc; checking whether image was still produced..." >&2

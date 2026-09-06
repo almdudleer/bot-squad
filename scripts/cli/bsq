@@ -5973,8 +5973,23 @@ def _extract_missing_paths(repo_root: str, sha: str, dest: str) -> tuple:
     return (tracked, missing)
 
 
-def _certify_pytest_run(text: str, rc: int, cmd: list, sha: str) -> tuple:
-    """Decide whether a completed run may be reported. Returns (lines, exit_rc)."""
+def _certify_pytest_run(text: str, rc: int, cmd: list, sha: str,
+                        env_line: str = None) -> tuple:
+    """Decide whether a completed run may be reported. Returns (lines, exit_rc).
+
+    T-1001: the ENVIRONMENT line rides EVERY verdict, refusals included. A
+    refusal is a record too, and the next reader's first question about a
+    run that would not certify is which image it was in.
+    """
+    lines, exit_rc = _certify_pytest_outcome(text, rc, cmd, sha)
+    lines.append(env_line or (
+        "verify-isolated: ENVIRONMENT host (no container) — the interpreter "
+        "and installed packages are this box's, which this tool does NOT pin."))
+    return lines, exit_rc
+
+
+def _certify_pytest_outcome(text: str, rc: int, cmd: list, sha: str) -> tuple:
+    """The outcome half of the verdict — see _certify_pytest_run."""
     short = sha[:12]
     if not _looks_like_pytest(cmd):
         return ([
@@ -6055,6 +6070,180 @@ def _certify_pytest_run(text: str, rc: int, cmd: list, sha: str) -> tuple:
     ], rc)
 
 
+# --- T-1001: the tag a certification names is a MOVING REFERENT -------------
+#
+# Every api certification this fleet has ever taken was run "in
+# `bot-squad-api:latest`". That tag is rebuilt by `docker compose build`, which
+# every staging deploy runs — so the moment the deploy those measurements
+# GATED lands, the sentence that gated it is about a different image. Measured
+# 2026-09-06: `docker image inspect` on `926bf32fcb08` and `8ceaa2fcd999` — the
+# two images that carried the whole afternoon's api chain — both return rc 1.
+# Not untagged: ABSENT. The record of what was observed stands; what is gone is
+# anyone's ability to go back and CHECK it.
+#
+# Naming the digest in the report was ALREADY the rule and the fleet followed
+# it all day, and it did not save us: an anchor makes a claim CHECKABLE, not
+# REPRODUCIBLE. So this half does the one thing naming cannot — it makes the
+# RUN unambiguous, by substituting the immutable image id for the tag in the
+# argv before exec. Two things follow that a printed digest does not give you:
+# a rebuild landing mid-chain cannot change what the next container executes,
+# and the id printed beside the verdict is the id that RAN rather than the id
+# the tag pointed at when someone looked.
+#
+# Rebuilding the image from the same ref is NOT the missing arm. `api/Dockerfile`
+# runs `pip install -e ".[dev]"` against `api/pyproject.toml`, whose deps are
+# unpinned floors (`fastapi>=0.110`, …) with no lockfile anywhere in the tree —
+# so a rebuild resolves whatever PyPI serves that day. We have already been bitten
+# by exactly that: an api suite result that depended on the fastapi version. A
+# rebuild from a ref is a NEW environment, not a reproduction.
+#
+# The half that keeps the image alive so a run can be REPEATED is not here,
+# because it cannot be: it belongs to whoever rebuilds the tag. See the
+# T-1001-IMAGE-RETAIN block in deploy-recipes/bot-squad/staging.sh.
+
+# Flags of `docker run` that CONSUME the next argv token. The image is the
+# first non-flag token after them, and getting this wrong does not fail loudly:
+# `--entrypoint python` would hand us `python`, which is a real image name on
+# plenty of hosts. So the parse is explicit, and an unrecognised flag REFUSES
+# rather than guessing — `--image` is the escape hatch.
+_DOCKER_VALUE_FLAGS = {
+    "-a", "--attach", "--add-host", "--annotation", "--blkio-weight",
+    "--blkio-weight-device", "--cap-add", "--cap-drop", "--cgroup-parent",
+    "--cgroupns", "--cidfile", "-c", "--cpu-shares", "--cpu-period",
+    "--cpu-quota", "--cpu-rt-period", "--cpu-rt-runtime", "--cpus",
+    "--cpuset-cpus", "--cpuset-mems", "--detach-keys", "--device",
+    "--device-cgroup-rule", "--device-read-bps", "--device-read-iops",
+    "--device-write-bps", "--device-write-iops", "--dns", "--dns-option",
+    "--dns-search", "--domainname", "--entrypoint", "-e", "--env",
+    "--env-file", "--expose", "--gpus", "--group-add", "--health-cmd",
+    "--health-interval", "--health-retries", "--health-start-period",
+    "--health-timeout", "-h", "--hostname", "--ip", "--ip6", "--ipc",
+    "--isolation", "--kernel-memory", "-l", "--label", "--label-file",
+    "--link", "--link-local-ip", "--log-driver", "--log-opt",
+    "--mac-address", "-m", "--memory", "--memory-reservation",
+    "--memory-swap", "--memory-swappiness", "--mount", "--name", "--net",
+    "--network", "--network-alias", "--oom-score-adj", "--pid",
+    "--pids-limit", "--platform", "--pull", "-p", "--publish", "--restart",
+    "--runtime", "--security-opt", "--shm-size", "--stop-signal",
+    "--stop-timeout", "--storage-opt", "--sysctl", "--tmpfs", "-u", "--user",
+    "--userns", "--ulimit", "--uts", "-v", "--volume", "--volume-driver",
+    "--volumes-from", "-w", "--workdir",
+}
+_DOCKER_BOOL_FLAGS = {
+    "-d", "--detach", "--disable-content-trust", "--help", "-i",
+    "--interactive", "--init", "--no-healthcheck", "--oom-kill-disable",
+    "-P", "--publish-all", "--privileged", "-q", "--quiet", "--read-only",
+    "--rm", "--sig-proxy", "-t", "--tty",
+}
+# The short booleans that legally cluster (`-it`, `-itd`). Deliberately NOT
+# every short flag: clustering a value-taking one (`-itv`) is a different argv
+# shape and must reach the refusal, not be waved through.
+_DOCKER_SHORT_BOOLS = set("ditPq")
+
+
+def _docker_run_index(cmd: list):
+    """Index just past `run` in a `docker run` / `docker container run` argv."""
+    if not cmd or os.path.basename(str(cmd[0])) != "docker":
+        return None
+    if len(cmd) > 1 and str(cmd[1]) == "run":
+        return 2
+    if len(cmd) > 2 and str(cmd[1]) == "container" and str(cmd[2]) == "run":
+        return 3
+    return None
+
+
+def _docker_run_image_index(cmd: list):
+    """Index of the IMAGE argument in a `docker run` argv, or None.
+
+    None means "I could not tell", never "there isn't one" — the caller turns
+    it into a refusal. An identification made by guessing would be worse than
+    no identification at all: it would print an anchor that is confidently
+    about the wrong image.
+    """
+    i = _docker_run_index(cmd)
+    if i is None:
+        return None
+    n = len(cmd)
+    while i < n:
+        tok = str(cmd[i])
+        if not tok.startswith("-"):
+            return i
+        if "=" in tok:                      # --name=x, --entrypoint=python
+            i += 1
+        elif tok in _DOCKER_VALUE_FLAGS:
+            i += 2
+        elif tok in _DOCKER_BOOL_FLAGS:
+            i += 1
+        elif (len(tok) > 2 and not tok.startswith("--")
+              and set(tok[1:]) <= _DOCKER_SHORT_BOOLS):
+            i += 1                          # -it, -itd
+        else:
+            return None                     # unknown flag — refuse, don't guess
+    return None
+
+
+def _resolve_image(ref: str):
+    """``{'id', 'created'}`` for a local image reference, or None if it does
+    not resolve. The id is the anchor: a tag is a pointer someone else can
+    move, and on this host has been moved by the very deploy the measurement
+    was taken to gate."""
+    p = subprocess.run(
+        ["docker", "image", "inspect", str(ref),
+         "--format", "{{.Id}}\t{{.Created}}"],
+        capture_output=True, text=True)
+    if p.returncode != 0 or "\t" not in p.stdout:
+        return None
+    image_id, _, created = p.stdout.strip().partition("\t")
+    if not image_id:
+        return None
+    return {"id": image_id, "created": created.strip()}
+
+
+def _pin_image_in_cmd(cmd: list, explicit: str):
+    """Replace the image reference in ``cmd`` with its immutable id, in place.
+
+    Returns the ENVIRONMENT line for the certification block, or raises through
+    ``die`` with VERIFY_UNMEASURED_RC. Refusing here — BEFORE the run — is
+    deliberate: a suite that takes ten minutes and is then declared unmeasured
+    has spent the host for nothing, and on this box that is not a rounding
+    error.
+    """
+    idx = None
+    if explicit:
+        for i, tok in enumerate(cmd):
+            if str(tok) == explicit:
+                idx = i
+                break
+        if idx is None:
+            die(f"verify-isolated: --image {explicit} does not appear in the "
+                "command, so pinning it would certify an image this run never "
+                "used.\n  Pass the reference exactly as it is written in the "
+                "argv.", code=VERIFY_UNMEASURED_RC)
+    elif _docker_run_index(cmd) is not None:
+        idx = _docker_run_image_index(cmd)
+        if idx is None:
+            die("verify-isolated: this is a `docker run`, but I cannot tell "
+                "which argument names the IMAGE (an unrecognised flag).\n"
+                "  The image is half of what a certification measures and a "
+                "guess here anchors the wrong one, so: pass it explicitly.\n"
+                "  bsq verify-isolated --image bot-squad-api:latest -- docker "
+                "run ...", code=VERIFY_UNMEASURED_RC)
+    if idx is None:
+        return None
+    ref = str(cmd[idx])
+    info = _resolve_image(ref)
+    if info is None:
+        die(f"verify-isolated: {ref!r} does not resolve to an image on this "
+            "host, so nothing here could be anchored to one.\n"
+            "  `docker image inspect` returned non-zero. If the tag was "
+            "rebuilt out from under an earlier measurement, that measurement "
+            "is not wrong — it is UNCHECKABLE, which is a narrower thing.",
+            code=VERIFY_UNMEASURED_RC)
+    cmd[idx] = info["id"]
+    return (f"verify-isolated: ENVIRONMENT {ref} = {info['id']} "
+            f"(created {info['created']})")
+
+
 def cmd_verify_isolated(args) -> None:
     """Run a command against a `git archive` extract of a ref (T-0752).
 
@@ -6108,6 +6297,16 @@ def cmd_verify_isolated(args) -> None:
               flush=True)
         print(f"verify-isolated: extract verified — all {len(tracked)} tracked "
               "path(s) present", flush=True)
+        # T-1001 — pin the ENVIRONMENT as hard as the source is already pinned.
+        # Runs before anything expensive: an unanchorable run must cost the
+        # host nothing.
+        env_line = _pin_image_in_cmd(cmd, getattr(args, "image", None))
+        if env_line:
+            print(env_line, flush=True)
+            print("verify-isolated: substituted the image ID into the command "
+                  "— a rebuild of the tag cannot move this run, and the id "
+                  "above is what EXECUTED, not what the tag pointed at when "
+                  "it was read.", flush=True)
         # T-0983 — EXPORT THE EXTRACT ROOT so the provenance gate can be armed
         # WITHOUT a wrapper. Only this process knows where the extract landed,
         # so arming a gate that (correctly) refuses to default its comparison
@@ -6162,7 +6361,7 @@ def cmd_verify_isolated(args) -> None:
                 chunks.append(block)
         rc = proc.wait()
         output = b"".join(chunks).decode("utf-8", "replace")
-        lines, exit_rc = _certify_pytest_run(output, rc, cmd, sha)
+        lines, exit_rc = _certify_pytest_run(output, rc, cmd, sha, env_line)
         print("")
         for line in lines:
             print(line)
@@ -8547,6 +8746,10 @@ def build_parser() -> argparse.ArgumentParser:
     vi.add_argument("--ref", default="HEAD", help="ref to extract (default HEAD)")
     vi.add_argument("--keep", action="store_true",
                     help="leave the extract in place and print its path")
+    vi.add_argument("--image", default=None,
+                    help="T-1001: the docker image reference this run uses, "
+                         "when the argv is too exotic to parse. It is "
+                         "replaced by the immutable image id before exec.")
     vi.add_argument("cmd", nargs=argparse.REMAINDER,
                     help="command to run inside the extract (after --)")
     vi.set_defaults(func=cmd_verify_isolated)

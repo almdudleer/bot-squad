@@ -268,6 +268,58 @@ def test_evaluate_regex_match():
     assert R.evaluate_probe(spec, _pr(output="all quiet"))[0] == "ok"
 
 
+# --- T-0993: naming the exit-code footgun at RUNTIME -----------------------
+#
+# A static lint cannot see into a probe that delegates to a script (20 of
+# watchrobot's 23 do), and a footgun in the MIDDLE of a script is not a
+# footgun — only one that sets the script's exit code is, which is not a
+# textual property. The runtime signature IS location-independent: the probe
+# exits nonzero while its stdout would have judged fine. These pin that the
+# annotation says so, and — the load-bearing half — that it stays SILENT on a
+# probe that genuinely failed. An annotation that always fires is noise that
+# looks like diagnosis, and is indistinguishable from one that works.
+
+
+def test_rc_error_names_the_footgun_when_stdout_would_have_judged():
+    spec = R.MonitorTrigger(_spec(judge="numeric_gt", threshold=0)).spec
+    # a counter that exits 1 on its healthy zero-match case (T-0708's shape)
+    verdict, value = R.evaluate_probe(spec, _pr(exit_code=1, output="0"))
+    assert verdict == "error"          # the verdict is UNCHANGED: not a gate
+    assert "would have judged ok" in value
+    assert "'0'" in value              # the value itself, not just a verdict
+
+
+def test_rc_error_footgun_hint_reports_a_hidden_BREACH_as_such():
+    spec = R.MonitorTrigger(_spec(judge="numeric_gt", threshold=0)).spec
+    verdict, value = R.evaluate_probe(spec, _pr(exit_code=1, output="7"))
+    assert verdict == "error"
+    assert "would have judged breach" in value
+
+
+def test_rc_error_hint_is_SILENT_on_a_genuinely_failed_probe():
+    """The arm that fails if the annotation ever becomes unconditional."""
+    spec = R.MonitorTrigger(_spec(judge="numeric_gt", threshold=0)).spec
+    # no stdout at all — the probe really did fail
+    _, empty = R.evaluate_probe(spec, _pr(exit_code=1, error="connection refused"))
+    assert "would have judged" not in empty
+    assert empty == "exit=1: connection refused"
+    # stdout present but unjudgeable — still a real failure, still silent
+    _, junk = R.evaluate_probe(spec, _pr(exit_code=1, output="Traceback (most recent",
+                                         error="boom"))
+    assert "would have judged" not in junk
+
+
+def test_rc_error_hint_survives_a_long_stderr_and_healthy_probes_untouched():
+    spec = R.MonitorTrigger(_spec(judge="numeric_gt", threshold=0)).spec
+    # detail is clipped at a hardcoded 200; the hint is appended OUTSIDE that
+    # clip, so a noisy probe cannot silently eat its own diagnosis.
+    _, value = R.evaluate_probe(spec, _pr(exit_code=1, output="0", error="x" * 900))
+    assert "would have judged ok" in value
+    # and nothing that exits 0 is touched by any of this
+    assert R.evaluate_probe(spec, _pr(output="0")) == ("ok", 0)
+    assert R.evaluate_probe(spec, _pr(output="5")) == ("breach", 5)
+
+
 def test_evaluate_probe_errors_are_not_breaches():
     spec = R.MonitorTrigger(_spec()).spec
     # probe did not run (timeout / exec error)

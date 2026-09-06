@@ -47,7 +47,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -490,7 +490,27 @@ def evaluate_probe(spec: dict, probe: ProbeResult) -> tuple[str, Any]:
         return ("breach" if probe.exit_code != 0 else "ok", probe.exit_code)
     if probe.exit_code != 0:
         detail = (probe.error or "").strip()[:200]
-        return ("error", f"exit={probe.exit_code}" + (f": {detail}" if detail else ""))
+        # T-0993: the rc path discards stdout at exactly the moment stdout is
+        # diagnostic. A counter that exits 1 on its healthy zero-match case
+        # (T-0708's footgun) prints a perfectly judgeable value and then loses
+        # it to its own exit code, and the result is indistinguishable here
+        # from a probe that genuinely failed. Re-judge the SAME stdout as if
+        # the probe had exited 0: if that yields a verdict, it is the exit
+        # code and not the measurement that failed. This observes the RESULT,
+        # so it works wherever the command lives — inline, in a delegated
+        # script, or in a container, none of which a static lint can read.
+        # Reuses this function rather than restating the judging rules, so the
+        # hint can never disagree with the judge it is describing.
+        hint = ""
+        if probe.output.strip():
+            would, would_value = evaluate_probe(spec, replace(probe, exit_code=0))
+            if would != "error":
+                hint = (f" [stdout {str(would_value)[:80]!r} would have judged "
+                        f"{would} — exit code may not be this probe's signal; "
+                        f"cf T-0708]")
+        return ("error",
+                f"exit={probe.exit_code}"
+                + (f": {detail}" if detail else "") + hint)
     if judge == "regex_match":
         value = probe.output.strip()[:_MONITOR_VALUE_CLIP]
         breach = re.search(str(threshold), probe.output) is not None

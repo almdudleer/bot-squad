@@ -233,6 +233,9 @@ def test_over_cap_batch_names_the_oldest_and_counts_the_rest(cfg, backlog, dm):
 
 
 def test_capped_backlog_rotates_out_over_successive_sweeps(cfg, backlog, dm):
+    """Rotation across sweeps SPACED PAST the page-rate-limit interval — the
+    steady-state case the operator asked for: a backlog drains as one digest
+    per interval, not one per 300s sweep."""
     since_base = status_deadlines._parse_iso("2026-08-01T00:00:00Z")
     n = status_deadlines.MESSAGE_CAP + 3
     for i in range(n):
@@ -243,15 +246,96 @@ def test_capped_backlog_rotates_out_over_successive_sweeps(cfg, backlog, dm):
     assert out1["breaches"] == n  # every one of them IS a breach...
     assert len(dm.calls) == 1  # ...but only one message, capped
 
-    out2 = status_deadlines.deadline_check_tick_one(cfg, "test-project", now=now + 1)
+    step = status_deadlines.page_min_interval_sec()
+    out2 = status_deadlines.deadline_check_tick_one(cfg, "test-project", now=now + step)
     assert out2["breaches"] == 3  # the leftover 3, uncapped this time
     assert len(dm.calls) == 2
     for i in range(status_deadlines.MESSAGE_CAP, n):
         assert f"T-{i:04d}" in dm.calls[1]["message"]
 
-    out3 = status_deadlines.deadline_check_tick_one(cfg, "test-project", now=now + 2)
+    out3 = status_deadlines.deadline_check_tick_one(cfg, "test-project", now=now + 2 * step)
     assert out3["breaches"] == 0  # fully surfaced now
     assert len(dm.calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# Page rate limit (decoupled from the 300s SWEEP cadence) — operator review
+# ---------------------------------------------------------------------------
+
+
+def test_page_rate_limit_defaults():
+    assert status_deadlines.page_min_interval_sec() == 3600
+
+
+def test_page_rate_limit_env_override(monkeypatch):
+    monkeypatch.setenv("BOT_SQUAD_TICKET_DEADLINE_PAGE_MIN_INTERVAL_SEC", "60")
+    assert status_deadlines.page_min_interval_sec() == 60
+    monkeypatch.setenv("BOT_SQUAD_TICKET_DEADLINE_PAGE_MIN_INTERVAL_SEC", "-5")
+    assert status_deadlines.page_min_interval_sec() == 3600
+
+
+def test_sweep_at_300s_does_not_page_twice_within_the_hour(cfg, backlog, dm):
+    """The exact operator scenario: a backlog big enough to need several
+    rotation batches must NOT turn into a page every 300s scheduler tick —
+    only the first sweep inside the rate-limit window may page; the rest
+    still SWEEP (rotation bookkeeping stays live) but hold the send."""
+    since_base = status_deadlines._parse_iso("2026-08-01T00:00:00Z")
+    n = status_deadlines.MESSAGE_CAP + 3
+    for i in range(n):
+        since_iso = _iso(since_base - (n - i))
+        _write_task(backlog, f"T-{i:04d}", status="totest", status_since=since_iso)
+    now = since_base + 73 * 3600
+    out1 = status_deadlines.deadline_check_tick_one(cfg, "test-project", now=now)
+    assert out1["delivered"] is True and out1["rate_limited"] is False
+    assert len(dm.calls) == 1
+
+    # a sweep 300s later (the real scheduler cadence) still finds the
+    # leftover 3 as breaches, but the page is held back
+    out2 = status_deadlines.deadline_check_tick_one(cfg, "test-project", now=now + 300)
+    assert out2["breaches"] == 3
+    assert out2["delivered"] is False and out2["rate_limited"] is True
+    assert len(dm.calls) == 1  # still just the one page
+
+    # once the interval elapses, the held-back breach finally pages
+    out3 = status_deadlines.deadline_check_tick_one(
+        cfg, "test-project", now=now + status_deadlines.page_min_interval_sec())
+    assert out3["delivered"] is True and out3["rate_limited"] is False
+    assert len(dm.calls) == 2
+
+
+def test_a_genuine_new_breach_still_pages_promptly_in_steady_state(cfg, backlog, dm):
+    """The operator's "steady state still pages promptly" claim, pinned: a
+    single breach with no recent page at all is never held back by the rate
+    limit — `last_paged_at` starts unset, so the FIRST page is immediate."""
+    since = "2026-08-01T00:00:00Z"
+    _write_task(backlog, "T-0001", status="blocked_on_user", status_since=since)
+    now = status_deadlines._parse_iso(since) + 25 * 3600
+    out = status_deadlines.deadline_check_tick_one(cfg, "test-project", now=now)
+    assert out["delivered"] is True and out["rate_limited"] is False
+
+
+def test_rate_limit_never_erases_last_paged_at_on_an_unrelated_write(cfg, backlog, dm):
+    """A tasks-only sidecar write (a resolved ticket dropping out) must not
+    wipe the page-cadence bookkeeping sitting alongside it."""
+    since_base = status_deadlines._parse_iso("2026-08-01T00:00:00Z")
+    n = status_deadlines.MESSAGE_CAP + 1
+    paths = []
+    for i in range(n):
+        since_iso = _iso(since_base - (n - i))
+        paths.append(_write_task(backlog, f"T-{i:04d}", status="totest", status_since=since_iso))
+    now = since_base + 73 * 3600
+    status_deadlines.deadline_check_tick_one(cfg, "test-project", now=now)
+    _, last_paged_at = status_deadlines._read_state(cfg, "test-project")
+    assert last_paged_at == now
+
+    # resolve the one leftover (uncapped) ticket — a tasks-only change
+    paths[-1].write_text(
+        paths[-1].read_text().replace("status: totest", "status: in_progress"),
+        encoding="utf-8",
+    )
+    status_deadlines.deadline_check_tick_one(cfg, "test-project", now=now + 5)
+    _, last_paged_at2 = status_deadlines._read_state(cfg, "test-project")
+    assert last_paged_at2 == now  # untouched by the unrelated cleanup
 
 
 def test_undelivered_send_defers_not_drops(cfg, backlog, dm):

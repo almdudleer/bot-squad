@@ -57,6 +57,23 @@ leaves the sidecar unstamped so the breach retries every tick until delivered,
 same as the lifecycle notifier.
 
 Kill switch: ``BOT_SQUAD_TICKET_DEADLINES=0``.
+
+PAGE CADENCE vs SWEEP CADENCE (T-0752/operator review, 2026-09-06)
+-------------------------------------------------------------------
+The 300s scheduler tick is a SWEEP interval — how often the board is
+re-checked — not a PAGE interval. The first live sweep found 56 of 63 gated
+tickets already breaching (a pre-existing backlog, not a bug), which the
+:data:`MESSAGE_CAP` batching turns into 6 pages inside 30 minutes at the raw
+300s cadence — individually correct, but the T-0820/T-0834 shape: an alarm
+that fires repeatedly gets muted, and the true positive it exists for stops
+landing. :func:`page_min_interval_sec` decouples the two: the sweep still
+runs every 300s and still rotates through the capped backlog, but an actual
+PAGE for a project fires at most once per :data:`DEFAULT_PAGE_MIN_INTERVAL_SEC`
+— so a steady-state breach (rare enough that the previous page is already
+outside the window) still pages promptly, while a backlog catch-up drains as
+readable hourly digests instead of a half-hour siren burst. The header
+already carries the true total on every page, so throttling the SEND never
+hides the size of the problem — it only paces how often he is asked to look.
 """
 from __future__ import annotations
 
@@ -86,6 +103,15 @@ _ENV_OVERRIDE: dict[str, str] = {
 
 GATED_STATUSES = frozenset(DEFAULT_DEADLINE_SEC)
 
+#: Minimum gap between two PAGES for the same project (never between sweeps —
+#: see the module docstring's "PAGE CADENCE vs SWEEP CADENCE"). 1h by default:
+#: long enough that a multi-ticket backlog catch-up reads as an hourly digest
+#: rather than a siren burst, short enough that a genuine new breach is never
+#: sitting silent for more than an hour once it clears its own 24h/72h
+#: deadline — a rounding error at that timescale, not a new silence.
+DEFAULT_PAGE_MIN_INTERVAL_SEC = 3600
+_PAGE_MIN_INTERVAL_ENV = "BOT_SQUAD_TICKET_DEADLINE_PAGE_MIN_INTERVAL_SEC"
+
 
 def deadline_sec(status: str) -> Optional[int]:
     """Env-tunable deadline for ``status``, or ``None`` when it isn't gated."""
@@ -100,6 +126,18 @@ def deadline_sec(status: str) -> Optional[int]:
         except (TypeError, ValueError):
             pass
     return DEFAULT_DEADLINE_SEC[status]
+
+
+def page_min_interval_sec() -> int:
+    raw = os.environ.get(_PAGE_MIN_INTERVAL_ENV)
+    if raw:
+        try:
+            v = int(raw)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_PAGE_MIN_INTERVAL_SEC
 
 
 def _now_iso() -> str:
@@ -232,33 +270,55 @@ def _sidecar_path(cfg: Any, slug: str) -> Path:
     return Path(cfg.data_dir) / "_worker" / "status_deadlines" / f"{slug}.json"
 
 
-def _read_sidecar(cfg: Any, slug: str) -> dict[str, dict]:
-    """``{task_id: {"status":..., "since":...}}`` for the last stay already
-    alerted on. Missing/corrupt file = empty (worst case a breach re-alerts
-    once more — never a crash, never a blast)."""
+def _read_state(cfg: Any, slug: str) -> tuple[dict[str, dict], Optional[float]]:
+    """``(tasks, last_paged_at)`` — ``tasks`` is ``{task_id: {"status":...,
+    "since":...}}`` for the last stay already alerted on; ``last_paged_at`` is
+    the epoch of the last successful PAGE for this project (see the module
+    docstring's "PAGE CADENCE vs SWEEP CADENCE"), or ``None`` if never paged.
+    Missing/corrupt file = both empty/None (worst case a breach re-alerts once
+    more, or a page fires promptly instead of waiting out a lost interval —
+    never a crash, never a blast)."""
     try:
         raw = json.loads(_sidecar_path(cfg, slug).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {}
-    tasks = raw.get("tasks") if isinstance(raw, dict) else None
-    if not isinstance(tasks, dict):
-        return {}
-    out: dict[str, dict] = {}
-    for k, v in tasks.items():
-        if isinstance(v, dict) and "status" in v and "since" in v:
-            out[str(k)] = {"status": str(v["status"]), "since": str(v["since"])}
-    return out
+        return {}, None
+    tasks_raw = raw.get("tasks") if isinstance(raw, dict) else None
+    tasks: dict[str, dict] = {}
+    if isinstance(tasks_raw, dict):
+        for k, v in tasks_raw.items():
+            if isinstance(v, dict) and "status" in v and "since" in v:
+                tasks[str(k)] = {"status": str(v["status"]), "since": str(v["since"])}
+    lp = raw.get("last_paged_at") if isinstance(raw, dict) else None
+    last_paged_at = float(lp) if isinstance(lp, (int, float)) else None
+    return tasks, last_paged_at
+
+
+def _write_state(cfg: Any, slug: str, tasks: dict[str, dict],
+                  last_paged_at: Optional[float]) -> None:
+    p = _sidecar_path(cfg, slug)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {"tasks": tasks, "updated_at": _now_iso()}
+    if last_paged_at is not None:
+        payload["last_paged_at"] = last_paged_at
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def _read_sidecar(cfg: Any, slug: str) -> dict[str, dict]:
+    """The ``tasks`` half of :func:`_read_state` — kept as its own name
+    because it is what the tests (and any future reader) actually want most
+    of the time: which stays are already alerted."""
+    tasks, _ = _read_state(cfg, slug)
+    return tasks
 
 
 def _write_sidecar(cfg: Any, slug: str, tasks: dict[str, dict]) -> None:
-    p = _sidecar_path(cfg, slug)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(
-        json.dumps({"tasks": tasks, "updated_at": _now_iso()}, indent=1),
-        encoding="utf-8",
-    )
-    os.replace(tmp, p)
+    """Write ``tasks`` while PRESERVING whatever ``last_paged_at`` is already
+    on disk — a tasks-only write (e.g. dropping a resolved ticket) must never
+    erase the page-cadence bookkeeping alongside it."""
+    _, last_paged_at = _read_state(cfg, slug)
+    _write_state(cfg, slug, tasks, last_paged_at)
 
 
 def _notify(cfg: Any, slug: str, text: str) -> bool:
@@ -289,7 +349,7 @@ def deadline_check_tick_one(cfg: Any, slug: str, now: Optional[float] = None) ->
     if now is None:
         now = time.time()
     rows = _scan_backlog(cfg, slug)
-    state = _read_sidecar(cfg, slug)
+    state, last_paged_at = _read_state(cfg, slug)
     new_state = dict(state)
     breaches: list[dict] = []
 
@@ -318,19 +378,33 @@ def deadline_check_tick_one(cfg: Any, slug: str, now: Optional[float] = None) ->
         new_state.pop(gone, None)
 
     delivered = False
+    rate_limited = False
     if breaches:
-        text, shown = _compose_message(breaches)
-        delivered = _notify(cfg, slug, text)
-        if delivered:
-            # Only the NAMED subset is marked alerted — a breach left out by
-            # the cap stays pending so it is named in a later sweep instead of
-            # disappearing into "+N more" forever.
-            for b in shown:
-                new_state[b["id"]] = {"status": b["status"], "since": b["since_iso"]}
+        min_interval = page_min_interval_sec()
+        if last_paged_at is not None and (now - last_paged_at) < min_interval:
+            # Sweep and rotation still happened above (breaches is real,
+            # `new_state` may still have dropped resolved tickets below) — only
+            # the PAGE is held back, so a steady-state breach that arrives well
+            # outside the last page's window is never delayed by this branch.
+            rate_limited = True
+        else:
+            text, shown = _compose_message(breaches)
+            delivered = _notify(cfg, slug, text)
+            if delivered:
+                # Only the NAMED subset is marked alerted — a breach left out
+                # by the cap stays pending so it is named in a later sweep
+                # instead of disappearing into "+N more" forever.
+                for b in shown:
+                    new_state[b["id"]] = {"status": b["status"], "since": b["since_iso"]}
+                last_paged_at = now
 
     if new_state != state:
-        _write_sidecar(cfg, slug, new_state)
-    return {"ok": True, "slug": slug, "breaches": len(breaches), "delivered": delivered}
+        # A successful page always adds at least one entry to `new_state`
+        # (the shown subset), so this also covers persisting the fresh
+        # `last_paged_at` — the two never change independently.
+        _write_state(cfg, slug, new_state, last_paged_at)
+    return {"ok": True, "slug": slug, "breaches": len(breaches),
+            "delivered": delivered, "rate_limited": rate_limited}
 
 
 def deadline_check_tick(cfg: Any) -> dict:

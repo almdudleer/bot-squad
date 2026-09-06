@@ -6661,6 +6661,43 @@ def cmd_build_api(args) -> None:
         print(f"build-api: {ref} now resolves to {after['id']}")
     sys.exit(rc)
 
+# --- T-0994: a certification carries its own admission ticket ---------------
+# `verify-isolated` was one of the TWO MANDATED ways to run a suite that
+# BYPASSED the fleet suite lock entirely (the deploy recipe was the other).
+# A lane certifying the way it was told to was not defying the rule — the tool
+# did not implement it. That is the structural half of why six suite processes
+# ran across three lanes while a TL held the lock by hand.
+#
+# It ADMITS rather than ACQUIRES, deliberately. A frozen-extract run is
+# containerless — no daemon round-trip, no image pull, no container start — so
+# it is not governed by the container pool; and a certification that BLOCKS on
+# a semaphore turns a measurement into a queue artefact. So this records the
+# gate readings beside the count and never delays the run.
+#
+# Fails OPEN and SAYS SO: an extract, a clone, or the install may not have the
+# module, and an exemption you ANNOUNCE is auditable while one you improvise is
+# how the next unsatisfiable rule gets written.
+def _verify_admission_ticket() -> str:
+    """One line recording D-state/load at the moment this certification began."""
+    gate = Path(__file__).resolve().parent / "fleet_slot.py"
+    if not gate.exists():
+        return (f"verify-isolated: fleet gate UNREACHABLE in this tree "
+                f"({gate}) — run NOT admitted through it, and this line is the "
+                f"announcement of that exemption")
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_bsq_fleet_slot", gate)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        ok, reason, rec = mod.admit(note="verify-isolated certification",
+                                    kind="containerless")
+        return (f"verify-isolated: {mod._admission_line(rec)} — "
+                f"admission {'PASSED' if ok else 'OVER CEILING'} ({reason}); "
+                f"recorded, NOT blocking (a certification must not queue)")
+    except Exception as exc:  # noqa: BLE001 - never fail a certification on the gate
+        return f"verify-isolated: fleet gate errored ({exc!r}) — run NOT admitted"
+
+
 def cmd_verify_isolated(args) -> None:
     """Run a command against a `git archive` extract of a ref (T-0752).
 
@@ -6758,6 +6795,7 @@ def cmd_verify_isolated(args) -> None:
               "the provenance gate needs no wrapper)", flush=True)
         if report_note:
             print(report_note, flush=True)
+        print(_verify_admission_ticket(), flush=True)
         print(f"verify-isolated: running: {' '.join(cmd)}\n", flush=True)
         # Captured AND streamed. Capturing is what makes the verdict below
         # possible; streaming is what keeps the evidence readable while a long

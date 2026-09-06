@@ -5016,9 +5016,19 @@ def _drift_message(st: dict, *, just_committed: bool = True) -> str | None:
             "not from here. Re-run `git fetch origin` before you report READY.\n"
         )
     behind, unshipped = st.get("behind", 0), st.get("unshipped")
-    if behind <= _DRIFT_BEHIND_LIMIT and not unshipped:
+    # `unshipped is None` means `git cherry` did not answer. That is NOT zero:
+    # `not None` is true, so folding it into the quiet path would turn a failed
+    # measurement into "nothing to say" — a guard passing because its instrument
+    # broke, which is the whole failure this ticket is about.
+    content_unknown = unshipped is None
+    if behind <= _DRIFT_BEHIND_LIMIT and not unshipped and not content_unknown:
         return None
     lines = ["\n*** CLONE DRIFT (T-0959) ***"]
+    if content_unknown:
+        lines.append(
+            "The content check did not run (git cherry failed), so whether commits here\n"
+            "are missing from origin is UNKNOWN — not zero. Re-run `bsq clone-drift`."
+        )
     if behind > _DRIFT_BEHIND_LIMIT:
         lines.append(
             f"This clone is {behind} commit(s) BEHIND {st['upstream']}."

@@ -1803,6 +1803,7 @@ def run_next(cfg: "Config", slug: str) -> DeployResult | None:
     wd = _run_recipe_watchdog(
         recipe, repo, log_path, budget_s, no_progress_floor_s, queue_id,
         ceiling_s=ceiling_s, tempo_multiplier=tempo_multiplier,
+        slots_dir=Path(cfg.data_dir) / "_worker" / "fleet_slots",
     )
     rc, killed_reason = wd.returncode, wd.killed_reason
 
@@ -2196,6 +2197,128 @@ class WatchdogOutcome:
     budget_s: int = 0
 
 
+# ---------------------------------------------------------------------------
+# T-0994: the deploy takes the fleet gate IN CODE.
+#
+# The one-suite-at-a-time control used to be enforced by CONVENTION IN AGENT
+# PROMPTS ONLY. Every session wrapped its runs because it was told to; the
+# deploy is an automated path that runs `docker compose build` and did not,
+# because there is no human in that loop to remember. A control that holds only
+# where somebody read the prose carefully is not a control — and on 2026-09-06
+# a TL had to wrap the deploy in the fleet lock BY HAND, holding it for the
+# measured 14.01 minutes from queue to rc.
+#
+# `scripts/cli/fleet_slot.py` is loaded BY ABSOLUTE PATH rather than imported:
+# it is deliberately stdlib-only and outside the package, so this must not
+# depend on it being importable, on sys.path, or on a venv layout.
+# ---------------------------------------------------------------------------
+
+#: How long the deploy waits for container slots to drain before proceeding
+#: anyway. It PROCEEDS rather than failing, because a deploy queue that
+#: deadlocks on a gate is a worse outage than a build that overlaps a suite —
+#: but the override is written into the run log, never taken silently.
+DEFAULT_SLOT_WAIT_SECONDS = int(os.environ.get("BOT_SQUAD_DEPLOY_SLOT_WAIT", "900"))
+
+_FLEET_SLOT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "cli" / "fleet_slot.py"
+
+
+def _fleet_slot_module():
+    """Load ``scripts/cli/fleet_slot.py`` by path, or None when unavailable."""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_bot_squad_fleet_slot", _FLEET_SLOT_PATH)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+class _FleetSlot:
+    """Hold an exclusive ``build`` slot for the lifetime of a deploy recipe.
+
+    Fails OPEN and LOUD: if the gate module is missing or errors, the deploy
+    still runs and the run log says the gate was not taken. A deploy silently
+    skipping the gate is the defect; a deploy blocked forever by a missing
+    helper file is a new outage.
+    """
+
+    def __init__(self, note: str, log_path: Path, slots_dir: Path | None = None,
+                 wait_s: int = DEFAULT_SLOT_WAIT_SECONDS):
+        self.note = note
+        self.log_path = log_path
+        # The gate state lives BESIDE the data dir this deploy is operating on.
+        # Anchoring it to the install's fixed path instead was a real defect,
+        # caught by running the deploy suite through the gate: the unit tests
+        # took a LIVE EXCLUSIVE BUILD SLOT and blocked the whole fleet's
+        # container work for a minute. A test must not be able to reach the
+        # production semaphore, and "remember to set the env var" is the same
+        # kind of prose control this ticket exists to remove.
+        self.slots_dir = slots_dir
+        self.wait_s = wait_s
+        self.token = None
+        self._mod = None
+
+    def _log(self, msg: str) -> None:
+        try:
+            with self.log_path.open("a") as fh:
+                fh.write(f"[fleet-gate] {msg}\n")
+        except OSError:
+            pass
+
+    def __enter__(self):
+        self._mod = _fleet_slot_module()
+        if self._mod is None:
+            self._log(f"NOT TAKEN — {_FLEET_SLOT_PATH} unavailable. This build is "
+                      f"running UNGATED and may overlap fleet container work.")
+            return self
+        try:
+            ok, reason, rec = self._mod.admission_check(self.slots_dir)
+            self._log(f"admission {'PASSED' if ok else 'OVER CEILING'} — {reason}; "
+                      f"{self._mod._admission_line(rec)}")
+            # A deploy is not discretionary work, so a hot host DELAYS it via
+            # the slot queue rather than cancelling it; the reading is recorded
+            # either way so the run carries its own admission ticket.
+            self.token, adm = self._mod.acquire(
+                "build", pgid=os.getpgrp(), lane="deploy", note=self.note,
+                wait=self.wait_s, sd=self.slots_dir)
+            self._log(f"acquired exclusive build slot {self.token} after "
+                      f"{adm.get('waited_s')}s — {self.note}")
+        except TimeoutError as exc:
+            self._log(f"PROCEEDING WITHOUT THE SLOT after {self.wait_s}s: {exc} "
+                      f"This build overlapped fleet container work.")
+        except Exception as exc:  # pragma: no cover - defensive
+            self._log(f"NOT TAKEN — gate raised {exc!r}. Build is UNGATED.")
+        return self
+
+    def adopt(self, pgid: int) -> None:
+        """Hand the slot to the recipe's process group.
+
+        The worker supervises the recipe but does not BE it, and the recipe
+        survives a worker restart by design (systemd --user --scope). If the
+        slot's liveness stayed on the worker, restarting the worker would free
+        a slot whose `docker build` is still running — the same shape as
+        ``flock``'s parent dying while its child held the lock.
+        """
+        if self._mod and self.token:
+            try:
+                self._mod.adopt(self.token, pgid, sd=self.slots_dir)
+            except Exception:
+                pass
+
+    def __exit__(self, *exc):
+        if self._mod and self.token:
+            try:
+                self._mod.release(self.token, sd=self.slots_dir)
+                self._log(f"released {self.token}")
+            except Exception:
+                pass
+        return False
+
+
 def _run_recipe_watchdog(
     recipe: Path,
     repo: Path,
@@ -2205,6 +2328,7 @@ def _run_recipe_watchdog(
     queue_id: str = "",
     ceiling_s: int = DEFAULT_CEILING_SECONDS,
     tempo_multiplier: float = DEFAULT_TEMPO_MULTIPLIER,
+    slots_dir: Path | None = None,
 ) -> WatchdogOutcome:
     """Run ``bash <recipe>`` (cwd=repo, output→log_path) under supervision.
 
@@ -2242,14 +2366,33 @@ def _run_recipe_watchdog(
     """
     poll_interval = float(os.environ.get("BOT_SQUAD_DEPLOY_POLL_SECONDS", "5"))
     argv = _scope_wrap(["bash", str(recipe)], f"bot-squad-deploy-{queue_id or 'run'}")
-    with log_path.open("w") as lf:
-        proc = subprocess.Popen(
-            argv,
-            cwd=str(repo),
-            stdout=lf,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,  # own process group → killpg reaches children
-        )
+    # Truncate the log first so the gate's own lines survive (it appends).
+    log_path.write_text("")
+    with _FleetSlot(f"deploy {queue_id or 'run'}", log_path, slots_dir) as slot:
+        with log_path.open("a") as lf:
+            proc = subprocess.Popen(
+                argv,
+                cwd=str(repo),
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,  # own process group → killpg reaches children
+            )
+        try:
+            slot.adopt(os.getpgid(proc.pid))
+        except OSError:
+            pass
+        return _watch_recipe(proc, recipe, log_path, budget_s, no_progress_floor_s,
+                             ceiling_s, tempo_multiplier, poll_interval)
+
+
+def _watch_recipe(proc, recipe: Path, log_path: Path, budget_s: int,
+                  no_progress_floor_s: int, ceiling_s: int,
+                  tempo_multiplier: float, poll_interval: float) -> WatchdogOutcome:
+    """The supervision loop, split out so the fleet slot wraps the whole run.
+
+    Unchanged behaviour — see :func:`_run_recipe_watchdog` for the three ways a
+    run ends and why the silence budget is recomputed rather than fixed.
+    """
 
     start = time.monotonic()
     last_progress = start

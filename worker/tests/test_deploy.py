@@ -3964,3 +3964,54 @@ def test_deploy_ping_stays_green_when_every_per_user_worker_is_current(
     assert text.startswith("✅ deploy test-project/staging SUCCESS")
     assert "COORDINATOR ONLY" not in text
     assert "all already converged" in text
+
+
+# ---------------------------------------------------------------------------
+# T-0994: the deploy takes the fleet gate IN CODE, and a TEST must not be able
+# to reach the production one.
+# ---------------------------------------------------------------------------
+
+def test_run_next_takes_a_build_slot_under_the_config_data_dir(tmp_path: Path) -> None:
+    """The deploy path holds an exclusive fleet BUILD slot for the recipe.
+
+    The control it replaces was enforced by convention in agent prompts only:
+    every session wrapped its runs because it was told to, and the deploy — an
+    automated path with no human in that loop — did not, so a TL had to wrap it
+    by hand for a measured 14.01 minutes.
+
+    **And the gate state must live under ``cfg.data_dir``, not the install's
+    fixed path.** Anchoring it to the install was a real defect, found by
+    running this very suite through the gate: the unit tests took a LIVE
+    EXCLUSIVE BUILD SLOT and blocked the whole fleet's container work. A test
+    that can reach the production semaphore is a test that throttles seven
+    lanes to prove a point about itself.
+    """
+    proj = _make_project(tmp_path)
+    cfg = _make_config(tmp_path, proj)
+    _make_recipe(tmp_path, cfg, proj.slug, "staging", rc=0)
+
+    enqueue(cfg, proj.slug, "staging", "gated deploy", "user")
+    result = run_next(cfg, proj.slug)
+    assert result is not None and result.ok is True
+
+    gate = cfg.data_dir / "_worker" / "fleet_slots"
+    assert gate.is_dir(), (
+        "the deploy did not take the gate under cfg.data_dir — if it ran at "
+        "all, it reached the INSTALL's fleet state from a unit test")
+
+    # It recorded an admission ticket, and released the slot on the way out.
+    tickets = (gate / "admissions.ndjson").read_text().strip().splitlines()
+    assert tickets, "the run carried no admission ticket"
+    last = json.loads(tickets[-1])
+    assert last["kind"] == "build" and last["granted"] is True
+    assert list((gate / "holders").glob("*.json")) == [], "the build slot leaked"
+
+    # And the run log SAYS the gate was taken — a deploy that skipped it
+    # silently is the defect; one that says so is a control.
+    log_path = next((cfg.data_dir / proj.slug / "_jobs" / "deploy" / "runs")
+                    .glob(f"{result.queue_id}.log"))
+    body = log_path.read_text()
+    assert "[fleet-gate]" in body, body[:500]
+    assert "acquired exclusive build slot" in body, body[:500]
+    # The recipe's own output survived the gate's appends.
+    assert "released" in body

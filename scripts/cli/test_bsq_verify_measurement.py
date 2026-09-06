@@ -19,7 +19,10 @@ expectations.
 from __future__ import annotations
 
 import importlib.util
+import os
+import re
 import subprocess
+import sys
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -268,3 +271,169 @@ def test_an_unlistable_ref_is_UNKNOWN_not_complete(real_extract):
         str(dest), "0000000000000000000000000000000000000000", str(dest))
     assert missing is None
     assert tracked == []
+
+
+# --- T-0983: the measurement arm and the provenance gate, in ONE run --------
+#
+# THE TRAP THIS PINS is not a defect in either tool — it is what they did to
+# each other. `verify-isolated` refuses to report a pass count for a command it
+# cannot parse as pytest; the provenance gate requires an absolute extract root
+# and deliberately refuses to default one (`realpath("")` is the CWD and is
+# truthy, so a defaulted target is not a gate). Only the run knows where the
+# extract landed, so arming the gate meant
+#     verify-isolated ... -- bash -c 'GATE_EXTRACT_ROOT="$PWD" ... pytest ...'
+# and `bash -c` is not a pytest argv, so the measurement arm switched itself
+# off. Both refusals are correct. Together they forced every lane to give up
+# one of them, and a report missing either arm reads exactly like a complete
+# one.
+#
+# The stub gate below is NOT a copy of the real plugin and does not try to be.
+# What is under test is the HANDOFF — that a child plugin can read the extract
+# root with no wrapper, and that verify-isolated still measures the same run —
+# so the stub implements only the two states that handoff has: root visible and
+# correct, and a plugin that refuses via pytest.exit().
+
+_STUB_GATE = '''\
+import os
+import pytest
+
+def pytest_sessionfinish(session, exitstatus):
+    root = os.environ.get("GATE_EXTRACT_ROOT")
+    print(f"\\nSTUB_GATE root={root!r} cwd={os.getcwd()!r}")
+    if not root:
+        pytest.exit("PROVENANCE=REFUSED GATE_EXTRACT_ROOT is unset", returncode=91)
+    if os.path.realpath(root) != os.path.realpath(os.getcwd()):
+        pytest.exit(f"PROVENANCE=FAILED root {root} is not the run's cwd",
+                    returncode=91)
+    if os.environ.get("STUB_GATE_REFUSE"):
+        pytest.exit("PROVENANCE=FAILED 25 module(s) resolved outside the extract",
+                    returncode=91)
+    print("STUB_GATE PROVENANCE=OK")
+'''
+
+_TRIVIAL_TEST = "def test_one(): assert True\ndef test_two(): assert True\n"
+
+
+@pytest.fixture(scope="module")
+def gate_sandbox(tmp_path_factory):
+    """A plugin dir + a two-test file, both OUTSIDE the extract on purpose.
+
+    The extract holds only what is committed, so anything the child needs that
+    is not in the ref has to arrive the way a real gate does — on PYTHONPATH.
+    """
+    d = tmp_path_factory.mktemp("t0983")
+    (d / "stub_gate.py").write_text(_STUB_GATE)
+    (d / "test_trivial.py").write_text(_TRIVIAL_TEST)
+    return d
+
+
+def _run_verify(gate_sandbox, extra_env=None, cmd=()):
+    """Invoke the REAL `bsq verify-isolated` against HEAD. Returns (rc, output)."""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(gate_sandbox)
+    env.update(extra_env or {})
+    proc = subprocess.run(
+        [sys.executable, str(_BSQ_PATH), "verify-isolated", "--"] + list(cmd),
+        cwd=_repo_root(), env=env, capture_output=True, text=True)
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def test_the_extract_root_reaches_the_child_with_no_wrapper(gate_sandbox):
+    """THE FIX. `GATE_EXTRACT_ROOT` is exported by the tool that made the
+    extract, so no `bash -c` stands between verify-isolated and pytest."""
+    rc, out = _run_verify(gate_sandbox, cmd=[
+        sys.executable, "-c",
+        "import os;print('CHILD_ROOT=' + os.environ.get('GATE_EXTRACT_ROOT','<unset>'));"
+        "print('CHILD_CWD=' + os.getcwd())"])
+    # Anchored: verify-isolated ECHOES the command it is about to run, so an
+    # unanchored search matches the `-c` source text before the child's output.
+    root = re.search(r"^CHILD_ROOT=(\S+)$", out, re.M)
+    cwd = re.search(r"^CHILD_CWD=(\S+)$", out, re.M)
+    assert root and cwd, out
+    assert root.group(1) != "<unset>", out
+    assert os.path.isabs(root.group(1)), out
+    # It must be THIS run's extract, not merely some absolute path.
+    assert os.path.realpath(root.group(1)) == os.path.realpath(cwd.group(1)), out
+    # ...and the tool must still refuse to call a non-pytest command measured.
+    assert "UNMEASURED" in out, out
+
+
+def test_all_three_arms_fire_in_one_run(gate_sandbox):
+    """SOURCE + EXECUTION + PROVENANCE from a single process, no wrapper.
+
+    Composing three separate runs of the same sha is an ARGUMENT; this is the
+    measurement it was standing in for."""
+    rc, out = _run_verify(gate_sandbox, cmd=[
+        sys.executable, "-m", "pytest", "-q", "-p", "stub_gate",
+        str(gate_sandbox / "test_trivial.py")])
+    assert "tracked path(s) present" in out, out          # SOURCE
+    assert "STUB_GATE PROVENANCE=OK" in out, out          # PROVENANCE
+    assert "MEASURED 2 test(s) executed" in out, out      # EXECUTION
+    assert rc == 0, out
+
+
+def test_a_refusing_gate_is_reported_as_RAN_AND_REFUSED_not_as_a_bad_command(
+        gate_sandbox):
+    """NEGATIVE ARM, and the reason this ticket is not just the export.
+
+    `pytest.exit()` ends the session before the summary prints, so a gate that
+    refuses leaves the same summary-shaped hole as a command that never ran.
+    Told "no pytest summary line was found", a reader goes after their own
+    invocation while the gate's verdict sits four lines above, already correct.
+    That is the did-not-run / ran-and-refused collapse arriving through
+    COMPOSITION rather than through a wrong number.
+    """
+    rc, out = _run_verify(gate_sandbox, extra_env={"STUB_GATE_REFUSE": "1"},
+                          cmd=[sys.executable, "-m", "pytest", "-q", "-p",
+                               "stub_gate", str(gate_sandbox / "test_trivial.py")])
+    assert rc == bsq.VERIFY_UNMEASURED_RC, out            # still REFUSES
+    assert "ENDED EARLY by pytest.exit()" in out, out
+    assert "PROVENANCE=FAILED 25 module(s)" in out, out   # the verdict is quoted
+    assert "The child exited 91" in out, out              # the gate's rc survives
+    assert "no pytest summary line was found" not in out, out
+
+
+def test_an_inherited_extract_root_is_overridden_and_says_so(gate_sandbox):
+    """A stale root from the ambient environment would let the gate compare
+    against some OTHER tree — a previous extract, or the shared clone — and a
+    contaminated run would pass. This run's own extract wins, out loud."""
+    rc, out = _run_verify(gate_sandbox,
+                          extra_env={"GATE_EXTRACT_ROOT": "/tmp/some-stale-extract"},
+                          cmd=[sys.executable, "-m", "pytest", "-q", "-p",
+                               "stub_gate", str(gate_sandbox / "test_trivial.py")])
+    assert "ignoring inherited GATE_EXTRACT_ROOT=/tmp/some-stale-extract" in out, out
+    assert "STUB_GATE PROVENANCE=OK" in out, out
+    assert rc == 0, out
+
+
+# The real contaminated output, transcribed from the run recorded on T-0983
+# (2026-09-06, by this session: `--import-mode=importlib` with the live clone
+# ahead of the extract on PYTHONPATH). Not composed to fit the parser.
+REAL_GATE_REFUSAL = (
+    "...                                                                      "
+    "[100%]Exit: PROVENANCE=FAILED 25 bot_squad_worker module(s) resolved "
+    "outside the extract, first=/home/almdudleer/bot-squad-mgmt/worker/"
+    "bot_squad_worker/__init__.py\n"
+)
+
+
+def test_the_ended_early_verdict_is_read_off_a_real_gate_refusal():
+    """pytest appends `Exit:` to the PROGRESS LINE with no newline, in both
+    `-q` and default modes (measured, pytest 9.0.3). A line-anchored pattern
+    would miss every real one."""
+    lines, rc = _verdict(REAL_GATE_REFUSAL, rc=91)
+    blob = "\n".join(lines)
+    assert rc == bsq.VERIFY_UNMEASURED_RC
+    assert "ENDED EARLY" in blob
+    assert "The child exited 91" in blob
+    assert "PROVENANCE=FAILED 25 bot_squad_worker module(s)" in blob
+
+
+def test_a_summaryless_run_with_no_pytest_exit_keeps_the_original_verdict():
+    """GREEN CONTROL for the branch above: without an `Exit:` line the old
+    diagnosis must stand, or the new one has simply swallowed the old fault."""
+    lines, rc = _verdict("", rc=0)
+    blob = "\n".join(lines)
+    assert rc == bsq.VERIFY_UNMEASURED_RC
+    assert "no pytest summary line was found" in blob
+    assert "ENDED EARLY" not in blob

@@ -5825,6 +5825,13 @@ _PYTEST_COLLECTED_RE = re.compile(r"(?<![\w.])(\d+)\s+tests?\s+collected(?![\w])
 _PYTEST_INTERRUPTED_RE = re.compile(
     r"Interrupted:\s+(\d+)\s+errors?\s+during\s+collection")
 _PYTEST_NO_TESTS_RE = re.compile(r"\bno tests ran\b", re.IGNORECASE)
+# T-0983: `pytest.exit()` from a plugin ends the session BEFORE the summary is
+# printed, so a refusing gate looks identical here to a command that never ran.
+# That is the did-not-run / ran-and-refused collapse this file exists to
+# prevent, arriving through composition rather than through a wrong number.
+# Deliberately unanchored: pytest appends this to the progress line, with no
+# newline, in BOTH `-q` and default modes (measured on pytest 9.0.3, both).
+_PYTEST_EXITED_EARLY_RE = re.compile(r"Exit:\s*(.+)")
 
 _PYTEST_PLURALS = {"errors": "error", "warnings": "warning", "reruns": "rerun"}
 
@@ -5937,12 +5944,29 @@ def _certify_pytest_run(text: str, rc: int, cmd: list, sha: str) -> tuple:
         ], VERIFY_UNMEASURED_RC)
 
     if m["summary_line"] is None:
+        ended = _PYTEST_EXITED_EARLY_RE.findall(text)
+        if ended:
+            # RAN-AND-REFUSED, not did-not-run. Saying "no summary was found"
+            # here would send the reader after their command line while the
+            # actual verdict — a provenance gate, a fixture guard — sits a few
+            # lines above it, already printed and already correct.
+            return ([refuse.format(
+                sha=short,
+                why="the session was ENDED EARLY by pytest.exit() before a "
+                    "summary line was printed.")] + [
+                f"  pytest said: Exit: {ended[-1].strip()}",
+                f"  The child exited {rc}; THAT code carries the reason, and "
+                "the run above it may well have been fine. This is a "
+                "ran-and-refused state, not a broken command line — read the "
+                "plugin's verdict, do not retype the invocation.",
+            ], VERIFY_UNMEASURED_RC)
         return ([refuse.format(
             sha=short,
             why="no pytest summary line was found in "
                 f"{len(text)} byte(s) of output.")] + [
-            "  The command was a pytest invocation, so a summary was expected. "
-            "An unmeasured result must fail rather than pass quietly.",
+            f"  The command was a pytest invocation and exited {rc}, so a "
+            "summary was expected. An unmeasured result must fail rather than "
+            "pass quietly.",
         ], VERIFY_UNMEASURED_RC)
 
     if m["collected_only"] is not None and m["executed"] == 0:
@@ -6024,13 +6048,43 @@ def cmd_verify_isolated(args) -> None:
               flush=True)
         print(f"verify-isolated: extract verified — all {len(tracked)} tracked "
               "path(s) present", flush=True)
+        # T-0983 — EXPORT THE EXTRACT ROOT so the provenance gate can be armed
+        # WITHOUT a wrapper. Only this process knows where the extract landed,
+        # so arming a gate that (correctly) refuses to default its comparison
+        # target used to require
+        #     verify-isolated ... -- bash -c 'GATE_EXTRACT_ROOT="$PWD" pytest ...'
+        # and `bash -c` is not a pytest argv, so _looks_like_pytest() below
+        # (also correctly) declined to certify the run. Both refusals are right;
+        # together they forced every lane to give up either provenance or this
+        # tool's measurement arm, and the two reports read identically.
+        #
+        # This is NOT the defaulting the gate refuses. A default is a guess made
+        # by the consumer about a root nobody established; this is the producer
+        # publishing a root it just created and proved complete, one frame above
+        # the run. A gate invoked outside verify-isolated still finds the
+        # variable unset and still refuses.
+        child_env = dict(os.environ)
+        child_env["BSQ_VERIFY_EXTRACT_ROOT"] = dest
+        inherited = child_env.get("GATE_EXTRACT_ROOT")
+        child_env["GATE_EXTRACT_ROOT"] = dest
+        if inherited and os.path.realpath(inherited) != os.path.realpath(dest):
+            # An inherited value points at some OTHER tree — a previous run's
+            # extract, or the shared clone. Comparing against it would let a
+            # contaminated run pass, so this run's own extract wins; say so
+            # rather than swapping it silently.
+            print(f"verify-isolated: ignoring inherited GATE_EXTRACT_ROOT="
+                  f"{inherited} — the gate must compare against THIS run's "
+                  f"extract", flush=True)
+        print(f"verify-isolated: GATE_EXTRACT_ROOT={dest} (exported — arming "
+              "the provenance gate needs no wrapper)", flush=True)
         print(f"verify-isolated: running: {' '.join(cmd)}\n", flush=True)
         # Captured AND streamed. Capturing is what makes the verdict below
         # possible; streaming is what keeps the evidence readable while a long
         # stage runs. Chunked reads rather than readline() so `-q`'s progress
         # dots, which carry no newline, still appear as they are produced.
         try:
-            proc = subprocess.Popen(cmd, cwd=dest, stdout=subprocess.PIPE,
+            proc = subprocess.Popen(cmd, cwd=dest, env=child_env,
+                                    stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT)
         except FileNotFoundError:
             # Overwhelmingly: a relative interpreter path. The extract holds

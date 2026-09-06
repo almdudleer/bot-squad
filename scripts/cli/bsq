@@ -6155,7 +6155,7 @@ def _census_lines(census: dict) -> list:
     if structural:
         out.append(
             f"  {structural} of {len(families)} reason "
-            f"{'family' if len(families) == 1 else 'families'} name "
+            f"{'family names' if len(families) == 1 else 'families name'} "
             "such a condition. Where that IS the cause, the isolation itself "
             "is the cause — a `git archive` extract has no `.git` — so they "
             "can never be certified by this mechanism and need a second arm. "

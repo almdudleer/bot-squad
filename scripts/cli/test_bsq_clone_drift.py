@@ -270,3 +270,36 @@ def test_the_verb_name_does_not_collide_with_the_existing_drift_verb():
     EVERY bsq verb for every live session — measured here on 2026-09-06."""
     parser = bsq.build_parser()          # would raise on a collision
     assert parser.parse_args(["drift", "status"]).func is not bsq.cmd_drift
+
+
+def test_the_on_demand_form_does_not_claim_you_just_committed(world):
+    """`bsq clone-drift` is asked by a session that is READING the tree. Telling
+    it "you just committed onto a base the deploy does not ship" is a false
+    statement inside the one message whose entire job is to be believed — and
+    the read-time case is the expensive one (operator, 2026-09-06: nearly
+    recorded a fabricated-citation finding against a delivered p1 because a grep
+    of this tree returned a well-formed false negative)."""
+    _advance_origin(world, n=20)
+    _commit(world["clone"], "stranded.txt", "never pushed")
+    st = bsq._drift_state(str(world["clone"]))
+
+    at_commit = bsq._drift_message(st)
+    on_demand = bsq._drift_message(st, just_committed=False)
+    assert "You just committed" in at_commit
+    assert "the one\nyou just made" in at_commit
+
+    assert "just committed" not in on_demand
+    assert "you just made" not in on_demand
+    # ...and it names what a stale tree actually does to a reader
+    assert "FALSE NEGATIVES" in on_demand
+    # both still carry the size and the remedy
+    for msg in (at_commit, on_demand):
+        assert "20 commit(s) BEHIND" in msg
+        assert "1 commit(s) here have NO equivalent on origin" in msg
+        assert "merge origin/work" in msg
+
+
+def test_the_verb_asks_for_the_reader_wording():
+    src = _BSQ_PATH.read_text()
+    body = src.split("def cmd_drift(")[1].split("\ndef ")[0]
+    assert "_drift_message(st, just_committed=False)" in body

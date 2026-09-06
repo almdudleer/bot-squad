@@ -67,6 +67,7 @@ CASES=(
 )
 
 fail=0
+drift_ran=0
 WINDOWS=()
 
 # 1. bash function matches the documented contract.
@@ -103,11 +104,23 @@ PY
             fail=1
         fi
     done <<< "$py_out"
+    drift_ran=1
 else
     echo "WARN: could not import python _derive_role — skipped cross-language drift check"
 fi
 
-if [ "$fail" -eq 0 ]; then
+# A skipped drift arm must NOT read as a match. The old code printed the full
+# "matches contract + python _derive_role" PASS at rc=0 even when the import
+# failed and the cross-language comparison never ran — a well-formed green
+# asserting a comparison it had not performed. That matters most in a frozen
+# `bsq verify-isolated` extract, which is exactly where the worker package is
+# least likely to import and exactly where certifications are being run.
+if [ "$fail" -ne 0 ]; then
+    :
+elif [ "$drift_ran" -eq 1 ]; then
     echo "PASS: bsq_derive_role matches contract + python _derive_role ($((${#WINDOWS[@]})) windows)"
+else
+    echo "PARTIAL: contract only ($((${#WINDOWS[@]})) windows) — cross-language drift check SKIPPED"
+    exit 2
 fi
 exit "$fail"

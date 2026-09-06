@@ -206,15 +206,30 @@ def count_pending_backlog(cfg: Any, slug: str) -> int:
 # ceiling is still enforced at spawn (_enforce_parallel_cap, T-0239) and the
 # re-drive defers under that backpressure. We surface:
 #   * max_in_progress  — the parallelism cap (pace.py SSOT, TL-B / T-0482)
-#   * in_progress      — current load (board tasks at status in_progress)
+#   * live_dev_sessions— current load, and the quantity the cap is measured
+#     against since T-0966 (see `_live_dev_count`); `in_progress` (the board
+#     label) is still reported beside it, but it no longer gates anything
 #   * weekly_target_pct— OPTIONAL utilization target (system_settings [operator])
 #   * burn_tokens_per_hr / remaining_tokens — best-effort from telemetry's quota
 #     estimate (Max weekly TOTAL is NOT queryable, telemetry.py — so the % target
 #     is ADVISORY, never a hard block; degrade gracefully when no signal).
 
+#: What ``max_in_progress`` counts, published on every pacing payload (T-0966
+#: DoD4). A surface prints this beside the number so "7" is never a bare integer
+#: an operator has to infer the unit of.
+CAP_COUNTS = "live_dev_sessions"
+
+
 def _in_progress_count(cfg: Any, slug: str) -> int:
-    """Board tasks currently at ``status: in_progress`` (the load measured against
-    ``max_in_progress``). Non-archived top-level ``backlog/*.md`` only."""
+    """Board tasks currently at ``status: in_progress``. Non-archived top-level
+    ``backlog/*.md`` only.
+
+    T-0966: this is REPORTED, not gated on. It used to be the load measured
+    against ``max_in_progress``, which made that cap inert — the label is a
+    field a session must remember to stamp, and 7 of 8 live devs had not, so the
+    cap read 1/7 with eight sessions running. See :func:`_live_dev_count` for
+    what the cap is measured against now, and ``dispatch.decide_topology`` for
+    the same choice made (and measured) a month earlier for the same reason."""
     from bot_squad_worker import frontmatter as _fm
 
     backlog = cfg.data_dir / slug / "backlog"
@@ -234,6 +249,22 @@ def _in_progress_count(cfg: Any, slug: str) -> int:
         if str(meta.get("status", "")).strip().lower() == "in_progress":
             n += 1
     return n
+
+
+def _live_dev_count(cfg: Any, slug: str) -> int:
+    """Live dev sessions on ``slug`` — the load the parallelism cap gates (T-0966).
+
+    Delegates to ``sessions.count_live_dev_sessions``, the same counter spawn
+    admission enforces, so the dashboard and the refusal can never disagree
+    about how many lanes are running. Best-effort: pacing must never break the
+    tick, and an unreadable session dir degrades to 0 rather than raising.
+    """
+    try:
+        from bot_squad_worker import sessions as _sessions
+        return _sessions.count_live_dev_sessions(cfg, slug)
+    except Exception:  # noqa: BLE001 — pacing must never break the tick
+        log.exception("pacing: live dev count failed for %s", slug)
+        return 0
 
 
 def _system_settings_path(cfg: Any) -> Optional[Path]:
@@ -342,6 +373,9 @@ def pacing_status(cfg: Any, slug: str) -> dict:
 
       * ``throttle``  — at/over the parallelism cap OR rate-limit 429s seen:
                         stop dispatching new sessions, let in-flight drain.
+                        T-0966: "at/over the cap" now compares LIVE DEV SESSIONS
+                        (``live_dev_sessions``) to ``max_in_progress``; the
+                        ``in_progress`` board label is reported, never gated on.
       * ``ramp``      — a weekly target is set, spend-to-date is UNDER it, and
                         there is real headroom below BOTH the board cap
                         (``max_in_progress``) and the live AIMD backoff ceiling
@@ -363,8 +397,12 @@ def pacing_status(cfg: Any, slug: str) -> dict:
         cap = _pace.max_in_progress(cfg, slug)  # 0 = unlimited
     except Exception:  # noqa: BLE001 — pacing must never break the tick
         cap = 0
+    # T-0966: the cap is measured against LIVE DEV SESSIONS. The board label is
+    # still read and reported (`in_progress`) so its drift stays visible, but it
+    # gates nothing — see `_in_progress_count`.
+    lanes = _live_dev_count(cfg, slug)
     in_prog = _in_progress_count(cfg, slug)
-    at_cap = cap > 0 and in_prog >= cap
+    at_cap = cap > 0 and lanes >= cap
     target = weekly_quota_target_pct(cfg)
     burn = _burn_signal(cfg, slug)
     verdict = pace_verdict(target, burn["spend_pct"])
@@ -382,12 +420,12 @@ def pacing_status(cfg: Any, slug: str) -> dict:
         # Never overrides an explicit max_in_progress or an active backoff clamp
         # (F2.7 DoD) — both bound the candidate below, so a clamped backoff or a
         # cap already saturated by in_prog collapses this back to "advisory".
-        candidate = in_prog + _pace_ramp_step()
+        candidate = lanes + _pace_ramp_step()
         if cap > 0:
             candidate = min(candidate, cap)
         if backoff_ceiling is not None:
             candidate = min(candidate, backoff_ceiling)
-        if candidate > in_prog:
+        if candidate > lanes:
             ramp_to = candidate
             rec = "ramp"
         else:
@@ -399,7 +437,11 @@ def pacing_status(cfg: Any, slug: str) -> dict:
 
     return {
         "max_in_progress": cap,            # 0 = unlimited
-        "in_progress": in_prog,
+        # T-0966: name the quantity the cap gates, on the payload, so a surface
+        # cannot print a bare "7" and leave the operator to infer what it counts.
+        "cap_counts": CAP_COUNTS,
+        "live_dev_sessions": lanes,        # the load measured against the cap
+        "in_progress": in_prog,            # board LABEL — reported, gates nothing
         "at_cap": at_cap,
         "weekly_target_pct": target,       # None = unset (optional)
         "spend_pct": burn["spend_pct"],    # None = no quota anchor to measure against

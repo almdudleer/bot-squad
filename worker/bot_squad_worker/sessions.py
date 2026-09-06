@@ -2955,7 +2955,9 @@ def spawn(
     # T-0239: enforce the user-set parallel-sessions cap BEFORE any spawn side
     # effect (the task_id marker, tmux session, pane). At/over cap is a
     # capacity-reached refusal so the task stays pending, never a silent drop.
-    _enforce_parallel_cap(cfg)
+    # T-0966: `slug` also brings the per-project pace cap (the parallelism
+    # target the user sets) into admission — it was advisory-only before.
+    _enforce_parallel_cap(cfg, slug)
     # T-0306: same for the max_total_tokens budget (output tokens this quota
     # period). 0 = unlimited; over-budget refuses so the task stays pending.
     _enforce_token_cap(cfg)
@@ -4184,10 +4186,31 @@ def _count_live_sessions(cfg: Any) -> int:
     live-pane gates above, the count reflects ACTUAL leaf-dev load — not the
     coordination layer, and not reaper-lag on dead/archived/suspended rows.
     """
+    return count_live_dev_sessions(cfg)
+
+
+def count_live_dev_sessions(cfg: Any, slug: str | None = None) -> int:
+    """Live leaf-dev sessions — the whole worker-user (``slug=None``) or ONE project.
+
+    The counting body ``_count_live_sessions`` has always had; ``slug`` narrows
+    the project loop to a single board. Read that docstring for why each gate is
+    here (live-holder + live claude pane + not a coordination role).
+
+    T-0966 made this public and per-project because ``pace.max_in_progress`` now
+    gates on it. It is the RIGHT input for a parallelism cap for the reason the
+    board label is the wrong one: this quantity is DERIVED from the process table
+    and the tmux roster on every call, so no session can silently fail to
+    maintain it, and a dev that dies without moving its ticket or clearing its
+    binding stops being counted at the next read rather than at the next
+    reconcile tick. The ``in_progress`` label is the opposite — a field a session
+    has to remember to stamp, whose offset from reality therefore varies (7 of 8
+    live devs had not stamped it when T-0966 was measured).
+    """
     live = _live_agent_sids()
     n = 0
-    for slug in getattr(cfg, "projects", {}) or {}:
-        sess_dir = cfg.data_dir / slug / "sessions"
+    slugs = [slug] if slug else list(getattr(cfg, "projects", {}) or {})
+    for s in slugs:
+        sess_dir = cfg.data_dir / s / "sessions"
         if not sess_dir.exists():
             continue
         for md in sess_dir.glob("*.md"):
@@ -4197,25 +4220,50 @@ def _count_live_sessions(cfg: Any) -> int:
     return n
 
 
-def _enforce_parallel_cap(cfg: Any) -> None:
+def _enforce_parallel_cap(cfg: Any, slug: str | None = None) -> None:
     """Raise ActionError if spawning would exceed the EFFECTIVE concurrency.
 
-    Two layers (T-0239 cap + T-0249 backoff governor):
+    Three layers (T-0239 cap + T-0249 backoff governor + T-0966 pace cap):
+      * the per-project ``pace.max_in_progress`` — the parallelism target the
+        USER sets («таргет параллелизма 7»), counted as live dev sessions on
+        THIS board (0 = unlimited); checked first because it is the tightest and
+        the one he set by hand, and skipped entirely when ``slug`` is absent;
       * the hard ``max_parallel_sessions`` cap is the ceiling (0 = unlimited);
       * the WS-4 backoff governor depresses the effective limit BELOW the cap
         under Claude rate-limit / 5h-usage-limit pressure.
     Admission refuses (the task stays pending/QUEUED, never a silent drop — the
     T-0237 S4 contract) once live sessions reach the effective limit, and the
     message distinguishes a hard-cap refusal from a backoff (pressure) refusal.
+
+    T-0966: before this, ``pace.max_in_progress`` was ADVISORY ONLY — a signal in
+    the operator's brief, measured against the ``in_progress`` board LABEL. With
+    the label unstamped by 7 of 8 live devs, the number he set read "1 of 7" and
+    refused nothing while eight sessions ran. Admission is where a cap either
+    binds or does not, so this is the layer it had to move to.
     """
     from bot_squad_worker import backoff as _backoff
+    from bot_squad_worker.actions import ActionError
+
+    if slug:
+        try:
+            from bot_squad_worker import pace as _pace
+            pace_cap = _pace.max_in_progress(cfg, slug)  # 0 = unlimited
+        except Exception:  # noqa: BLE001 — an unreadable pace.json is not a ceiling
+            pace_cap = 0
+        if pace_cap > 0:
+            lanes = count_live_dev_sessions(cfg, slug)
+            if lanes >= pace_cap:
+                raise ActionError(
+                    f"spawn: capacity reached — {lanes}/{pace_cap} live dev "
+                    f"sessions on {slug} (pace.max_in_progress, the parallelism "
+                    f"target); spawn refused, task stays pending"
+                )
 
     cap = _read_caps(_caps_config_dir(cfg))["max_parallel_sessions"]
     effective = _backoff.effective_limit(cfg)  # already clamped to the ceiling
     live = _count_live_sessions(cfg)
     if live < effective:
         return
-    from bot_squad_worker.actions import ActionError
     if cap > 0 and effective >= cap:
         raise ActionError(
             f"spawn: capacity reached — {live}/{cap} parallel sessions live "

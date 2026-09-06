@@ -4657,6 +4657,46 @@ def _pace_verdict(target_pct: float | None, spend_pct: float | None) -> str | No
     return "on"
 
 
+def _pace_live_lanes(slug: str):
+    """(cap_counts, live_value, why_unknown) for `slug`.
+
+    T-0966 DoD4: `max_in_progress` counts LIVE DEV SESSIONS, and only the worker
+    can take that number (it re-derives liveness from the tmux roster and the
+    process table on every call). Best-effort: when the count cannot be taken,
+    `live_value` is None and `why_unknown` says WHICH failure it was — an
+    unreachable worker and a worker that predates this field are different
+    facts, and a surface that prints one for the other sends its reader to the
+    wrong place. Never a 0 standing in for an unknown.
+    """
+    try:
+        snap = post("automation_status", {"slug": slug}, fatal=False)
+    except Exception as exc:  # noqa: BLE001 — a pace read must not need a worker
+        msg = str(exc).strip() or exc.__class__.__name__
+        if "unknown action" in msg:
+            return None, None, "this worker predates the automation_status action"
+        return None, None, f"worker call failed — {msg}"
+    q = snap.get("quota") or {}
+    live = q.get("live_dev_sessions")
+    if live is None:
+        return q.get("cap_counts"), None, "this worker predates T-0966"
+    return q.get("cap_counts"), live, None
+
+
+def _pace_cap_line(cap: int, counts, live, why=None) -> str:
+    """The `max_in_progress:` value, always naming WHAT it counts.
+
+    He set this number from «таргет параллелизма 7»; printing a bare 7 left the
+    operator to infer both the unit and whether it was reached. Both are stated.
+    """
+    unit = (counts or "live dev sessions").replace("_", " ")
+    if not cap:
+        return f"0 (unlimited) — would count {unit}"
+    if live is None:
+        return f"{cap} {unit} — live count unknown ({why or 'not measured'})"
+    verdict = "AT CAP" if live >= cap else f"{cap - live} lane(s) free"
+    return f"{live}/{cap} {unit} live — {verdict}"
+
+
 def cmd_pace_show(args) -> None:
     """T-0482: print the project's pace-control config (the user's pace surface).
     T-0579/F2.7: also surfaces the weekly-quota-target pace verdict (under/on/over).
@@ -4676,7 +4716,8 @@ def cmd_pace_show(args) -> None:
     eff = _pace_effective_state(drive_block, paused)
     print(f"pace control for {slug}:")
     print(f"  drive state: {eff} — {_PACE_DRIVE_STATE_LABELS.get(eff, eff)}")
-    print(f"  max_in_progress: {mip if mip else '0 (unlimited)'}")
+    counts, live, why = _pace_live_lanes(slug)
+    print(f"  max_in_progress: {_pace_cap_line(mip, counts, live, why)}")
     print(f"  paused (global): {'yes' if paused else 'no'}")
     if inits:
         print("  initiatives:")
@@ -4931,7 +4972,8 @@ def _pace_print_automation(snap: dict, slug: str, *, verbose: bool = False) -> N
     q = snap.get("quota") or {}
     cap = q.get("max_in_progress", snap.get("max_in_progress"))
     if cap is not None:
-        print(f"  cap:         max_in_progress={cap if cap else '0 (unlimited)'}")
+        print(f"  cap:         max_in_progress: "
+              f"{_pace_cap_line(cap, q.get('cap_counts'), q.get('live_dev_sessions'), 'this worker predates T-0966')}")
     tgt, spend, verdict = (q.get("weekly_target_pct"), q.get("spend_pct"),
                            q.get("verdict"))
     # An absent signal is printed as an explicit unknown, never omitted: a

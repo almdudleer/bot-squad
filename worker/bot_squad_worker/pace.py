@@ -13,11 +13,32 @@ operator consumes. The *operator-dispatch-HONORS-the-controls* half is T-0475
 Four controls, deliberately minimal (the mechanism is "my call, cost LOW" per
 the stakeholder — extend the existing caps, don't build a new engine):
 
-* **max_in_progress** — a ceiling on how many tasks the system keeps in the
-  ``in_progress`` board state at once (0 = unlimited; back-compat for a fresh /
-  legacy project). Distinct from the ``[caps].max_parallel_sessions`` *process*
-  cap (live claude panes) — this paces the *board*, so the user can throttle
-  WIP without touching concurrency.
+* **max_in_progress** — the PARALLELISM TARGET: a ceiling on how many LIVE DEV
+  SESSIONS this project may run at once (0 = unlimited; back-compat for a fresh
+  / legacy project). Enforced at spawn admission
+  (``sessions._enforce_parallel_cap``) and counted by
+  ``sessions.count_live_dev_sessions``.
+
+  ⚠ **T-0966 changed what this counts, and the name is now historical.** It used
+  to count tickets carrying the ``in_progress`` **board label**, and that made it
+  inert: measured on the live install 2026-09-06 13:49Z with the stakeholder's
+  own ``max_in_progress = 7`` set from «таргет параллелизма 7», **8 live dev
+  sessions held 8 tickets and exactly 1 of those tickets was labelled
+  ``in_progress``** — so the cap read 1/7 and would have permitted six more
+  spawns. The label is a fair proxy for work-in-flight only while every session
+  maintains it; nothing enforced that, so the proxy's offset varied and the cap
+  reported a believable wrong number rather than failing. The live-session count
+  is DERIVED (process table + tmux roster, re-read on every call), so no session
+  can silently fail to maintain it and a dev that dies without moving its ticket
+  stops counting at the next read. ``dispatch.decide_topology`` made the same
+  choice a month earlier off the same measurement — see its ★ note.
+
+  The key name is kept because it is the on-disk config key, the api mirror
+  field, and the tuple ``DRIVE_STATE_AXES`` matches on; every SURFACE prints what
+  it counts (``operator_redrive.CAP_COUNTS``) so the stale name is never the only
+  thing a reader has to go on. Still distinct from the
+  ``[caps].max_parallel_sessions`` cap, which is global to the worker-user across
+  every project — this one is per-project and set by ``bsq pace set``.
 * **per-initiative weight + priority** — steer the *order*: which initiative the
   operator drains first / how much it favours. Stored keyed by the initiative's
   ``.md`` basename (the same form tasks carry in their ``initiative:``
@@ -204,8 +225,9 @@ DRIVE_STATE_CUSTOM = "custom"
 #: ``off`` engages the pause and LEAVES the previous state stored, so resuming
 #: returns to the mode he was in rather than to a default he never chose.
 DRIVE_STATE_AXES: dict[str, dict] = {
-    # "work on one task" — the board is capped at a single in-progress task, so
-    # the drive finishes one thing before it is allowed to start another.
+    # "work on one task" — capped at a single live dev session (T-0966; it was
+    # a single in-progress board task before), so the drive finishes one thing
+    # before it is allowed to start another.
     "one_task": {"scope": "all", "stop_when": "scope_exhausted",
                  "max_in_progress": 1},
     # "finish up (i.e. close all in progress)" — nothing new is picked up; the
@@ -516,7 +538,11 @@ def read_config(cfg: Any, slug: str) -> dict:
 
 
 def max_in_progress(cfg: Any, slug: str) -> int:
-    """The max-in-progress ceiling (0 = unlimited). Convenience for the consumer."""
+    """The parallelism ceiling — max LIVE DEV SESSIONS (0 = unlimited).
+
+    Returns the CAP VALUE only. The quantity it is measured against lives in
+    ``sessions.count_live_dev_sessions``; see the ``max_in_progress`` bullet at
+    the top of this module for why that is sessions and not the board label."""
     return read_config(cfg, slug)["max_in_progress"]
 
 

@@ -311,11 +311,20 @@ def test_the_gap_is_reserved_only_because_of_the_declaration(tmp_path, declared)
                                    note="peer build landing in the gap")
     if declared:
         if _admitted(peer) and _lease_legitimately_lapsed(tmp_path, tok):
+            # T-1043: the token stays OUT of this reason on purpose. It is
+            # random per run, and _skip_census (scripts/cli/bsq) sha256s
+            # (count, location, reason) into the fingerprint a release gate
+            # compares between refs — a token in the text would make this
+            # skip's fingerprint different on every run it fires, which
+            # reads as "these runs aren't comparable" for a reason that is
+            # pure nonce and trains a reader to ignore a moved fingerprint.
+            print(f"T-1043: reclaims.log confirms declared token {tok}'s "
+                  "lease expired before the peer's request")
             pytest.skip(
                 "the host stretched this scenario past the renewed 60s "
-                "lease and the arbiter correctly reclaimed it (reclaims.log "
-                f"confirms token {tok}) before the peer's request — not a "
-                "defect, see T-1043")
+                "lease and the arbiter correctly reclaimed the declared "
+                "window (confirmed via reclaims.log) before the peer's "
+                "request — not a defect, see T-1043")
         assert not _admitted(peer), (
             "THE DEFECT: a peer landed in the middle of a declared occupation "
             "and reclaims.log records no lease expiry for this token — the "

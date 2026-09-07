@@ -28,6 +28,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -323,3 +325,68 @@ def test_status_swap_rates_prints_the_values_and_gates_nothing(tmp_path):
     assert out.returncode == 0, out.stderr
     assert "si=" in out.stdout and "so=" in out.stdout
     assert "RECORDED, NOT GATED" in out.stdout
+
+
+def test_ceiling_is_re_checked_at_the_actual_grant_not_only_at_request(
+        tmp_path, monkeypatch):
+    """T-1070 — fleet_slot ADMITTED a suite at d_state 44 against a ceiling of
+    20. The ceiling itself was never broken: ``admission_check()`` refuses
+    d_state=44 on demand every time it is asked (see the parametrized guards
+    above). What was missing is that :func:`acquire` only ever asked it ONCE,
+    before queueing for a free SLOT — whatever the capacity wait then cost was
+    a window nothing re-checked, and a grant that only re-SAMPLES the readings
+    for the log, rather than re-DECIDING on them, admits on a pass that already
+    expired.
+
+    Here a single containerless slot is held by lane A while the readings are
+    healthy; lane B's own admission_check() also passes at that instant, and
+    it queues behind A for capacity — genuinely queued, proven by its waiter
+    file existing. Only once B is behind the same slot does the host degrade
+    to the 22:57Z event (T-1031's own r_state=70 sample) and A's slot free.
+    The grant point must re-decide on THAT reading, not the one B queued on.
+    """
+    mod = _module()
+    state = tmp_path / "slots"
+    state.mkdir(parents=True)
+    (state / "config.json").write_text(json.dumps({"containerless_slots": 1}))
+    for var in ("BOT_SQUAD_FLEET_DSTATE_MAX", "BOT_SQUAD_FLEET_RSTATE_MAX",
+                "BOT_SQUAD_FLEET_PSI_MEM_MAX"):
+        monkeypatch.delenv(var, raising=False)
+
+    box = [dict(HEALTHY_PARKED)]
+    monkeypatch.setattr(mod, "admission_readings", lambda sd, **kw: dict(box[0]))
+    monkeypatch.setattr(mod, "_POLL", 0.05)
+
+    token_a, adm_a = mod.acquire("containerless", pgid=os.getpgid(0), lane="A",
+                                 note="holderA", wait=5, sd=state)
+    assert adm_a["r_state"] == HEALTHY_PARKED["r_state"]
+
+    waiters_dir = mod._waiters_dir(state)
+    outcome: dict = {}
+
+    def _second():
+        try:
+            outcome["result"] = mod.acquire(
+                "containerless", pgid=os.getpgid(0), lane="B",
+                note="holderB", wait=2, sd=state)
+        except BaseException as exc:  # crosses the thread boundary
+            outcome["exc"] = exc
+
+    th = threading.Thread(target=_second)
+    th.start()
+    deadline = time.time() + 5
+    while not any(waiters_dir.glob("*.json")) and time.time() < deadline:
+        time.sleep(0.02)
+    assert any(waiters_dir.glob("*.json")), "B never entered the wait queue"
+
+    # The host degrades to the 22:57Z event at the EXACT moment A's slot
+    # frees — the only moment a grant decision actually happens.
+    box[0] = dict(EVENT_2257)
+    mod.release(token_a, sd=state)
+    th.join(timeout=10)
+
+    assert isinstance(outcome.get("exc"), TimeoutError), (
+        f"acquire() granted a slot on a reading it never re-checked at the "
+        f"grant point: {outcome.get('result')}")
+    assert "r_state=70" in str(outcome["exc"])
+    assert "over the ceiling of 24" in str(outcome["exc"])

@@ -222,7 +222,14 @@ run_arm worker bash -c "cd '$DEST' && TMPDIR='$PYTEST_TMP' '$REPO/worker/.venv/b
 # api — inside the EXISTING bot-squad-api:latest image. Never rebuilt here:
 # a build is an exclusive, announced event (T-0994) and out of scope for an
 # unattended nightly job.
-run_arm api bash -c "docker run --rm -e BUILD_AT_IMPORT=0 -v '$DEST':/repo -w /repo/api --entrypoint python bot-squad-api:latest -m pytest -q"
+#
+# T-0968/fleet_slot: a bare `docker run` does not announce itself to the
+# fleet's container-concurrency gate, and this repo's own recipes made that
+# mistake for months (measured: 31 of 545 admissions were container work).
+# Routed through `fleet_slot.py run --kind container` so a nightly cert run
+# queues behind other container work instead of silently adding to the load
+# nobody could see coming.
+run_arm api bash -c "'$REPO/scripts/cli/fleet_slot.py' run --kind container --note 'T-1046 nightly cert api arm' -- docker run --rm -e BUILD_AT_IMPORT=0 -v '$DEST':/repo -w /repo/api --entrypoint python bot-squad-api:latest -m pytest -q"
 
 # The api container runs as root, so anything it writes under the bind mount
 # ($DEST) is root-owned — chown it back before this user has to touch $DEST
@@ -237,7 +244,8 @@ run_arm api bash -c "docker run --rm -e BUILD_AT_IMPORT=0 -v '$DEST':/repo -w /r
 # script with no arm having actually failed. A 300s bound on just this step
 # turns "silently eats the whole 90-minute budget" into "this one step timed
 # out," which is a diagnosable, bounded failure instead of an opaque one.
-timeout 300 docker run --rm -v "$DEST":/repo --entrypoint chown \
+"$REPO/scripts/cli/fleet_slot.py" run --kind container --note "T-1046 nightly cert api chown" -- \
+  timeout 300 docker run --rm -v "$DEST":/repo --entrypoint chown \
   bot-squad-api:latest -R "$(id -u):$(id -g)" /repo >/dev/null 2>&1 || true
 
 # web — reuse the shared web/node_modules PACKAGES (symlinked individually,

@@ -175,6 +175,20 @@ def main(argv: list[str]) -> int:
         file=sys.stderr,
     )
 
+    if total.total == 0:
+        # A "0 of 0" run is not a clean board — it's an empty or
+        # wrong-level path, and exiting 0 here would certify NOTHING while
+        # looking exactly like a healthy pass to a caller that only reads
+        # the exit code. Refuse loudly instead (T-0975, caught by the
+        # operator: "read 0 of 0" + rc 0 from a mistyped path).
+        print(
+            f"backlog frontmatter lint: REFUSING — scanned 0 files under "
+            f"{', '.join(str(r) for r in roots)}; wrong path, or a data dir "
+            f"with no <slug>/backlog/*.md at all",
+            file=sys.stderr,
+        )
+        return 2
+
     if total.unreadable:
         print("unreadable (no real YAML reader can parse these):", file=sys.stderr)
         for path, reason in total.unreadable:

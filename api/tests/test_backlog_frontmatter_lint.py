@@ -127,12 +127,14 @@ def test_lint_walks_multiple_slugs(tmp_path, lint):
     assert result.total == 3
 
 
-def test_lint_returns_zero_when_data_dir_missing(tmp_path, lint):
+def test_lint_dir_result_ok_when_data_dir_missing(tmp_path, lint):
+    """`lint_dir` itself has nothing to flag on a missing dir — but `main`
+    refuses this, see test_lint_refuses_zero_of_zero_run below: 0-of-0
+    is not the same claim as "clean"."""
     missing = tmp_path / "does-not-exist"
     result = lint.lint_dir(missing)
     assert result.ok
     assert result.total == 0
-    assert lint.main([str(missing)]) == 0
 
 
 def test_lint_module_constant_matches_api(lint):
@@ -208,3 +210,36 @@ def test_lint_prints_denominator_summary(tmp_path, lint, capsys):
     err = capsys.readouterr().err
     assert "read 1 of 2 file(s)" in err
     assert "1 unreadable" in err
+
+
+# --- T-0975 (operator review): "0 of 0" must refuse, not report a false clean ---
+
+
+def test_lint_refuses_zero_of_zero_run(tmp_path, lint, capsys):
+    """A missing/wrong-level/genuinely-empty path scans 0 files. Exiting 0
+    here would certify NOTHING while looking like a healthy pass to a
+    caller reading only the exit code — the operator hit this by hand
+    (passed the backlog dir instead of the data dir) and only the stated
+    denominator revealed the run was empty, not clean."""
+    missing = tmp_path / "does-not-exist"
+    assert lint.main([str(missing)]) == 2
+    err = capsys.readouterr().err
+    assert "read 0 of 0 file(s)" in err
+    assert "REFUSING" in err
+    assert str(missing) in err
+
+
+def test_lint_refuses_zero_of_zero_on_existing_but_empty_dir(tmp_path, lint):
+    """Same refusal for a data dir that exists but has no <slug>/backlog at
+    all — not just a nonexistent path."""
+    tmp_path.mkdir(exist_ok=True)
+    assert lint.main([str(tmp_path)]) == 2
+
+
+def test_lint_healthy_nonempty_run_still_exits_zero(tmp_path, lint):
+    """The 0-of-0 refusal must not swallow the ordinary healthy case: files
+    present, nothing wrong, still exits 0."""
+    bl = tmp_path / "s" / "backlog"
+    bl.mkdir(parents=True)
+    _write_task(bl, "T-0001", "open")
+    assert lint.main([str(tmp_path)]) == 0

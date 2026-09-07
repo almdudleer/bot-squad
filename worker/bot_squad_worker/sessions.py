@@ -1141,6 +1141,7 @@ def declare_roles(
     roles=None,
     add=(),
     drop=(),
+    global_user_id: str | None = None,
     claude_uuid: str | None = None,
 ) -> dict:
     """A session DECLARES the set of roles it holds. Returns
@@ -1220,6 +1221,32 @@ def declare_roles(
                     f"{slug!r} — exactly one dispatcher per project (T-0472); "
                     f"route through it or let it recycle first"
                 )
+
+        # T-0943 P0: TAKING `user-conversation` RECORDS WHOSE CONVERSATION IT
+        # IS. The role says what this session DOES; the binding says whose, and
+        # without it `live_user_conversation_sid` cannot answer a per-user
+        # question about this session at all — so it fails closed and a fresh
+        # attendant spawns. Bind from the thing that HAS the identity: an
+        # explicit owner passed by the caller, else the gid this session was
+        # already stamped with at spawn. If neither exists the declaration is
+        # left UNBOUND on purpose, and the session attends nobody — that is a
+        # visible state, not a silent one (`bsq role show` prints it).
+        #
+        # Dropping the role clears the binding: a session that handed the
+        # conversation away must not keep answering for that user.
+        # A FUNCTION OF THE RESULTING SET, not of the transition. Computing it
+        # from "previously held" would miss the commonest case outright:
+        # `previous` comes from `roles_of`, which DERIVES, so a session whose
+        # window already implies `user-conversation` never counts as TAKING it
+        # and would declare the role while recording no owner at all.
+        if "user-conversation" in new:
+            owner = (str(global_user_id or "").strip()
+                     or user_conversation_binding(meta)
+                     or session_global_user_id(meta))
+            if owner:
+                meta[UC_BINDING_FIELD] = owner
+        else:
+            meta.pop(UC_BINDING_FIELD, None)
 
         meta["roles"] = list(new)
         # Keep the single-valued mirror honest for every legacy reader: the
@@ -4300,6 +4327,30 @@ def user_conversation_window(global_user_id: str) -> str:
 GLOBAL_USER_ID_FIELD = "global_user_id"
 
 
+#: T-0943 P0: the gid a session was bound to WHEN IT TOOK ``user-conversation``.
+#: Distinct from ``global_user_id``, which is stamped at SPAWN time for a
+#: session created as an attendant. A talking-operator is spawned as neither
+#: shape and acquires the role later, so the binding has to be recorded at the
+#: moment of the declaration or it does not exist at all.
+UC_BINDING_FIELD = "user_conversation_gid"
+
+
+def user_conversation_binding(meta: dict | None) -> str:
+    """The gid this session was bound to when it TOOK ``user-conversation``.
+
+    Empty when there is no binding — which is a real answer, not a missing one:
+    an unbound declaration attends NOBODY. Holding the role says what a session
+    DOES, never WHOSE it is, so a lookup that answers a per-user question must
+    read this and fail closed when it is empty.
+    """
+    if not meta:
+        return ""
+    val = meta.get(UC_BINDING_FIELD)
+    if not val or val == "~":
+        return ""
+    return str(val).strip()
+
+
 def session_global_user_id(meta: dict | None) -> str:
     """The global user id a user-conversation session attends, or "".
 
@@ -4409,16 +4460,39 @@ def live_user_conversation_sid(
         if meta is None:
             continue
         sid = str(meta.get("sid") or md.stem)
-        # T-0943 REOPEN: a THIRD way to match, and it is the one a declaration
-        # creates. The gid arm and the legacy-window arm both key on how the
-        # session was SPAWNED; a session that later declared `user-conversation`
-        # (a talking-operator collapsing the split) was spawned as neither and
-        # was invisible to `ensure_user_conversation`, which is what spawned the
-        # duplicate. An explicit tombstone still excludes, via `roles_of`.
-        declared_uc = "user-conversation" in roles_of(meta)
+        # T-0943 REOPEN, CORRECTED AFTER A P0: a THIRD way to match, and it is
+        # the one a declaration creates. The gid arm and the legacy-window arm
+        # both key on how the session was SPAWNED; a talking-operator that later
+        # declared `user-conversation` was spawned as neither and was invisible
+        # to `ensure_user_conversation`, which is what spawned the duplicate.
+        #
+        # As first written this arm asked only "does this session hold
+        # user-conversation" and CARRIED NO USER IDENTITY, so this per-user
+        # lookup returned the first live user-conversation session in sorted md
+        # order, whoever owned it — user B's inbound routed into user A's
+        # session. IDENTITY IS NEVER INFERRED FROM A ROLE.
+        #
+        # TWO conditions, and they are NOT the same condition — each rejects
+        # cases the other admits, so both are required:
+        #   * DECLARED-ONLY. `roles_of` falls back to DERIVATION, so the old
+        #     arm fired for sessions that declared nothing at all: a post-rename
+        #     attendant whose `user-conversation` came from its WINDOW NAME, and
+        #     a legacy pre-rename attendant. A declaration may widen a lookup;
+        #     a derivation may not.
+        #   * BOUND-ONLY. A session may declare the role and carry no binding
+        #     (nothing recorded one), and that is exactly the fail-closed case:
+        #     it attends nobody, so it answers for nobody.
+        # Ordering was considered as an alternative and REJECTED BY MEASUREMENT:
+        # with the asker holding no candidate of their own, a last-resort arm
+        # never gets a chance to prefer anything and hands back the stranger
+        # anyway — the leak becomes rarer and invisible rather than fixed.
+        declared = declared_roles(meta)
+        bound_uc = (declared is not None
+                    and "user-conversation" in declared
+                    and user_conversation_binding(meta) == gid)
         if (session_global_user_id(meta) != gid
                 and _window_from_sid(sid) != want
-                and not declared_uc):
+                and not bound_uc):
             continue
         if sid in live:
             return sid

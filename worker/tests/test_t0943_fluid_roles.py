@@ -41,11 +41,13 @@ def _make_cfg(tmp_path: Path) -> types.SimpleNamespace:
 
 def _write_session(tmp_path: Path, slug: str, sid: str, *, window: str,
                    roles: list | None = None, role: str = "",
-                   status: str = "active") -> Path:
+                   status: str = "active", uc_gid: str = "") -> Path:
     sess_dir = tmp_path / "data" / slug / "sessions"
     sess_dir.mkdir(parents=True, exist_ok=True)
     lines = ["---", f"sid: {sid}", f"status: {status}", "task_id: ~",
              f"window: {window}"]
+    if uc_gid:
+        lines.append(f"user_conversation_gid: {uc_gid}")
     if role:
         lines.append(f"role: {role}")
     if roles is not None:
@@ -899,13 +901,27 @@ def test_a_tombstoned_session_is_not_an_attendant(tmp_path, monkeypatch):
 
 def test_a_declared_holder_answers_the_gid_keyed_lookup_too(tmp_path, monkeypatch):
     """`ensure_user_conversation` asks the (slug, gid) question, not the roster
-    one. A declared holder with no gid stamped was invisible to it as well."""
+    one, and a declared talking-operator must answer it — FOR THE USER IT IS
+    BOUND TO.
+
+    THE CLAIM CHANGED, THE TEST DID NOT MOVE. As first written this asserted
+    that a declared holder with NO gid stamped answers for an ARBITRARY gid
+    ("gu_abc"). That was the P0: it is the defect written down as a
+    requirement, and it is why the shipped regression looked correct to me.
+    Holding `user-conversation` says what a session DOES, never WHOSE it is.
+    The legitimate requirement underneath — a talking-operator must not be
+    invisible to `ensure_user_conversation` — survives, now carried by the
+    BINDING recorded when the role was taken. The sibling
+    `test_an_unbound_declaration_is_a_candidate_for_nobody` pins the other
+    half: no binding, no answer, for anybody."""
     cfg = _make_cfg(tmp_path)
     sid = "S-u-operator-p640"
     _write_session(tmp_path, "p", sid, window="operator",
-                   roles=["operator", "user-conversation"])
+                   roles=["operator", "user-conversation"], uc_gid="gu_abc")
     _live(monkeypatch, sid)
     assert S.live_user_conversation_sid(cfg, "p", "gu_abc") == sid
+    # ...and NOT for anybody else, which is the assertion the original lacked.
+    assert S.live_user_conversation_sid(cfg, "p", "gu_other") is None
 
 
 def test_binding_a_ticket_to_a_solo_session_is_allowed(tmp_path, monkeypatch):
@@ -1234,3 +1250,306 @@ def test_seat_claim_by_the_driver_itself_is_not_refused_by_its_own_drive(
     rec = SEAT.claim(cfg, "p", sid)
     assert rec["ok"] is True
     assert (rec["seat"] or {}).get("sid") == sid
+
+
+# ---------------------------------------------------------------------------
+# P0 REGRESSION FROM 993d4cb: identity must never be inferred from a role
+#
+# My reopen commit added a THIRD disjunct to `live_user_conversation_sid` that
+# asked only "does this session hold user-conversation". It carried NO user
+# identity while arms one and two are user-scoped, so the per-user lookup
+# returned the FIRST live user-conversation session in sorted md order, whoever
+# owned it. `live_user_conversation_sid` is the single-attendant invariant
+# behind `ensure_user_conversation`: non-None means "this user already has an
+# attendant, route the inbound there instead of spawning". So on a box with
+# more than one tenant, USER B'S MESSAGE WAS ROUTED INTO USER A'S SESSION.
+#
+# Two compounding mistakes, and the second is the one that made the blast
+# radius wide: the arm asked `roles_of`, WHICH FALLS BACK TO DERIVATION. So it
+# fired for sessions that never declared anything — a post-rename attendant
+# with no `roles` field, a legacy pre-rename attendant, another user's
+# attendant. That is the rule I had written down myself the same day while
+# fixing the peer fan-out — A DECLARATION MAY WIDEN A BROADCAST, A DERIVATION
+# MAY NOT — and did not apply here.
+#
+# THE RULE (operator, 2026-09-07): IDENTITY IS NEVER INFERRED FROM A ROLE.
+# Holding `user-conversation` says what a session DOES, never WHOSE it is. A
+# session with no user binding is not a candidate for ANY user: return None and
+# let a fresh attendant spawn. A wrong attendant is a stranger reading
+# someone's conversation; a spurious spawn is a wasted process. FAIL CLOSED.
+#
+# LAST-RESORT ORDERING WAS PROPOSED AND REJECTED BY MEASUREMENT, not argument:
+# with the asker having no candidate of their own, ordering never gets a chance
+# to prefer anything and control falls straight through to the identity-free
+# arm, which hands back the stranger anyway. It converts the leak from ALWAYS
+# to ONLY-WHEN-THE-ASKER-HAS-NOTHING-LIVE — rarer, invisible, worse to debug.
+# `test_no_candidate_of_their_own_still_refuses_a_strangers_attendant` is that
+# measurement, pinned.
+# ---------------------------------------------------------------------------
+
+def _uc_md(tmp_path, sid, *, window="", gid="", roles=None, uc_gid=""):
+    d = tmp_path / "p" / "sessions"
+    d.mkdir(parents=True, exist_ok=True)
+    lines = ["---", f"sid: {sid}", "status: active", "task_id: ~"]
+    if window:
+        lines.append(f"window: {window}")
+    if gid:
+        lines.append(f"global_user_id: {gid}")
+    if uc_gid:
+        lines.append(f"user_conversation_gid: {uc_gid}")
+    if roles is not None:
+        lines.append("roles: [" + ", ".join(roles) + "]")
+    lines += ["---", ""]
+    (d / f"{sid}.md").write_text("\n".join(lines))
+
+
+def _uc_cfg(tmp_path):
+    return types.SimpleNamespace(data_dir=tmp_path, projects={"p": object()})
+
+
+# --- the four shapes that WERE firing, one test each -------------------------
+
+def test_another_users_post_rename_attendant_is_not_returned(tmp_path, monkeypatch):
+    """Shape 1 — the shipped failure. A post-rename attendant carries its user
+    in the `global_user_id` FIELD and a user-facing window that no longer
+    spells the gid, so only the field can tell two of them apart."""
+    a = "S-u-universal_bsq_session-p3"
+    _uc_md(tmp_path, a, window="universal_bsq_session", gid="gu_a")
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: {a})
+    assert S.live_user_conversation_sid(_uc_cfg(tmp_path), "p", "gu_b") is None
+
+
+def test_a_post_rename_attendant_with_no_roles_field_is_not_returned(
+        tmp_path, monkeypatch):
+    """Shape 2 — and the one that shows the arm was never about declarations:
+    this session declares NOTHING. Its `user-conversation` comes from the
+    WINDOW NAME via `roles_of`'s derivation fallback."""
+    a = "S-u-user_session_flomaster-p4"
+    _uc_md(tmp_path, a, window="user_session_flomaster", gid="gu_a")
+    assert S.declared_roles(S._read_session_metadata(
+        tmp_path / "p" / "sessions" / f"{a}.md")) is None, "fixture must be UNdeclared"
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: {a})
+    assert S.live_user_conversation_sid(_uc_cfg(tmp_path), "p", "gu_b") is None
+
+
+def test_a_legacy_pre_rename_attendant_of_another_user_is_not_returned(
+        tmp_path, monkeypatch):
+    """Shape 3 — the legacy `<gid>-user-conversation` window shape. It is
+    another user's by construction; arm two must match it only for ITS user."""
+    a = "S-u-gu_a-user-conversation-p6"
+    _uc_md(tmp_path, a, window="gu_a-user-conversation")
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: {a})
+    assert S.live_user_conversation_sid(_uc_cfg(tmp_path), "p", "gu_b") is None
+
+
+def test_another_users_declared_talking_operator_is_not_returned(
+        tmp_path, monkeypatch):
+    """Shape 4 — the case 993d4cb was actually written for, asked for the WRONG
+    user. Declaring `user-conversation` says what it does, never whose it is."""
+    a = "S-u-operator-p7"
+    _uc_md(tmp_path, a, window="operator", gid="gu_a",
+           roles=["operator", "user-conversation"], uc_gid="gu_a")
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: {a})
+    assert S.live_user_conversation_sid(_uc_cfg(tmp_path), "p", "gu_b") is None
+
+
+def test_no_candidate_of_their_own_still_refuses_a_strangers_attendant(
+        tmp_path, monkeypatch):
+    """THE OPERATOR'S REQUIRED CASE, and the measurement that rejected
+    last-resort ordering. The asker has NO gid-matched and NO window-matched
+    candidate at all, so ordering never gets to prefer anything: a
+    last-resort arm falls straight through and hands back the stranger.
+    FAIL CLOSED — None, and let a fresh attendant spawn."""
+    a = "S-u-operator-p3"
+    _uc_md(tmp_path, a, window="operator", gid="gu_a",
+           roles=["operator", "user-conversation"], uc_gid="gu_a")
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: {a})
+    assert S.live_user_conversation_sid(_uc_cfg(tmp_path), "p", "gu_b") is None
+
+
+# --- the two that must stay silent ------------------------------------------
+
+def test_a_plain_operator_is_never_an_attendant(tmp_path, monkeypatch):
+    """MUST NOT FIRE, and it did not before either — pinned so a later widening
+    of the role test cannot quietly recruit it."""
+    a = "S-u-operator-p8"
+    _uc_md(tmp_path, a, window="operator", gid="gu_a")
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: {a})
+    assert S.live_user_conversation_sid(_uc_cfg(tmp_path), "p", "gu_b") is None
+    assert S.live_user_conversation_sid(_uc_cfg(tmp_path), "p", "gu_a") == a
+
+
+def test_a_dev_is_never_an_attendant(tmp_path, monkeypatch):
+    """MUST NOT FIRE."""
+    a = "S-u-dev_thing-p9"
+    _uc_md(tmp_path, a, window="dev_thing")
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: {a})
+    assert S.live_user_conversation_sid(_uc_cfg(tmp_path), "p", "gu_b") is None
+
+
+# --- the gap 993d4cb existed to close must STAY closed -----------------------
+
+def test_a_declared_attendant_is_found_for_the_user_it_is_BOUND_to(
+        tmp_path, monkeypatch):
+    """The intent of 993d4cb, surviving whole — via a BINDING rather than a
+    role. A talking-operator that TOOK `user-conversation` records the owning
+    gid at that moment, and this lookup reads that binding. Without this the
+    fix would be a plain revert and the duplicate-spawn gap would reopen."""
+    a = "S-u-operator-p3"
+    _uc_md(tmp_path, a, window="operator",
+           roles=["operator", "user-conversation"], uc_gid="gu_a")
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: {a})
+    assert S.live_user_conversation_sid(_uc_cfg(tmp_path), "p", "gu_a") == a
+
+
+def test_an_unbound_declaration_is_a_candidate_for_nobody(tmp_path, monkeypatch):
+    """FAIL CLOSED, stated as an assertion: a session that declared
+    `user-conversation` but carries NO binding attends nobody, so it answers
+    for nobody — not even when it is the only live session on the project."""
+    a = "S-u-operator-p3"
+    _uc_md(tmp_path, a, window="operator",
+           roles=["operator", "user-conversation"])
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: {a})
+    assert S.live_user_conversation_sid(_uc_cfg(tmp_path), "p", "gu_a") is None
+
+
+# --- healthy controls: the two original arms are untouched -------------------
+
+def test_the_gid_arm_still_resolves_its_own_user(tmp_path, monkeypatch):
+    a = "S-u-universal_bsq_session-p3"
+    _uc_md(tmp_path, a, window="universal_bsq_session", gid="gu_a")
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: {a})
+    assert S.live_user_conversation_sid(_uc_cfg(tmp_path), "p", "gu_a") == a
+
+
+def test_the_legacy_window_arm_still_resolves_its_own_user(tmp_path, monkeypatch):
+    a = "S-u-gu_a-user-conversation-p6"
+    _uc_md(tmp_path, a, window="gu_a-user-conversation")
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: {a})
+    assert S.live_user_conversation_sid(_uc_cfg(tmp_path), "p", "gu_a") == a
+
+
+# ---------------------------------------------------------------------------
+# The WRITE side of the P0 fix: taking `user-conversation` records WHOSE
+# conversation it is. Without this the resolver's third arm reads a binding
+# that nothing ever writes — a mechanism nobody can invoke.
+# ---------------------------------------------------------------------------
+
+def test_taking_user_conversation_records_the_owner(tmp_path, no_rename):
+    """«та сессия, которая держит на себе общение с юзером» — WHICH user. The
+    role says what the session does; this says whose."""
+    cfg = _make_cfg(tmp_path)
+    sid = "S-u-operator-p1"
+    md = _write_session(tmp_path, "p", sid, window="operator", roles=["operator"])
+    S.declare_roles(cfg, "p", sid, add=("user-conversation",),
+                    global_user_id="gu_abc")
+    meta = S._read_session_metadata(md)
+    assert S.user_conversation_binding(meta) == "gu_abc"
+    assert meta["roles"] == ["operator", "user-conversation"]
+
+
+def test_taking_it_with_no_owner_anywhere_leaves_it_UNBOUND(tmp_path, no_rename):
+    """FAIL CLOSED, and deliberately not an error: an unbound declaration is a
+    legitimate visible state. What it must never be is a silent match for
+    whoever asks first."""
+    cfg = _make_cfg(tmp_path)
+    sid = "S-u-operator-p1"
+    md = _write_session(tmp_path, "p", sid, window="operator", roles=["operator"])
+    S.declare_roles(cfg, "p", sid, add=("user-conversation",))
+    meta = S._read_session_metadata(md)
+    assert S.user_conversation_binding(meta) == ""
+
+
+def test_the_owner_is_taken_from_the_spawn_stamp_when_not_passed(
+        tmp_path, no_rename):
+    """«from the thing that has it» — a session already stamped with its user
+    at spawn does not need the caller to repeat it."""
+    cfg = _make_cfg(tmp_path)
+    sid = "S-u-user_session_x-p1"
+    md = tmp_path / "data" / "p" / "sessions" / f"{sid}.md"
+    md.parent.mkdir(parents=True, exist_ok=True)
+    md.write_text("---\nsid: %s\nstatus: active\ntask_id: ~\n"
+                  "window: user_session_x\nglobal_user_id: gu_spawned\n---\n" % sid)
+    S.declare_roles(cfg, "p", sid, add=("user-conversation",))
+    assert S.user_conversation_binding(S._read_session_metadata(md)) == "gu_spawned"
+
+
+def test_dropping_user_conversation_clears_the_binding(tmp_path, no_rename):
+    """A session that handed the conversation away must stop answering for that
+    user — otherwise the binding outlives the role that justified it."""
+    cfg = _make_cfg(tmp_path)
+    sid = "S-u-operator-p1"
+    md = _write_session(tmp_path, "p", sid, window="operator", roles=["operator"])
+    S.declare_roles(cfg, "p", sid, add=("user-conversation",),
+                    global_user_id="gu_abc")
+    assert S.user_conversation_binding(S._read_session_metadata(md)) == "gu_abc"
+    S.declare_roles(cfg, "p", sid, drop=("user-conversation",))
+    assert S.user_conversation_binding(S._read_session_metadata(md)) == ""
+
+
+def test_two_live_attendants_sharing_a_window_shape_are_told_apart(
+        tmp_path, monkeypatch):
+    """TWO USERS WHO SHARE ONE ATTRIBUTE AND DIFFER IN THE BOUNDARY — the shape
+    that reads fine and fails in production.
+
+    Both are post-rename attendants, so both carry a user-facing window that no
+    longer spells the gid: the WINDOW SHAPE is shared and only the FIELD is the
+    boundary. The wrong one sorts first in md order, so a lookup that stops at
+    "is this a user-conversation session" answers with it.
+
+    (The same class bit the neighbouring fleet twice today on a different
+    surface: a process whose NAME and uid matched theirs while its user
+    NAMESPACE did not. Matching one attribute is not identity.)"""
+    a = "S-u-universal_bsq_session-p3"       # sorts before b
+    b = "S-u-user_session_flomaster-p5"
+    _uc_md(tmp_path, a, window="universal_bsq_session", gid="gu_a")
+    _uc_md(tmp_path, b, window="user_session_flomaster", gid="gu_b")
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: {a, b})
+    cfg = _uc_cfg(tmp_path)
+    assert S.live_user_conversation_sid(cfg, "p", "gu_b") == b
+    assert S.live_user_conversation_sid(cfg, "p", "gu_a") == a
+
+
+# --- BOTH ERAS ARE ON DISK AT ONCE ------------------------------------------
+# Sessions that already hold `user-conversation` today were written before the
+# binding existed, so none of them carries `user_conversation_gid`. A migration
+# case nobody wrote down is how the pre-rename shape got missed the first time.
+# There is no backfill and there is nothing to backfill: exactly one session md
+# on the install carries a `roles:` field at all, and it has no
+# `global_user_id`. So both of these are the REAL state of the fleet, not
+# hypotheticals.
+
+def test_a_pre_binding_holder_with_a_spawn_stamp_still_resolves_for_its_user(
+        tmp_path, monkeypatch):
+    """ERA 1, the graceful path: an attendant spawned FOR a user carries
+    `global_user_id` from spawn time. It needs no binding and no migration —
+    arm one already answers, and answers only for its own user."""
+    a = "S-u-universal_bsq_session-p3"
+    _uc_md(tmp_path, a, window="universal_bsq_session", gid="gu_a",
+           roles=["user-conversation"])          # declared, but NO uc binding
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: {a})
+    cfg = _uc_cfg(tmp_path)
+    assert S.live_user_conversation_sid(cfg, "p", "gu_a") == a
+    assert S.live_user_conversation_sid(cfg, "p", "gu_b") is None
+
+
+def test_a_pre_binding_holder_with_no_identity_at_all_answers_for_nobody(
+        tmp_path, monkeypatch):
+    """ERA 2, and the case the TL asked to see stated rather than implied: a
+    session that ALREADY HOLDS the role, declared before the binding existed,
+    with NO `user_conversation_gid` AND NO `global_user_id` anywhere on disk.
+
+    There is nothing on that md that names a user, so there is no answer to a
+    per-user question. None — and `ensure_user_conversation` spawns a fresh
+    attendant. A wrong attendant is a stranger reading someone's conversation;
+    a spurious spawn is a wasted process. It re-binds itself the moment anyone
+    declares the role with an owner."""
+    a = "S-u-operator-p1"
+    _uc_md(tmp_path, a, window="operator", roles=["operator", "user-conversation"])
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: {a})
+    cfg = _uc_cfg(tmp_path)
+    assert S.live_user_conversation_sid(cfg, "p", "gu_a") is None
+    assert S.live_user_conversation_sid(cfg, "p", "gu_b") is None
+    # and it is not silently invisible either — the roster still shows it, so
+    # `bsq team status` / `role show` can say it is UNBOUND rather than absent.
+    assert any(r.get("sid") == a for r in S.live_user_conversation_sids(cfg, "p"))

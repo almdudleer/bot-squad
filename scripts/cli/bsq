@@ -4321,6 +4321,11 @@ def cmd_role(args) -> None:
         return
 
     params = {"slug": slug, "sid": sid}
+    # T-0943 P0: carry the owner through so TAKING `user-conversation` records
+    # WHOSE conversation it is. Absent is allowed and means unbound.
+    _owner = getattr(args, "global_user_id", None)
+    if _owner:
+        params["global_user_id"] = _owner
     if sub == "take":
         params["add"] = args.role
     elif sub == "drop":
@@ -10086,6 +10091,8 @@ def build_parser() -> argparse.ArgumentParser:
     rlt = rl_sub.add_parser("take", help="add a role to the set you hold")
     rlt.add_argument("role", help="role to take")
     rlt.add_argument("--sid", help="session SID (default: derived from tmux)")
+    rlt.add_argument("--user", dest="global_user_id", metavar="GID",
+                       help="the global user id this session attends — RECORDED when you take `user-conversation` (T-0943). Identity is never inferred from a role, so without it the declaration is UNBOUND and the session answers for nobody")
     rlt.set_defaults(func=cmd_role)
     rld = rl_sub.add_parser("drop", help="give a role up (budding does this for you)")
     rld.add_argument("role", help="role to drop")
@@ -10094,6 +10101,8 @@ def build_parser() -> argparse.ArgumentParser:
     rlx = rl_sub.add_parser("set", help="replace the whole set ('' = the explicit no-roles tombstone)")
     rlx.add_argument("roles", help="comma-separated roles, or '' for none")
     rlx.add_argument("--sid", help="session SID (default: derived from tmux)")
+    rlx.add_argument("--user", dest="global_user_id", metavar="GID",
+                       help="the global user id this session attends — RECORDED when you take `user-conversation` (T-0943). Identity is never inferred from a role, so without it the declaration is UNBOUND and the session answers for nobody")
     rlx.set_defaults(func=cmd_role)
     rl.set_defaults(func=cmd_role, sub="show")
 

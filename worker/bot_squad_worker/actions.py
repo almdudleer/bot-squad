@@ -6157,6 +6157,12 @@ _MORPH_SESSION_ALLOWED = _MORPH_SESSION_REQUIRED | {
 _DECLARE_ROLES_REQUIRED = {"slug", "sid"}
 _DECLARE_ROLES_ALLOWED = _DECLARE_ROLES_REQUIRED | {
     "roles", "add", "drop", "claude_uuid",
+    # T-0943 P0: the gid this session attends, recorded WHEN it takes
+    # `user-conversation`. Identity is never inferred from a role, so a
+    # declaration without this leaves the session bound to nobody — and
+    # therefore an answer for nobody. Optional on purpose: an unbound
+    # declaration is a legitimate, visible state, not an error.
+    "global_user_id",
 }
 
 
@@ -6194,6 +6200,7 @@ def _action_declare_roles(params: dict[str, Any]) -> dict[str, Any]:
     from bot_squad_worker import sessions as _sessions
     return _sessions.declare_roles(
         cfg, params["slug"], params["sid"],
+        global_user_id=params.get("global_user_id"),
         roles=_as_list(params.get("roles")),
         add=tuple(_as_list(params.get("add")) or ()),
         drop=tuple(_as_list(params.get("drop")) or ()),

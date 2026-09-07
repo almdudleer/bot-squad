@@ -43,9 +43,13 @@ Recipients, in order:
 * every non-archived session bound to the ticket (``task_id`` +
   ``extra_task_ids``, resolved by :func:`idle_timeout.bound_task_ids` rather
   than a fifth local copy of that walk);
-* failing that, the live operator (``dispatch.live_operator_sids``, the
-  identity SSOT) — an unheld ticket that just changed is the operator's, which
-  is also the direction T-0936 takes for umbrella tickets;
+* failing that, whoever HOLDS the operator role
+  (``dispatch.operator_role_holders``) — an unheld ticket that just changed is
+  the operator's, which is also the direction T-0936 takes for umbrella
+  tickets. Deliberately NOT ``live_operator_sids``: that is the spawn
+  singleton, dedicated-only so budding is not refused, and answering routing
+  with it silently skipped a live operator that had declared it also talks to
+  the user (T-0943);
 * failing THAT, whoever holds the operator SEAT (``operator_seat.seat_holder``,
   T-0937). Measured on the live install the day this shipped: bot-squad had no
   operator-ROLE pane at all, so the rung above answered nobody and every unheld
@@ -379,10 +383,18 @@ def resolve_fallbacks(cfg: Any, slug: str) -> Fallbacks:
     that posture, not re-implement it.
     """
     try:
-        from bot_squad_worker.dispatch import live_operator_sids
-        operators = list(live_operator_sids(cfg, slug))
+        # T-0943: ROUTING, not the singleton guard. `live_operator_sids` answers
+        # "may I spawn another operator" — it is DEDICATED-ONLY by design, so
+        # that budding one off is not refused as a duplicate. Asking it "who
+        # should hear about this ticket" returns the guard's answer to a
+        # different question, and a session that had declared
+        # `roles: [operator, user-conversation]` was skipped by the fan-out
+        # while it was live and driving the board. Declaring the truth about
+        # itself turned off its own ticket notifications.
+        from bot_squad_worker.dispatch import operator_role_holders
+        operators = list(operator_role_holders(cfg, slug))
     except Exception:  # noqa: BLE001
-        log.exception("ticket_watch: live_operator_sids failed for %s", slug)
+        log.exception("ticket_watch: operator_role_holders failed for %s", slug)
         operators = []
     try:
         from bot_squad_worker import operator_seat as _seat
@@ -403,7 +415,10 @@ def recipients_for(cfg: Any, slug: str, task_id: str,
 
     1. the sessions BOUND to the ticket;
     2. the live operator — an unheld ticket that just moved is the operator's
-       business (the direction T-0936 takes for umbrella tickets);
+       business (the direction T-0936 takes for umbrella tickets). "The
+       operator" here means WHOEVER HOLDS THE OPERATOR ROLE, including a
+       session that also talks to the user or carries a dev task; it is not
+       the dedicated-operator singleton (T-0943);
     3. the operator SEAT holder (T-0937) — the session actually driving this
        board whatever its role. Without this rung a project with no
        operator-role pane has no destination at all for an unheld ticket, which

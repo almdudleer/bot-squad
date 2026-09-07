@@ -1026,3 +1026,90 @@ def test_a_DECLARED_dev_does_receive_one(tmp_path, monkeypatch):
                    window="universal_bsq_session", roles=list(S.SOLO_ROLES))
     assert S.role_holders(cfg, "p", "dev", declared_only=True) == [
         "S-u-universal_bsq_session-p1"]
+
+
+# ---------------------------------------------------------------------------
+# The ticket fan-out asked the GUARD a ROUTING question
+#
+# Found live, on the install, 2026-09-07: `bsq ticket note` printed "nobody is
+# bound and no live operator — this write nudges no one" on every write while
+# S-almdudleer-operator-p640 was live and had DECLARED roles
+# [operator, user-conversation]. Measured against the running code:
+#     live_operator_sids    -> []
+#     operator_role_holders -> ['S-almdudleer-operator-p640']
+# The counterfactual was run, not assumed: the pre-T-0943 predicate
+# `_role_of(meta) == "operator"` returned [p640], the narrowed one returns [],
+# and what the narrowing lost was exactly that session.
+#
+# The narrowing is RIGHT — it is the continue-vs-respawn singleton, and
+# counting a multi-role holder there refuses the `bsq bud operator` handover.
+# The defect is that `ticket_watch.resolve_fallbacks` answers "who should hear
+# about this ticket" with the SINGLETON's answer. Declaring the truth about
+# itself turned off the operator's own ticket notifications.
+# ---------------------------------------------------------------------------
+
+def _fanout_cfg(tmp_path, monkeypatch):
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    return _make_cfg(tmp_path)
+
+
+def test_ticket_fanout_reaches_a_declared_talking_operator(tmp_path, monkeypatch):
+    """THE DEFECT. A session holding operator + user-conversation IS the
+    operator for routing purposes — «та сессия, на которой висит роль
+    оператора, должна получать nudges». An unheld ticket must reach it."""
+    from bot_squad_worker import ticket_watch as TW
+    cfg = _fanout_cfg(tmp_path, monkeypatch)
+    _write_session(tmp_path, "p", "S-u-operator-p1", window="operator",
+                   roles=["operator", "user-conversation"])
+    sids, why = TW.recipients_for(cfg, "p", "T-1", rows=[])
+    assert sids == ["S-u-operator-p1"]
+    assert why == "operator"
+
+
+def test_ticket_fanout_still_reaches_a_dedicated_operator(tmp_path, monkeypatch):
+    """HEALTHY CONTROL: the ordinary single-role case is byte-identical. A
+    widening that also changes the ordinary case is not a widening."""
+    from bot_squad_worker import ticket_watch as TW
+    cfg = _fanout_cfg(tmp_path, monkeypatch)
+    _write_session(tmp_path, "p", "S-u-operator-p2", window="operator")
+    sids, why = TW.recipients_for(cfg, "p", "T-1", rows=[])
+    assert sids == ["S-u-operator-p2"]
+    assert why == "operator"
+
+
+def test_ticket_fanout_prefers_the_dedicated_operator_over_the_parent(
+        tmp_path, monkeypatch):
+    """Routing is a PREFERENCE, not a union: once the drive has been budded
+    off, the ticket follows it and the parent stops being the answer. Two
+    dispatchers is the thing T-0472 forbids."""
+    from bot_squad_worker import ticket_watch as TW
+    cfg = _fanout_cfg(tmp_path, monkeypatch)
+    _write_session(tmp_path, "p", "S-u-universal_bsq_session-p1",
+                   window="universal_bsq_session")
+    _write_session(tmp_path, "p", "S-u-operator-p2", window="operator")
+    sids, _why = TW.recipients_for(cfg, "p", "T-1", rows=[])
+    assert sids == ["S-u-operator-p2"]
+
+
+def test_ticket_fanout_is_still_empty_when_nobody_holds_the_operator_role(
+        tmp_path, monkeypatch):
+    """NEGATIVE CONTROL, and the reason this is a fix and not a widening into
+    'somebody': a board with only a dev running still has no destination for an
+    unheld ticket, and must say so rather than invent one."""
+    from bot_squad_worker import ticket_watch as TW
+    cfg = _fanout_cfg(tmp_path, monkeypatch)
+    _write_session(tmp_path, "p", "S-u-dev_thing-p9", window="dev_thing")
+    sids, _why = TW.recipients_for(cfg, "p", "T-1", rows=[])
+    assert sids == []
+
+
+def test_the_singleton_guard_is_untouched_by_the_routing_fix(tmp_path, monkeypatch):
+    """GUARD PRESERVATION. Routing the fan-out must NOT widen the singleton:
+    if it did, `bsq bud operator` would start refusing the handover as a
+    duplicate. Same fixture as the test above it, opposite expectation — that
+    is the whole point of splitting the two questions."""
+    cfg = _fanout_cfg(tmp_path, monkeypatch)
+    _write_session(tmp_path, "p", "S-u-operator-p1", window="operator",
+                   roles=["operator", "user-conversation"])
+    assert D.live_operator_sids(cfg, "p") == []
+    assert D.operator_role_holders(cfg, "p") == ["S-u-operator-p1"]

@@ -767,7 +767,12 @@ def _cmd_install(home: Path, argv: list[str]) -> int:
         else:
             shutil.copyfile(dest, backup)
         print(f"previous {dest}: {was}  (recorded at {backup})")
-        dest.unlink()
+    # NO unlink here. T-1069/p751 measured a fleet call resolving this path
+    # during the gap: unlinking first left ~/.local/bin/bsq NOT EXISTING for
+    # the length of a mkstemp + a 33KB copyfile + a chmod, so a concurrent
+    # `bsq` got "command not found". `os.replace` already replaces an existing
+    # file atomically — the unlink bought nothing and was the whole window.
+    # An installer for the file the fleet executes must never make it absent.
     fd, tmp = tempfile.mkstemp(dir=str(dest.parent), prefix=".bsq-install.")
     os.close(fd)
     shutil.copyfile(me, tmp)

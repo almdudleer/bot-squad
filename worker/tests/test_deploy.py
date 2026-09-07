@@ -1392,6 +1392,129 @@ def test_watchdog_kills_whole_process_group(tmp_path: Path, monkeypatch) -> None
         os.kill(child_pid, 0)
 
 
+def _spawn_hanging_bash(tmp_path: Path):
+    """A real detached `while true; do sleep 60; done` bash, exactly the shape
+    of the T-1022 specimen found live on this host (PPID 1, immortal)."""
+    import os as _os
+
+    recipe = tmp_path / "staging.sh"
+    recipe.write_text("#!/usr/bin/env bash\nwhile true; do sleep 60; done\n")
+    recipe.chmod(0o755)
+    log_path = tmp_path / "run.log"
+    log_path.write_text("")
+    with log_path.open("a") as lf:
+        proc = subprocess.Popen(
+            ["bash", str(recipe)], stdout=lf, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    return proc, recipe, log_path, _os.getpgid(proc.pid)
+
+
+def test_watch_recipe_kills_the_group_when_the_loop_is_interrupted(
+    tmp_path: Path,
+) -> None:
+    """T-1022: the live specimen found on this host was a fake staging.sh
+    (`while true; do sleep 60; done`), PPID 1, running for over six hours.
+    Mechanism: ``_watch_recipe`` called ``_kill_process_group`` only after a
+    `break` on one of its two planned kill conditions -- anything else that
+    unwound the loop (Ctrl-C, a harness cancelling a stuck run, any other
+    exception) skipped it entirely. The recipe is deliberately detached
+    (``start_new_session``) so it survives a worker restart, which also means
+    nothing else was ever going to reap it once this loop stopped watching.
+
+    Replays that interruption directly against the real ``_watch_recipe`` and
+    proves the WHOLE process group -- not just the bash leader -- is gone
+    afterward.
+    """
+    import os as _os
+    import signal as _signal
+
+    from bot_squad_worker.deploy import _watch_recipe
+
+    proc, recipe, log_path, pgid = _spawn_hanging_bash(tmp_path)
+
+    class _Interrupted(Exception):
+        pass
+
+    real_wait = proc.wait
+    calls = {"n": 0}
+
+    def _wait(timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise subprocess.TimeoutExpired(cmd="bash", timeout=timeout)
+        if calls["n"] == 2:
+            # The one-off interruption -- e.g. the SIGINT of a real Ctrl-C.
+            raise _Interrupted("simulated Ctrl-C / harness cancellation")
+        # Calls after the interruption are `_kill_process_group`'s OWN waits
+        # on the (now SIGTERM'd/SIGKILL'd) real process -- those must behave
+        # normally, exactly as they would after a real one-shot signal.
+        return real_wait(timeout=timeout)
+
+    proc.wait = _wait  # instance override; the real process is untouched
+
+    try:
+        with pytest.raises(_Interrupted):
+            _watch_recipe(
+                proc, recipe, log_path, budget_s=0, no_progress_floor_s=0,
+                ceiling_s=0, tempo_multiplier=2.0, poll_interval=0.05,
+            )
+        # The whole group, not just the leader, must be gone.
+        with pytest.raises(ProcessLookupError):
+            _os.killpg(pgid, 0)
+    finally:
+        try:
+            _os.killpg(pgid, _signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def _watch_without_cleanup_on_interrupt(proc, poll_interval: float) -> None:
+    """The PRE-T-1022 shape: ``_kill_process_group`` sat only after the loop,
+    reached from its two planned `break`s -- never from an exception unwinding
+    it. Kept only to prove the fix above is load-bearing, never a real call
+    site."""
+    while True:
+        try:
+            proc.wait(timeout=poll_interval)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def test_without_the_finally_the_same_interruption_leaks_the_group(
+    tmp_path: Path,
+) -> None:
+    """Negative control: replay the IDENTICAL interruption against the
+    pre-fix shape. If the group is NOT reaped here, the test above proves the
+    fix is load-bearing rather than passing by coincidence."""
+    import os as _os
+    import signal as _signal
+
+    proc, recipe, log_path, pgid = _spawn_hanging_bash(tmp_path)
+
+    calls = {"n": 0}
+
+    def _wait(timeout=None):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RuntimeError("simulated Ctrl-C / harness cancellation")
+        raise subprocess.TimeoutExpired(cmd="bash", timeout=timeout)
+
+    proc.wait = _wait
+
+    try:
+        with pytest.raises(RuntimeError):
+            _watch_without_cleanup_on_interrupt(proc, poll_interval=0.05)
+        # The group SURVIVES -- this is the leak T-1022 found live on the host.
+        _os.killpg(pgid, 0)  # must NOT raise: the group is still alive
+    finally:
+        try:
+            _os.killpg(pgid, _signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 def test_reap_orphans_sweeps_stale_processing(tmp_path: Path, monkeypatch) -> None:
     """A file stranded in processing/ past max-age is swept to processed/.fail."""
     import os

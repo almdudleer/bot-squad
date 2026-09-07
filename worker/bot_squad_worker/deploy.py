@@ -2420,60 +2420,74 @@ def _watch_recipe(proc, recipe: Path, log_path: Path, budget_s: int,
             budget_s=budget_s if budget_exceeded else 0,
         )
 
-    while True:
-        try:
-            rc = proc.wait(timeout=poll_interval)
-            # Recipe finished on its own. Drain whatever it wrote last so the
-            # step terms are complete even on a clean exit.
-            done_at = time.monotonic()
-            _drain(log_path, last_size, progress, done_at - start)
-            return _outcome(rc, now=done_at)
-        except subprocess.TimeoutExpired:
-            pass
+    try:
+        while True:
+            try:
+                rc = proc.wait(timeout=poll_interval)
+                # Recipe finished on its own. Drain whatever it wrote last so
+                # the step terms are complete even on a clean exit.
+                done_at = time.monotonic()
+                _drain(log_path, last_size, progress, done_at - start)
+                return _outcome(rc, now=done_at)
+            except subprocess.TimeoutExpired:
+                pass
 
-        now = time.monotonic()
-        try:
-            size = log_path.stat().st_size
-        except OSError:
-            size = last_size
-        if size != last_size:
-            # Bytes arrived: that IS the progress signal, and the new bytes also
-            # tell us how slow this box is running right now.
-            last_size = _drain(log_path, last_size, progress, now - start, size=size)
-            last_progress = now
+            now = time.monotonic()
+            try:
+                size = log_path.stat().st_size
+            except OSError:
+                size = last_size
+            if size != last_size:
+                # Bytes arrived: that IS the progress signal, and the new bytes
+                # also tell us how slow this box is running right now.
+                last_size = _drain(log_path, last_size, progress, now - start, size=size)
+                last_progress = now
 
-        silence = now - last_progress
-        budget = _silence_budget(
-            no_progress_floor_s, tempo_multiplier, progress.longest_done_s, ceiling_s
-        )
-        if no_progress_floor_s > 0 and silence >= budget:
-            killed_reason = "no_progress"
-            limit_s = budget
-            limit_name = "no-progress budget"
-            rc = RC_NO_PROGRESS
-            break
-
-        # The wall-clock BUDGET NOTICE. Recorded once, never kills. Deliberately
-        # NOT written into the run log: the recipe's stdout fd holds its own
-        # offset in this same file, so a concurrent append would interleave into
-        # its output — and worse, it would grow the file and thereby reset
-        # last_progress, making the watchdog observe its own write as build
-        # progress. It travels out on the result instead.
-        if budget_s > 0 and not budget_exceeded and (now - start) >= budget_s:
-            budget_exceeded = True
-            budget_step = progress.last_step or progress.last_completed_step or "(no build step parsed)"
-            log.warning(
-                "deploy._run_recipe_watchdog: %s passed its %ds wall-clock budget "
-                "(elapsed %.0fs) and is STILL PROGRESSING — not killing. In flight: %s",
-                recipe, budget_s, now - start, budget_step,
+            silence = now - last_progress
+            budget = _silence_budget(
+                no_progress_floor_s, tempo_multiplier, progress.longest_done_s, ceiling_s
             )
+            if no_progress_floor_s > 0 and silence >= budget:
+                killed_reason = "no_progress"
+                limit_s = budget
+                limit_name = "no-progress budget"
+                rc = RC_NO_PROGRESS
+                break
 
-        if ceiling_s > 0 and (now - start) >= ceiling_s:
-            killed_reason = "ceiling"
-            limit_s = ceiling_s
-            limit_name = "absolute ceiling"
-            rc = RC_TIMEOUT
-            break
+            # The wall-clock BUDGET NOTICE. Recorded once, never kills. Deliberately
+            # NOT written into the run log: the recipe's stdout fd holds its own
+            # offset in this same file, so a concurrent append would interleave into
+            # its output — and worse, it would grow the file and thereby reset
+            # last_progress, making the watchdog observe its own write as build
+            # progress. It travels out on the result instead.
+            if budget_s > 0 and not budget_exceeded and (now - start) >= budget_s:
+                budget_exceeded = True
+                budget_step = progress.last_step or progress.last_completed_step or "(no build step parsed)"
+                log.warning(
+                    "deploy._run_recipe_watchdog: %s passed its %ds wall-clock budget "
+                    "(elapsed %.0fs) and is STILL PROGRESSING — not killing. In flight: %s",
+                    recipe, budget_s, now - start, budget_step,
+                )
+
+            if ceiling_s > 0 and (now - start) >= ceiling_s:
+                killed_reason = "ceiling"
+                limit_s = ceiling_s
+                limit_name = "absolute ceiling"
+                rc = RC_TIMEOUT
+                break
+    except BaseException:
+        # T-1022: a live specimen sat on this host for 6+ hours -- a fake
+        # staging.sh (`while true; do sleep 60; done`), PPID 1, from a run of
+        # this very test. The prior shape called `_kill_process_group` only
+        # after a `break` (the two kill conditions above); anything that
+        # unwound the loop instead -- Ctrl-C, a harness's own cancellation of
+        # a stuck run, any other exception -- skipped it. The recipe is
+        # deliberately detached (`start_new_session`) so it survives a worker
+        # restart, which means nothing else was ever going to reap it once
+        # this loop stopped watching it. Kill on ANY exit, not just the
+        # planned ones, then let the interruption keep propagating.
+        _kill_process_group(proc)
+        raise
 
     _kill_process_group(proc)
     now = time.monotonic()

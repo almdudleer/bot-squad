@@ -6668,6 +6668,50 @@ def _reap_log_path(cfg: Any, slug: str, date_str: str) -> Path:
     return _reap_log_dir(cfg, slug) / f"{date_str}.jsonl"
 
 
+def note_ticket_death(cfg: Any, slug: str, task_id: Any, sid_label: str,
+                       text: str) -> None:
+    """T-1055: append a Progress note to ``task_id``'s ticket recording HOW a
+    session bound to it ended, when that end left no handoff.
+
+    Before this, the only record of a crash/handoff-timeout lived in fields a
+    human never reads unprompted — the (now-archived) session md's
+    ``suspend_reason``/``archive_reason``, or the internal reap-log jsonl
+    :func:`_log_reap_event` writes for churn measurement. The stakeholder's
+    complaint was exactly that: a session ended and "nothing records how". This
+    puts the same fact where he actually looks — the ticket's own Progress feed
+    — instead of only in files that exist but are never surfaced.
+
+    Best-effort and silent on failure: a diagnostics write must never block or
+    fail the reap/exit it is documenting. No-op for an unbound/placeholder
+    task_id (nothing to write onto).
+    """
+    tid = str(task_id or "").strip()
+    if not tid or tid == "~":
+        return
+    try:
+        from bot_squad_worker import autocompact as _autocompact
+        from bot_squad_worker import task_body as _task_body
+        from bot_squad_worker.mdlock import task_lock, atomic_write
+
+        path_str = _autocompact.task_md_path(cfg, slug, tid)
+        if not path_str:
+            return
+        path = Path(path_str)
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with task_lock(path):
+            raw = path.read_text(encoding="utf-8")
+            parsed = _frontmatter.parse_or_none(raw)
+            if not parsed:
+                return
+            meta, body = parsed
+            meta = dict(meta or {})
+            new_body = _task_body.append_progress(body or "", ts, sid_label, text)
+            meta["updated"] = ts
+            atomic_write(path, _frontmatter.dump(meta, new_body))
+    except Exception:
+        log.exception("sessions: could not note ticket death for %s/%s", slug, tid)
+
+
 def _log_reap_event(cfg: Any, slug: str, sid: str, reason: str, *,
                      now: float | None = None) -> None:
     """Append one reap event. Best-effort — a log-write failure must never
@@ -6968,6 +7012,17 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
         _write_session_metadata(md, meta, atomic=True)
         archived.append(sid)
         _log_reap_event(cfg, slug, sid, reason, now=now_epoch)
+        if reason == "exited-stale":
+            # T-1055: a crashed/abandoned dev — pane gone, task still open, no
+            # graceful exit — used to leave this task's fate discoverable only
+            # via the now-archived session md's `archive_reason` or the
+            # internal reap log. Put it on the ticket itself.
+            hours = int((age or 0) // 3600)
+            note_ticket_death(
+                cfg, slug, tid, "session-reap",
+                f"session {sid} went unresponsive (pane exited, {hours}h+ with "
+                f"no activity) and was auto-archived as exited-stale — this "
+                f"task was left open with no handoff written before it died.")
 
     return {"ok": True, "scanned": scanned, "archived": len(archived), "sids": archived}
 

@@ -142,7 +142,13 @@ echo "=== T-1046 host-side nightly certification — run $RUN_ID ($(date -u -Ise
 # "AMBIENT GIT REPO" (confirmed by the R-0010 handler, 2026-09-07) — do not
 # remove this flag as a supposed simplification.
 MATERIALIZE_LOG="$(mktemp)"
-"$BSQ" verify-isolated --with-git --ref bot_squad/dev --keep -- true >"$MATERIALIZE_LOG" 2>&1
+# python3 "$BSQ", not a direct exec: measured (T-1046) that scripts/cli/bsq
+# lost its execute bit mid-run while another session had it open with 300+
+# uncommitted lines — a real, if transient, hazard on a file this heavily
+# co-edited. bsq has a `#!/usr/bin/env python3` shebang and is fully
+# readable at 644, so invoking the interpreter directly sidesteps the x-bit
+# dependency entirely rather than waiting out someone else's save.
+python3 "$BSQ" verify-isolated --with-git --ref bot_squad/dev --keep -- true >"$MATERIALIZE_LOG" 2>&1
 cat "$MATERIALIZE_LOG"
 DEST="$(grep -oE ' to (/\S+)$' "$MATERIALIZE_LOG" | awk '{print $NF}' | tail -1)"
 rm -f "$MATERIALIZE_LOG"

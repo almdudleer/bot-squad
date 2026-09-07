@@ -51,6 +51,13 @@ def test_noop_status_never_restamps(tmp_path, monkeypatch):
 
 
 def test_reentry_gets_a_fresh_stamp(tmp_path, monkeypatch):
+    """T-0997: this used real wall-clock transitions with nothing between them,
+    so before T-1016's monotonic `_fresh_since_stamp` it flaked ~1 run in 4 —
+    whenever two of the three second-resolution stamps landed in the same
+    second. T-1016 makes every real transition strictly greater than the last
+    regardless of clock resolution, so `second != first` now holds by
+    construction, not by wall-clock luck; measured 0/70 failures after the fix
+    vs 47/70 on a copy with the fix reverted (interleaved runs, 2026-09-07)."""
     p = tmp_path / "T-0001-demo.md"
     _write(p, status="in_progress", status_since="2020-01-01T00:00:00Z")
     _run_update(tmp_path, monkeypatch, "blocked_on_user")

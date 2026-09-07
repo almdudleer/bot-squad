@@ -50,7 +50,19 @@ LOG="$LOG_DIR/$RUN_ID.log"
 LOCK_FILE="/home/almdudleer/.t1046-cert.lock"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
-  echo "run_nightly_certification: another run holds $LOCK_FILE — exiting (not a failure)" >&2
+  # Measured (T-1046, R-0010 handler): a silent skip here is THIS TICKET'S
+  # OWN FAILURE MODE in miniature. The log redirection isn't armed until
+  # further down, so without this, a lock-skip wrote no .log and no .rc and
+  # exited 0 — the monitor's judge is nonzero_exit, so a skip reads as a
+  # clean PASS, and R-0010's own Instruction tells the handler to "read the
+  # newest .log", which after a silent skip is a STALE log from whatever run
+  # actually happened last. A tier reporting healthy while running nothing
+  # is the sentence T-1046's own title is made of. exit 0 stays — a skip
+  # genuinely is not a breach — but it must be a VISIBLE, dated exit 0, not
+  # an invisible one.
+  echo "=== SKIPPED $RUN_ID ($(date -u -Iseconds)) — another run holds $LOCK_FILE ===" >"$LOG_DIR/$RUN_ID.log"
+  echo 0 >"$LOG_DIR/$RUN_ID.rc"
+  echo "run_nightly_certification: another run holds $LOCK_FILE — skipped, see $LOG_DIR/$RUN_ID.log" >&2
   exit 0
 fi
 

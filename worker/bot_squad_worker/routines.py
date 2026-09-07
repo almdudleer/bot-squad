@@ -307,17 +307,6 @@ class MonitorTrigger(Trigger):
                     raise RoutineError(
                         f"monitor spec: judge {judge} needs a numeric threshold, "
                         f"got {threshold!r}")
-                if (_EXIT_CODE_FOOTGUN_RE.search(cmd)
-                        and not _EXIT_CODE_GUARD_RE.search(cmd)):
-                    raise RoutineError(
-                        f"monitor spec: cmd looks like it uses grep -c/-q, diff, "
-                        f"or cmp under judge {judge} — those commands exit "
-                        "nonzero on the common/healthy case (zero matches / no "
-                        "difference), which evaluate_probe treats as a PROBE "
-                        "ERROR, not a valid 0 value (this silently broke "
-                        "R-0008 — T-0708). Guard the pipeline so a healthy "
-                        "tick still exits 0, e.g. append '|| true', or use "
-                        "judge=nonzero_exit instead")
             elif judge == "regex_match":
                 if not threshold or not str(threshold).strip():
                     raise RoutineError(
@@ -327,6 +316,25 @@ class MonitorTrigger(Trigger):
                 except re.error as e:
                     raise RoutineError(
                         f"monitor spec: invalid regex threshold {threshold!r}: {e}")
+            # T-0990: keyed on the SAME predicate evaluate_probe uses (its own
+            # docstring: "only nonzero_exit consumes exit codes as signal; for
+            # every other judge a nonzero exit means the probe itself failed"),
+            # not on the hand-listed _MONITOR_NUMERIC_JUDGES — regex_match hits
+            # that same error path (evaluate_probe's exit_code!=0 branch runs
+            # before the regex_match branch) and was silently exempt from this
+            # guard.
+            if (judge != "nonzero_exit"
+                    and _EXIT_CODE_FOOTGUN_RE.search(cmd)
+                    and not _EXIT_CODE_GUARD_RE.search(cmd)):
+                raise RoutineError(
+                    f"monitor spec: cmd looks like it uses grep -c/-q, diff, "
+                    f"or cmp under judge {judge} — those commands exit "
+                    "nonzero on the common/healthy case (zero matches / no "
+                    "difference), which evaluate_probe treats as a PROBE "
+                    "ERROR, not a valid 0 value (this silently broke "
+                    "R-0008 — T-0708). Guard the pipeline so a healthy "
+                    "tick still exits 0, e.g. append '|| true', or use "
+                    "judge=nonzero_exit instead")
 
         on_breach = str(spec.get("on_breach") or "spawn").strip().lower()
         if on_breach not in ("spawn", "notify"):

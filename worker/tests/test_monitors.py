@@ -137,6 +137,11 @@ def test_schedule_trigger_poll_fires_when_due():
     {"cmd": "grep -qc pattern /var/log/x"},
     {"cmd": "diff a.txt b.txt"},
     {"cmd": "cmp a.txt b.txt"},
+    # T-0990: evaluate_probe's exit_code!=0 branch runs for EVERY judge except
+    # nonzero_exit (its own docstring), so regex_match hits the identical
+    # error path as the numeric judges — the guard must fire for it too.
+    {"judge": "regex_match", "threshold": "boom", "cmd": "grep -c boom /var/log/x"},
+    {"judge": "regex_match", "threshold": "boom", "cmd": "diff a.txt b.txt"},
 ])
 def test_monitor_spec_validation_rejects(bad):
     spec = _spec(**bad)
@@ -158,9 +163,25 @@ def test_monitor_spec_grep_c_footgun_allowed_when_guarded(cmd):
     assert trig.spec["cmd"] == cmd
 
 
-def test_monitor_spec_grep_c_footgun_only_checked_for_numeric_judges():
+@pytest.mark.parametrize("cmd", [
+    "grep -c boom /var/log/x || true",
+    "diff a.txt b.txt || exit 0",
+])
+def test_monitor_spec_grep_c_footgun_allowed_when_guarded_regex_match(cmd):
+    """T-0990: the footgun guard now covers regex_match too (same
+    exit-code-as-error runtime path as the numeric judges) — confirm the
+    guarded form still passes for it, mirroring the numeric-judge case above."""
+    trig = R.MonitorTrigger(_spec(judge="regex_match", threshold="boom", cmd=cmd))
+    assert trig.spec["cmd"] == cmd
+
+
+def test_monitor_spec_grep_c_footgun_exempts_nonzero_exit_judge():
     # nonzero_exit judge WANTS the exit code as signal — grep -c/-q etc.
-    # are exactly the right idiom there, not a footgun.
+    # are exactly the right idiom there, not a footgun. (T-0990: renamed from
+    # test_monitor_spec_grep_c_footgun_only_checked_for_numeric_judges, which
+    # claimed a scoping decision — "only checked for numeric judges" — its
+    # body never made: it held one nonzero_exit spec and never exercised
+    # regex_match at all.)
     spec = _spec(judge="nonzero_exit", cmd="grep -c boom /var/log/x")
     spec.pop("threshold")
     trig = R.MonitorTrigger(spec)

@@ -2496,14 +2496,34 @@ def _find_suspended_user_conversation(
     the legacy ``<gid>-user-conversation`` ``window`` match kept as the fallback
     — the same two-way match as ``live_user_conversation_sid``, and for the same
     reason: attendants suspended before the rename carry the gid only in their
-    window, attendants suspended after it carry it only in the field."""
+    window, attendants suspended after it carry it only in the field.
+
+    T-1053: a ``suspend_source: gc_sessions`` record is ranked BELOW every
+    deliberately-suspended one (idle_timeout's finalize/compact_exit, a manual
+    pause/suspend — anything that did NOT come from that flip), regardless of
+    raw ``suspended_at`` order. ``gc_sessions`` is a forensic "no live pane
+    found" data-hygiene sweep (see its docstring) — it freezes whatever
+    ``claude_uuid`` a record already had and stamps ``suspended_at`` at
+    DISCOVERY time, not at the moment the pane actually died, so it can read
+    as "more recent" than a genuinely later, deliberately-managed suspend
+    whose own record went missing for an unrelated reason. Measured live
+    (watchrobot, 2026-09-07): a gc_sessions ghost whose transcript had been
+    untouched — and uncompacted — for days outranked what should have been
+    the session's true, freshly-compacted continuation, so `bsq start`
+    resumed the ghost and Claude Code had to redo, from scratch, a compact
+    the operator's own bookkeeping believed had just happened. Preferring any
+    deliberate suspend over a gc_sessions one — and only falling back to the
+    ghost when nothing else qualifies — is strictly no worse than today (the
+    single-candidate case is unchanged) and closes that gap.
+    """
     from bot_squad_worker import sessions as _sessions
 
     gid = str(global_user_id or "").strip()
     sess_dir = cfg.data_dir / slug / "sessions"
     if not sess_dir.exists():
         return None
-    best: tuple[str, str] | None = None  # (suspended_at, sid)
+    best: tuple[str, str] | None = None       # deliberate suspends
+    best_ghost: tuple[str, str] | None = None  # gc_sessions fallback only
     for md in sess_dir.glob("*.md"):
         meta = _sessions._read_session_metadata(md)
         if not meta:
@@ -2519,9 +2539,14 @@ def _find_suspended_user_conversation(
         if not uuid or uuid == "~":
             continue
         key = (str(meta.get("suspended_at") or ""), str(meta.get("sid") or md.stem))
+        if str(meta.get("suspend_source") or "") == "gc_sessions":
+            if best_ghost is None or key > best_ghost:
+                best_ghost = key
+            continue
         if best is None or key > best:
             best = key
-    return best[1] if best else None
+    winner = best if best is not None else best_ghost
+    return winner[1] if winner else None
 
 
 def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:

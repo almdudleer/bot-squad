@@ -8553,17 +8553,44 @@ def _print_fanout(res: dict, tid: str) -> None:
 
     The relay habit grew because a ticket write felt like writing into a void
     while a peer_send visibly reached somebody. This line is the answer to the
-    question that drove it — and when nobody is bound and no operator is live,
-    it says THAT, which is the one case where relaying is still the right call.
+    question that drove it.
+
+    T-1072: it used to answer it WRONGLY most of the time. An empty
+    ``will_notify`` was printed as "nobody is bound to <tid> and no live
+    operator", and that sentence was false in the commonest case — a dev
+    writing onto its own ticket, where somebody IS bound and it is the writer.
+    Four states shared one sentence; the worker now sends ``will_notify_why``
+    and each gets its own, because the remedies differ. Only the genuinely-
+    nobody case keeps the relay advice: relaying is the wrong answer to "the
+    only person bound is you", and it is no answer at all to "we could not
+    find out".
     """
     if not isinstance(res, dict) or "will_notify" not in res:
         return
     targets = res.get("will_notify") or []
     if targets:
         print(f"  → fan-out will nudge: {', '.join(targets)}")
+        return
+    why = res.get("will_notify_why")
+    if why == "author_only":
+        print(f"  → you are the only session bound to {tid} — the fan-out has "
+              f"nobody else to tell (this is normal; do NOT relay)")
+    elif why == "watch_disabled":
+        print(f"  → ticket-watch is OFF, so no write to {tid} nudges anyone "
+              f"— binding and operators are not the reason")
+    elif why == "unknown":
+        print(f"  → could not work out who hears about {tid} (the lookup "
+              f"failed; see the worker log). This is NOT 'nobody'.")
+    elif why == "nobody":
+        print(f"  → nobody is bound to {tid} and no session holds the operator "
+              f"role — this write nudges no one (relay it only if it fits no "
+              f"ticket)")
     else:
-        print(f"  → nobody is bound to {tid} and no live operator — this write "
-              f"nudges no one (relay it only if it fits no ticket)")
+        # An older worker that does not send `will_notify_why`. Say what we
+        # actually know rather than re-asserting the sentence this ticket is
+        # about: an empty list from such a worker is ambiguous by construction.
+        print(f"  → this write nudges no one; the worker did not say why "
+              f"(pre-T-1072 worker — the reason is not recoverable here)")
 
 
 def cmd_ticket_note(args) -> None:

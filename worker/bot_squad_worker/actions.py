@@ -3657,16 +3657,72 @@ def _ticket_fanout_preview(cfg: Any, slug: str, task_id: str, sid: Any) -> list[
     so a session that dies or binds in between changes the real set. The author
     is excluded, mirroring the fan-out's own per-section suppression.
     """
+    return _ticket_fanout(cfg, slug, task_id, sid)[0]
+
+
+#: What an EMPTY ``will_notify`` actually means. T-1072: four different states
+#: collapsed into one printed sentence — "nobody is bound to <tid> and no live
+#: operator" — and the most common of them is the one where somebody IS bound.
+#: Each of these is a distinct fact with a distinct remedy, so the CLI is given
+#: the fact rather than left to guess from an empty list.
+FANOUT_BOUND = "bound"              # recipients found, they are bound to it
+FANOUT_OPERATOR = "operator"        # recipients found via the operator rung
+FANOUT_SEAT = "seat"                # recipients found via the seat rung
+FANOUT_AUTHOR_ONLY = "author_only"  # somebody IS bound: only you
+FANOUT_NOBODY = "nobody"            # genuinely nobody, on any rung
+FANOUT_WATCH_OFF = "watch_disabled"  # the fan-out itself is switched off
+FANOUT_UNKNOWN = "unknown"          # we could not find out — NOT "nobody"
+
+
+def _ticket_fanout(cfg: Any, slug: str, task_id: str,
+                   sid: Any) -> tuple[list[str], str]:
+    """``(targets, why)`` — who hears about this write, AND why the list is
+    what it is.
+
+    T-1072. The old version did ``sids, _why = recipients_for(...)`` and threw
+    ``_why`` away, then filtered out the author. An empty list came back for
+    FOUR different reasons and the CLI printed one sentence for all of them:
+
+    * genuinely nobody on any rung — the sentence is correct;
+    * **somebody IS bound and it is the WRITER** — both clauses of the sentence
+      are false, and this is the COMMON case, because a dev writing onto its
+      own ticket is the normal shape of this system;
+    * the fan-out is switched off entirely — binding and operators are
+      irrelevant and the switch is what the reader needs to know;
+    * the lookup RAISED — in which case we do not know, and an ``except`` that
+      returns ``[]`` mints a negative fact out of an error.
+
+    The author is still excluded from the TARGETS, which is right — the
+    fan-out's own per-section suppression does the same, and nudging yourself
+    about your own write is noise. What changes is that "the list emptied
+    because the only recipient was you" is now SAYABLE.
+
+    A PREVIEW, not a promise: the tick resolves recipients again when it fires.
+    """
     try:
         from bot_squad_worker import ticket_watch as _tw
         if not _tw.ticket_watch_enabled():
-            return []
-        sids, _why = _tw.recipients_for(cfg, slug, task_id)
-        return [s for s in sids if s != (str(sid) if sid else None)]
+            return [], FANOUT_WATCH_OFF
+        sids, why = _tw.recipients_for(cfg, slug, task_id)
+        me = str(sid) if sid else None
+        targets = [s for s in sids if s != me]
+        if targets:
+            return targets, (why if why in (FANOUT_BOUND, FANOUT_OPERATOR,
+                                            FANOUT_SEAT) else FANOUT_BOUND)
+        if sids:
+            # The rung found somebody and the only somebody was the writer.
+            return [], FANOUT_AUTHOR_ONLY
+        return [], FANOUT_NOBODY
     except Exception:  # noqa: BLE001
-        log.debug("could not preview ticket fan-out for %s/%s", slug, task_id,
-                  exc_info=True)
-        return []
+        log.exception("could not preview ticket fan-out for %s/%s", slug,
+                      task_id)
+        return [], FANOUT_UNKNOWN
+
+
+def _fanout_fields(cfg: Any, slug: str, task_id: str, sid: Any) -> dict:
+    """The two response fields every ticket writer returns, resolved once."""
+    targets, why = _ticket_fanout(cfg, slug, task_id, sid)
+    return {"will_notify": targets, "will_notify_why": why}
 
 
 def _action_task_progress_add(params: dict[str, Any]) -> dict[str, Any]:
@@ -3752,7 +3808,7 @@ def _action_task_progress_add(params: dict[str, Any]) -> dict[str, Any]:
 
     line = f"- {ts} · {sid} · {_sanitize_progress_text(text)}"
     return {"ok": True, "task_id": task_id, "line_appended": line,
-            "will_notify": _ticket_fanout_preview(cfg, slug, task_id, sid)}
+            **_fanout_fields(cfg, slug, task_id, sid)}
 
 
 # ---------------------------------------------------------------------------
@@ -4042,8 +4098,8 @@ def _action_task_context_set(params: dict[str, Any]) -> dict[str, Any]:
             "bytes_written": len(new_body), "path": str(path),
             "backup_path": str(backup) if backup else None,
             "context_rev": new_rev,
-            "will_notify": _ticket_fanout_preview(
-                _get_config(), params["slug"], task_id, params.get("sid"))}
+            **_fanout_fields(_get_config(), params["slug"], task_id,
+                             params.get("sid"))}
 
 
 _TASK_SUMMARY_SET_REQUIRED = {"slug", "task_id", "text"}
@@ -4089,8 +4145,8 @@ def _action_task_summary_set(params: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "task_id": params["task_id"],
             "bytes_written": len(new_body), "path": str(path),
             "backup_path": str(backup) if backup else None,
-            "will_notify": _ticket_fanout_preview(
-                _get_config(), params["slug"], params["task_id"], params.get("sid"))}
+            **_fanout_fields(_get_config(), params["slug"], params["task_id"],
+                             params.get("sid"))}
 
 
 _TASK_STAKEHOLDER_NOTE_REQUIRED = {"slug", "task_id", "text"}
@@ -4136,8 +4192,8 @@ def _action_task_stakeholder_note_add(params: dict[str, Any]) -> dict[str, Any]:
                         params.get("sid"), ("verbatim",))
     return {"ok": True, "task_id": params["task_id"],
             "line_appended": f"- {ts} · {source} · {text[:80]}",
-            "will_notify": _ticket_fanout_preview(
-                _get_config(), params["slug"], params["task_id"], params.get("sid"))}
+            **_fanout_fields(_get_config(), params["slug"], params["task_id"],
+                             params.get("sid"))}
 
 
 _TASK_DIGEST_ALLOWED = {"slug"}

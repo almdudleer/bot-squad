@@ -5421,7 +5421,8 @@ def test_restoring_a_stripped_ticket_id_puts_the_sends_back_in_the_topic(
 # `claude --resume` (full in-session history) over a memory-less fresh spawn.
 
 def _write_uc_md(cfg, window, sid, *, status="suspended", claude_uuid="u-77",
-                 suspended_at="2026-08-31T09:00:00Z", archived=None):
+                 suspended_at="2026-08-31T09:00:00Z", archived=None,
+                 suspend_source=None):
     import bot_squad_worker.sessions as S
     d = cfg.data_dir / "test-project" / "sessions"
     d.mkdir(parents=True, exist_ok=True)
@@ -5430,6 +5431,8 @@ def _write_uc_md(cfg, window, sid, *, status="suspended", claude_uuid="u-77",
             "suspended_at": suspended_at, "role": "user-conversation"}
     if archived is not None:
         meta["archived"] = archived
+    if suspend_source is not None:
+        meta["suspend_source"] = suspend_source
     S._write_session_metadata(d / f"{sid}.md", meta)
 
 
@@ -5502,6 +5505,56 @@ def test_find_suspended_uc_skips_archived_uuidless_and_other_windows(tmp_path,
     _write_uc_md(cfg, window, "S-new-p6", suspended_at="2026-08-31T02:00:00Z")
     assert A._find_suspended_user_conversation(
         cfg, "test-project", window) == "S-new-p6"
+
+
+# --- T-1053: a gc_sessions ghost never outranks a deliberate suspend --------
+#
+# gc_sessions (sessions.py:gc_sessions) is a forensic "no live pane found"
+# data-hygiene flip — it freezes whatever claude_uuid a record already had
+# and stamps suspended_at at DISCOVERY time, which can read as "later" than
+# a genuinely more recent, deliberately-managed suspend (idle_timeout's
+# finalize / compact_exit, a manual pause). Measured live on watchrobot
+# 2026-09-07: such a ghost outranked what should have been the session's
+# true, freshly-compacted continuation, so `bsq start` resumed a stale,
+# days-uncompacted transcript and Claude Code had to redo a compact the
+# system's own bookkeeping believed had just happened.
+
+def test_find_suspended_uc_prefers_deliberate_suspend_over_later_gc_ghost(
+        tmp_path, monkeypatch):
+    import bot_squad_worker.actions as A
+
+    cfg, _repo = _make_sessions_cfg(tmp_path, monkeypatch)
+    window = "gu_a1b2c3-user-conversation"
+    # Deliberate suspend (idle_timeout's compact_exit) — chronologically
+    # EARLIER on the wall clock than the ghost below, but the true, correct
+    # continuation.
+    _write_uc_md(cfg, window, "S-deliberate-p1",
+                 suspended_at="2026-09-07T00:46:31Z", claude_uuid="u-real")
+    # gc_sessions ghost — a stale record whose "suspended_at" (discovery
+    # time) reads LATER than the deliberate suspend above, even though the
+    # attendant it names went idle long before.
+    _write_uc_md(cfg, window, "S-ghost-p2",
+                 suspended_at="2026-09-07T09:00:00Z", claude_uuid="u-stale",
+                 suspend_source="gc_sessions")
+    assert A._find_suspended_user_conversation(
+        cfg, "test-project", window) == "S-deliberate-p1"
+
+
+def test_find_suspended_uc_falls_back_to_gc_ghost_when_nothing_else(
+        tmp_path, monkeypatch):
+    """No regression for the single-candidate case: when the ONLY suspended
+    record for this gid is a gc_sessions ghost, it is still returned — a
+    stale resume beats no resume at all, and this is the fallback the fix
+    must preserve."""
+    import bot_squad_worker.actions as A
+
+    cfg, _repo = _make_sessions_cfg(tmp_path, monkeypatch)
+    window = "gu_a1b2c3-user-conversation"
+    _write_uc_md(cfg, window, "S-ghost-only-p1",
+                 suspended_at="2026-09-06T15:49:07Z", claude_uuid="u-stale",
+                 suspend_source="gc_sessions")
+    assert A._find_suspended_user_conversation(
+        cfg, "test-project", window) == "S-ghost-only-p1"
 
 
 # --- T-1054: resume() carries the STORED window verbatim — a pre-T-0964 -----

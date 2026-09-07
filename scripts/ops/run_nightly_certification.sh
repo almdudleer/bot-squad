@@ -41,6 +41,19 @@ mkdir -p "$LOG_DIR"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 LOG="$LOG_DIR/$RUN_ID.log"
 
+# Serialise this script against itself. PYTEST_TMP below is a FIXED path
+# (see the byte-budget note there — it has no room left for a PID/random
+# suffix), so two overlapping runs would corrupt each other's pytest scratch
+# state the same way T-1004's hardcoded /tmp paths do. A daily routine
+# overlapping with itself is unlikely, but this is what makes it impossible
+# rather than merely unlikely, at zero byte cost to the path budget.
+LOCK_FILE="/home/almdudleer/.t1046-cert.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "run_nightly_certification: another run holds $LOCK_FILE — exiting (not a failure)" >&2
+  exit 0
+fi
+
 # Measured (T-1046): the bsq routine's monitor probe runs this in the WORKER
 # PROCESS's own environment, where /tmp is READ-ONLY (`mktemp: failed to
 # create file via template ... Read-only file system`) — unlike an
@@ -62,26 +75,48 @@ export TMPDIR
 #       "$TMPDIR/pytest-of-<user>/pytest-<N>/<test-name><idx>/...", and
 #       several worker tests (test_worker_census.py, test_jobs.py's
 #       heartbeat test) bind a REAL AF_UNIX socket under
-#       `tmp_path/data/_sock/worker.sock` — Linux caps a unix socket path
-#       (`sun_path`) at 108 bytes; the long TMPDIR blew through it.
+#       `tmp_path/data/_sock/[_sock/]worker.sock` — Linux caps a unix socket
+#       path (`sun_path`) at 108 bytes; the long TMPDIR blew through it.
 #   (b) test_t1019_provenance_gate.py's "no git reachable" tests build a
 #       throwaway dir under tmp_path and assert the provenance gate's repo
 #       walk finds NOTHING above it. Nested under the long TMPDIR, that walk
 #       instead finds the ambient repo at /home/www/bot-squad — the gate
 #       goes SILENT (a clean pass) rather than loud, on a test that exists
 #       to prove it fires.
-# `--basetemp=<PYTEST_TMP>` where PYTEST_TMP is short, PID-unique, AND has
-# no git repo above it fixes both at once: short (skips pytest's
-# "pytest-of-<user>/pytest-<N>/" wrapper too, ~35 more bytes saved — the
-# worst offending socket path measured 75 bytes against the 108 cap) and
-# rooted under plain /tmp, which is not inside any repo. PID-unique because
-# a SHARED short path across concurrent runs would trade this bug for
-# T-1004's exact hazard (a race on a fixed path). /tmp/claude-1000 specifically
-# (not /tmp/tmux-1000, which is tmux's own runtime dir and not ours to use)
-# because it's in the worker's systemd ReadWritePaths and nothing sits above
-# it in a repo. Verified against all 10 previously-failing tests directly,
-# not just inferred from a passing mktemp probe.
-PYTEST_TMP="/tmp/claude-1000/t1046-$$"
+#
+# IT IS `--basetemp` ITSELF THAT FIXES BOTH, NOT MERELY A SHORT BASE
+# DIRECTORY (measured by the R-0010 handler, not assumed — a first pass at
+# this comment credited "short base dir" and was wrong): the worst-case
+# socket path is TMPDIR + 99 bytes with pytest's normal
+# "pytest-of-<user>/pytest-<N>/" wrapper, and only 6 of that headroom was
+# EVER available even under bare `/tmp` — the original setup was never
+# robust, it was lucky. `--basetemp=<PYTEST_TMP>` removes that wrapper
+# outright (saves ~30 bytes, not just "some"), which is the only reason any
+# non-trivial TMPDIR fits at all: TMPDIR + 69 bytes, so PYTEST_TMP's own
+# length still has to stay short — this is a tight budget, not a solved one.
+#
+# PYTEST_TMP="/home/almdudleer/.t1046-cert-tmp" (32 bytes; 101 of 108 used,
+# 7 to spare on the worst known test) rather than a /tmp/* path: `/tmp` is
+# read-only to this process (see above) and BOTH of the writable /tmp
+# subdirectories in the worker's systemd ReadWritePaths turned out unsafe
+# for different reasons the R-0010 handler verified against the unit file
+# directly, not assumed from the list alone —
+#   `/tmp/claude-1000` is an OPTIONAL entry (`-/tmp/claude-1000`, leading
+#     dash): no /etc/tmpfiles.d rule creates it, the Claude Code harness
+#     does, so after a host reboot before any session starts, systemd
+#     silently SKIPS the entry and this path goes read-only again — the
+#     exact original EROFS bug, invisible until a probe hits it.
+#   `/tmp/tmux-1000` IS a hard, tmpfiles.d-guaranteed entry, but it is
+#     tmux's own runtime directory (R-0009 monitors it, T-0645 was an
+#     outage there) and not ours to write unrelated scratch files into.
+# `/home/almdudleer` is a hard ReadWritePaths entry (no dash, always
+# exists) with no git repo anywhere above it, so it fixes bug (b) too.
+# Verified against all previously-failing tests directly under this exact
+# setting (test_worker_census.py, the heartbeat test, and the full
+# test_t1019_provenance_gate.py file), not inferred from a passing mktemp
+# probe — a probe that doesn't invoke pytest cannot see any of this.
+PYTEST_TMP="/home/almdudleer/.t1046-cert-tmp"
+rm -rf "$PYTEST_TMP" 2>/dev/null || true
 mkdir -p "$PYTEST_TMP"
 
 exec > >(tee -a "$LOG") 2>&1

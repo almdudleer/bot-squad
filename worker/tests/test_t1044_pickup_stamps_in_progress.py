@@ -535,6 +535,12 @@ def test_bsq_own_reader_reads_the_full_title_after_a_stamp(tmp_path):
     def read_frontmatter(path: Path) -> dict:
         spec = importlib.util.spec_from_loader("_bsq_cli_under_test", None)
         mod = importlib.util.module_from_spec(spec)
+        # T-1049: supply `__file__`. `exec` does not define it, and the real
+        # CLI needs it — `read_frontmatter` resolves a sibling module via
+        # `Path(__file__).resolve().parent` (T-1047's reader fix). Without it
+        # the exec raises NameError and this test goes red for a reason
+        # unrelated to the code under test. Caught before that change landed.
+        mod.__dict__["__file__"] = str(cli)
         src = cli.read_text().replace('if __name__ == "__main__":\n    main()', "")
         try:
             exec(compile(src, str(cli), "exec"), mod.__dict__)  # noqa: S102

@@ -127,9 +127,16 @@ def _drop_pyc(root: Path) -> int:
 
 
 def _run_arm(cmd: list[str], *, gated: bool, kind: str, note: str,
-             wait: float, timeout: float) -> dict:
-    """One arm. Returns its wall/cpu/ratio plus the PSI window it ran under."""
-    inner = [sys.executable, "-c", _TIMER, *cmd]
+             wait: float, timeout: float, wrap: bool = True) -> dict:
+    """One arm. Returns its wall/cpu/ratio plus the PSI window it ran under.
+
+    ``wrap=False`` means the CALLER has already placed the timer where the work
+    actually happens. That is mandatory for a docker suite: wrapping here would
+    time the ``docker run`` CLIENT, which does almost no work, and report a
+    ratio of several hundred for a perfectly healthy run. Use ``--print-timer``
+    to get the script and splice it in as the container's own command.
+    """
+    inner = [sys.executable, "-c", _TIMER, *cmd] if wrap else list(cmd)
     argv = ([str(SLOT), "run", "--kind", kind, "--note", note,
              "--wait", str(wait), "--"] + inner) if gated else inner
 
@@ -194,9 +201,21 @@ def main() -> int:
     ap.add_argument("--pyc-root", default=None,
                     help="drop __pycache__ under here between arms")
     ap.add_argument("--out", default=None, help="write the JSON record here")
+    ap.add_argument("--no-wrap", action="store_true",
+                    help="the command ALREADY emits the @@RATIO@@ line — "
+                         "required for a docker suite, where the CPU that "
+                         "matters is burned inside the container and timing "
+                         "the client would measure the wrong process")
+    ap.add_argument("--print-timer", action="store_true",
+                    help="print the timer script and exit, to splice into a "
+                         "container command")
     ap.add_argument("cmd", nargs=argparse.REMAINDER,
                     help="-- the suite command to measure")
     args = ap.parse_args()
+
+    if args.print_timer:
+        sys.stdout.write(_TIMER)
+        return 0
 
     cmd = args.cmd[1:] if args.cmd and args.cmd[0] == "--" else args.cmd
     if not cmd:
@@ -212,7 +231,8 @@ def main() -> int:
                 dropped = None
             rec = _run_arm(cmd, gated=gated, kind=args.kind,
                            note=f"T-0968 DoD5 {'gated' if gated else 'ungated'} #{i + 1}",
-                           wait=args.wait, timeout=args.timeout)
+                           wait=args.wait, timeout=args.timeout,
+                           wrap=not args.no_wrap)
             rec["pair"] = i + 1
             rec["pycache_dirs_dropped"] = dropped
             runs.append(rec)

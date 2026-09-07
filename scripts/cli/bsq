@@ -4171,15 +4171,19 @@ def cmd_drift_on(args) -> None:
 
 
 def cmd_drift_status(args) -> None:
+    """T-0998: refuse a verdict when the SID names no session, rather than
+    defaulting `paused = False` and printing a fabricated "ON (active)" for
+    ANY string on stdout with exit 0 — a green about nothing. Mirrors
+    `set_drift_paused` (``drift on``/``drift off``), which already raises on
+    a missing SessionMd instead of writing one."""
     slug = resolve_slug()
     sid = require_sid(getattr(args, "sid", None))
     md = sessions_dir(slug) / f"{sid}.md"
-    paused = False
-    if md.exists():
-        fm = read_frontmatter(md)
-        paused = str(fm.get("drift_paused", "")).strip().lower() in {"true", "1", "yes", "on"}
-    else:
-        print(f"bsq: no SessionMd at {md} (status may be stale)", file=sys.stderr)
+    if not md.exists():
+        die(f"no SessionMd at {md} — {sid!r} is not a known session; "
+            f"there is no drift state to report")
+    fm = read_frontmatter(md)
+    paused = str(fm.get("drift_paused", "")).strip().lower() in {"true", "1", "yes", "on"}
     print(f"drift checks for {sid}: {'OFF (paused)' if paused else 'ON (active)'}")
 
 

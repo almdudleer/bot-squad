@@ -95,36 +95,54 @@ ARMS = {
     "api/tests/": "api",
     "web/src/": "web",
     "scripts/cli/": "scripts-cli",   # T-0991 wired this one
+    # T-1039 wired these six as exact FILES, not directory prefixes: a
+    # directory prefix would silently claim coverage for any future
+    # test_*.sh dropped into the same folder, which is the exact amnesia
+    # DECLARED_UNCOVERED's bidirectional check exists to prevent. A new
+    # shell test here must be added by hand, on purpose, or it goes RED.
+    ".githooks/test_commit_policy.sh": "shell-tests",
+    ".githooks/test_duplicate_def_gate.sh": "shell-tests",
+    ".githooks/test_push_policy.sh": "shell-tests",
+    "scripts/hooks/test_derive_role.sh": "shell-tests",
+    "scripts/hooks/test_worktree_guard.sh": "shell-tests",
+    "scripts/ops/test_smoke_with_backoff.sh": "shell-tests",
 }
 
 # The `jobs:` key each arm must occupy in .github/workflows/nightly-suites.yml,
 # plus a fragment its `run:` block must contain. The fragment is what stops a
 # job from being renamed into existence while running something else entirely.
+#
+# "shell-tests" runs six DIFFERENT files (see ARMS above), so one needle can't
+# prove all six ran — it can only prove the job wasn't renamed/gutted. Anchored
+# on test_commit_policy.sh, the oldest and largest of the six (876 lines,
+# T-0657), same anchoring logic as DENOMINATOR_ANCHOR below.
 ARM_NIGHTLY_JOBS = {
     "worker": "worker/tests",
     "api": "pytest",
     "web": "npm test",
     "scripts-cli": "scripts/cli",
+    "shell-tests": ".githooks/test_commit_policy.sh",
 }
 
 # Test-bearing paths that NO arm runs, each with the reason. A known and
 # declared hole is a different object from one nobody has enumerated: this
 # list is what makes the difference auditable.
 #
-# T-0991 measured these 7 and left them uncovered ON PURPOSE — wiring a shell
-# surface is a different job from the `scripts/cli` one this ticket names, and
-# is filed separately. What this ticket owes them is enumeration, not silence.
+# T-0991 measured 7 of these and left them uncovered ON PURPOSE — wiring a
+# shell surface was a different job from the `scripts/cli` one that ticket
+# named, and was filed separately as T-1039. T-1039 wired six of the seven
+# into the `shell-tests` nightly job above; one stays, because wiring it would
+# not test the gate — it would test that a SKIP fires, forever.
 DECLARED_UNCOVERED = {
-    ".githooks/test_commit_policy.sh": "shell gate test; run by hand, no CI job",
-    ".githooks/test_duplicate_def_gate.sh": "shell gate test; run by hand, no CI job",
-    ".githooks/test_push_policy.sh": "shell gate test; run by hand, no CI job",
-    "scripts/hooks/test_derive_role.sh": (
-        "shell mirror test; worker/tests/test_bsq_role_derivation_mirror.py READS "
-        "its CASES array but never EXECUTES it, so the script itself is unrun"
+    "scripts/ops/test_rebuild_api_venv.sh": (
+        "hardcodes /home/www/bot-squad/api — the live INSTALL path, absent on "
+        "any CI runner — and SKIPS (exit 0) when it is missing, plus needs "
+        "network pip installs and a couple of minutes. Wiring this into CI "
+        "would not exercise rebuild_api_venv.sh, it would exercise the SKIP "
+        "branch on every run forever: the 'exits 0 unconditionally' false "
+        "green T-1039's own DoD warned against. Stays a by-hand ops smoke "
+        "test against a target host."
     ),
-    "scripts/hooks/test_worktree_guard.sh": "shell gate test; run by hand, no CI job",
-    "scripts/ops/test_rebuild_api_venv.sh": "shell ops test; run by hand, no CI job",
-    "scripts/ops/test_smoke_with_backoff.sh": "shell ops test; run by hand, no CI job",
 }
 
 

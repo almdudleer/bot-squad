@@ -195,3 +195,70 @@ jobs:
       - name: Run the scripts/cli suite
         run: |
           pytest -q scripts/cli
+
+  # T-1039: the FIFTH surface. Six `test_*.sh` scripts guard the commit-policy,
+  # push-policy, duplicate-def, and worktree gates plus the bash/python
+  # role-derivation mirror -- the machinery that stops a lane from committing a
+  # peer's staged hunks or pushing a divergence -- and until this job existed
+  # none of them ran anywhere but a human's terminal.
+  # worker/tests/test_certification_surface_census.py::DECLARED_UNCOVERED is
+  # the SSOT; six of the seven T-0991 measured leave that list here.
+  #
+  # scripts/ops/test_rebuild_api_venv.sh is DELIBERATELY NOT wired here: it
+  # hardcodes /home/www/bot-squad/api -- the live INSTALL, absent on any CI
+  # runner -- and SKIPS (exit 0) when that path is missing. Wiring it would not
+  # test the gate, it would test that the skip fires, every run, forever --
+  # exactly the "a script that exits 0 unconditionally" false green this
+  # ticket's own DoD warned against. It stays a by-hand ops smoke test run
+  # against a target host. See DECLARED_UNCOVERED for the full reason.
+  #
+  # MEASURED green on a clean checkout before wiring (T-1039, 2026-09-07,
+  # b40b646): test_commit_policy.sh 62 passed/0 failed/3 skipped ~10s;
+  # test_duplicate_def_gate.sh 17/0 ~3s; test_push_policy.sh 73/0/1 skipped
+  # ~25s; test_derive_role.sh 45 windows, full contract+drift <1s;
+  # test_worktree_guard.sh 198/0 ~64s; test_smoke_with_backoff.sh 4/4 checks
+  # <1s. CONTROL: reintroducing T-0041's exact bug (operator mapped to
+  # teamlead in derive_role.sh, in a scratch copy) makes test_derive_role.sh
+  # fail loudly — rc 1, 8 FAIL lines naming the mismatch — proving the gate
+  # bites rather than passing unconditionally.
+  #
+  # NO pip/npm installs: every script here shells out to git/bash/python3
+  # only. The python it runs (the derive-role drift check, the worktree
+  # guard's PreToolUse hook simulation and its `bsq` co-edit-audit call)
+  # imports stdlib plus bot_squad_worker's/bsq's own source, importable
+  # straight from a checkout with no editable install -- the "deps are
+  # measured, not assumed" discipline above; the pyyaml requirement belongs to
+  # scripts/cli, not to this arm, and was checked separately.
+  #
+  # THE JOB NAME `shell-tests` IS LOAD-BEARING, same reasoning as scripts-cli
+  # above: the census asserts this job exists and that its `run:` still names
+  # test_commit_policy.sh.
+  shell-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bot_squad/dev
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Configure a git identity
+        # The throwaway clones each script builds set their own local
+        # user.email/user.name; this covers the rare path that doesn't and
+        # would otherwise fail on a runner with no global git identity.
+        run: |
+          git config --global user.email "ci@bot-squad.local"
+          git config --global user.name "bot-squad CI"
+      - name: commit-policy gate selftest
+        run: bash .githooks/test_commit_policy.sh
+      - name: duplicate-def gate selftest
+        run: bash .githooks/test_duplicate_def_gate.sh
+      - name: push-policy gate selftest
+        run: bash .githooks/test_push_policy.sh
+      - name: bash/python role-derivation mirror
+        run: bash scripts/hooks/test_derive_role.sh
+      - name: worktree guard selftest
+        run: bash scripts/hooks/test_worktree_guard.sh
+      - name: ops smoke-with-backoff selftest
+        run: bash scripts/ops/test_smoke_with_backoff.sh

@@ -2055,6 +2055,7 @@ def suspend(cfg: Any, slug: str, sid: str, *,
             break
         time.sleep(0.5)
     else:
+        _steer_client_before_kill(target_pane)
         _run(["tmux", "kill-pane", "-t", target_pane.pane_id])
 
     return {"ok": True, "suspended": True}
@@ -5524,6 +5525,79 @@ _ORPHAN_TMUX_REAP = (os.environ.get("BOT_SQUAD_ORPHAN_TMUX_REAP") or "1").strip(
 _BOT_SQUAD_INIT_WINDOW = "_init"
 
 
+# ---------------------------------------------------------------------------
+# T-1056: don't let an automatic kill steal a live client's view
+# ---------------------------------------------------------------------------
+#
+# Every window in a project's tmux session is SHARED state — all clients
+# attached to that session display the same "current" window (this is the
+# whole point of a plain `tmux attach`, as opposed to a grouped session with
+# independent views). So when a background tick (idle-timeout recycle,
+# archive_dead_teammates' reap) force-closes a pane/window that happens to be
+# the one currently displayed, tmux's own fallback selection decides what the
+# human sees next — often the never-visited `_init` placeholder, a bare shell
+# parked in the project's cwd. Stakeholder, 2026-09-07 (T-1056): "а только
+# что меня вообще в тмуксе рандомно перекинуло в другое окно с открытым в
+# какой-то служебной папке терминалом". `_steer_client_before_kill` makes
+# that landing spot OUR choice instead of tmux's.
+
+
+def _current_session_pane(session_name: str) -> str:
+    """The pane-id tmux is currently displaying for ``session_name`` — what
+    every attached client sees right now. "" if the session/tmux is gone."""
+    if not session_name:
+        return ""
+    res = _run(["tmux", "display-message", "-p", "-t", session_name, "#{pane_id}"])
+    if res.returncode != 0:
+        return ""
+    return res.stdout.strip()
+
+
+def _safe_landing_pane(session_name: str, *, exclude_pane: str) -> str:
+    """The best pane to land an attached client on inside ``session_name``,
+    other than ``exclude_pane`` (the one about to be killed).
+
+    Preference order: the live root/user-conversation session's window (sends
+    the human home) — else any other real window still alive — else "" (no
+    better choice than whatever tmux itself would pick, i.e. `_init`).
+    """
+    from bot_squad_worker import budding as _budding
+
+    user = _get_current_user()
+    candidates = [p for p in list_panes()
+                  if p.session == session_name and p.pane_id != exclude_pane]
+    for p in candidates:
+        sid = compute_sid(user, p.window, p.pane_id)
+        if _budding.is_root_session(sid):
+            return p.pane_id
+    for p in candidates:
+        if p.window != _BOT_SQUAD_INIT_WINDOW:
+            return p.pane_id
+    return ""
+
+
+def _steer_client_before_kill(pane: "PaneInfo | None") -> None:
+    """Best-effort: if ``pane`` is the window a client is currently looking
+    at, move that view to a safe pane BEFORE the caller kills ``pane``.
+
+    No-op (and never raises) when ``pane`` is None, isn't the session's
+    current pane, or no safer pane exists — those cases leave tmux's own
+    fallback exactly as it was before this function existed.
+    """
+    if pane is None or not pane.pane_id or not pane.session:
+        return
+    try:
+        if _current_session_pane(pane.session) != pane.pane_id:
+            return  # not what any client is displaying — a kill here is invisible
+        safe = _safe_landing_pane(pane.session, exclude_pane=pane.pane_id)
+        if safe:
+            _run(["tmux", "select-window", "-t", safe])
+            log.info("T-1056: steered %s's client off %s before reaping it "
+                      "(-> %s)", pane.session, pane.pane_id, safe)
+    except Exception:  # noqa: BLE001 — steering is a courtesy; never block a reap on it
+        log.exception("T-1056: steer-before-kill failed for %s", pane.pane_id)
+
+
 def _orphan_ledger_path(cfg: Any) -> Path:
     """Cross-project worker state (the per-slug dirs are the wrong home: an
     orphan by definition belongs to no slug)."""
@@ -6877,6 +6951,7 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
         # claude.
         own_pane = live_pane_by_sid.get(sid)
         if own_pane is not None:
+            _steer_client_before_kill(own_pane)
             _run(["tmux", "kill-window", "-t", own_pane.pane_id])
 
         meta["status"] = "suspended"

@@ -1100,6 +1100,102 @@ def _maybe_recycle_leased(cfg: Any, slug: str, sid: str, row: dict, md_path,
                           role=role, plan=plan)
 
 
+# --- T-1060: the system's OWN wake-ups must not reset the recycle clock ------
+#
+# ``uc_redrive`` re-drives an attendant whose reply turn died, on the
+# stakeholder's cadence — ~5 min, ~15 min, then every ~30 for as long as the
+# message hangs (T-0794). Each of those nudges is a REAL turn: the Stop hook
+# fires, :func:`_idle_age`'s primary signal resets, and the session reads as
+# freshly active. The steady cadence (1800s) is SHORTER than this module's
+# window (:func:`idle_timeout_sec`, 3300s), so a campaign that stays open pins
+# its attendant permanently below the deadline — not usually, ALWAYS, because
+# the two numbers alone decide it.
+#
+# Measured on the live install (T-1060): the stakeholder's watchrobot attendant
+# took 79 consecutive turns spaced 1787-1796s apart across 39h, one 6-8s after
+# each ``uc_redrive: re-woke idle attendant`` line, for a maximum idle age of
+# 1796s against a 3300s window. It could therefore never reach
+# :data:`PLAN_COMPACT_EXIT`, and so never took a DELIBERATE suspend: all six
+# SessionMds ever written for that gid carry ``suspend_source: gc_sessions``
+# (the forensic "no live pane" flip, which preserves whatever stale
+# ``claude_uuid`` was on the record). That ghost is exactly the input T-1053
+# had to work around, and its fix — prefer a deliberate suspend over a ghost —
+# can never engage for an attendant that has no deliberate suspend to prefer.
+#
+# THE ANCHOR is the fix, and it is deliberately one-directional. A system waker
+# stamps the idle moment it is ABOUT TO overwrite, once per campaign (a second
+# stamp would move the anchor forward and reinstate the pin), and
+# :func:`_idle_age` reports the OLDER of the two readings. So a session the
+# system keeps poking still reaches its deadline on schedule, while nothing can
+# make a session look busier than it is. It is cleared on every
+# ``ensure_user_conversation`` that is NOT marked a system wake — i.e. the
+# moment a human actually messages the attendant, its clock is its own again —
+# and on ``resume``/``suspend``, both of which start a new lifetime.
+SYSTEM_WAKE_ANCHOR_FIELD = "system_wake_anchor_at"
+
+
+def system_wake_anchor_age(meta: dict | None, now: float) -> float | None:
+    """Seconds since the idle moment a system waker preserved, or None.
+
+    ``None`` for an absent/unparsable stamp — an anchor that cannot be read
+    must never be guessed at, it simply does not constrain the clock.
+    """
+    raw = str((meta or {}).get(SYSTEM_WAKE_ANCHOR_FIELD) or "").strip()
+    if not raw or raw == "~":
+        return None
+    try:
+        at = datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, now - at)
+
+
+def clear_system_wake_anchor(meta: dict) -> bool:
+    """Drop the anchor. True iff one was there (so a caller can skip the write)."""
+    return meta.pop(SYSTEM_WAKE_ANCHOR_FIELD, None) is not None
+
+
+def mark_system_wake(cfg: Any, slug: str, sid: str, *,
+                     now: float | None = None) -> bool:
+    """Preserve ``sid``'s CURRENT idle moment before a system wake overwrites it.
+
+    Call this immediately BEFORE injecting the wake (the Stop hook that resets
+    the real clock fires seconds later, so a stamp taken after the injection
+    would already be reading the turn it exists to discount).
+
+    An anchor already on the md is left alone: the point is the moment the
+    session last went idle for a reason of its own, and every later nudge in the
+    same campaign is exactly what must not move it. Returns True iff a stamp was
+    written. Best-effort — a wake is never failed because its bookkeeping could
+    not be recorded.
+    """
+    now = time.time() if now is None else float(now)
+    try:
+        sessions_dir = cfg.data_dir / slug / "sessions"
+        md_path = sessions._find_session_md(sessions_dir, sid, None)
+        if md_path is None:
+            return False
+        with sessions.session_md_lock(md_path):
+            meta = sessions._read_session_metadata(md_path)
+            if meta is None or meta.get(SYSTEM_WAKE_ANCHOR_FIELD):
+                return False
+            age = _idle_age({}, meta, sessions._get_user_home(), now)
+            # An unknowable idle age anchors at NOW rather than skipping: the
+            # session is about to be woken by us either way, and "the clock
+            # starts here" is the conservative reading — it can only delay the
+            # deadline this anchor exists to make reachable, never advance it.
+            at = now - (age if age is not None else 0.0)
+            meta[SYSTEM_WAKE_ANCHOR_FIELD] = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+            sessions._write_session_metadata(md_path, meta, atomic=True)
+        return True
+    except Exception:  # noqa: BLE001 — bookkeeping never breaks a wake
+        log.debug("idle_timeout: mark_system_wake failed for %s/%s", slug, sid,
+                  exc_info=True)
+        return False
+
+
 def _idle_age(row: dict, meta: dict, user_home: str, now: float) -> float | None:
     """Seconds since the session went idle, or None when unknowable.
 
@@ -1113,17 +1209,29 @@ def _idle_age(row: dict, meta: dict, user_home: str, now: float) -> float | None
     legacy jsonl mtime via ``_pane_activity_at``, so nothing regresses before the
     Stop hook has fired once. Still jsonl-only (NOT the heartbeat-folded
     ``activity_at``) — see the module docstring on THE IDLE CLOCK.
+
+    T-1060: whichever of those two speaks, the SYSTEM-WAKE ANCHOR is read
+    beside it and the OLDER reading is returned — a turn this system asked for
+    must not be able to report the session as freshly busy. See
+    :data:`SYSTEM_WAKE_ANCHOR_FIELD`.
     """
     cwd = str(row.get("cwd") or meta.get("cwd") or "")
     sid = row.get("sid") or meta.get("sid") or ""
+    # T-1060: a system wake's own turn resets both signals below, so the
+    # preserved anchor is read alongside them and the OLDER reading wins.
+    anchor_age = system_wake_anchor_age(meta, now)
     hook_age = lifecycle_events.hook_idle_age(cwd, sid, now)
     if hook_age is not None:
-        return hook_age
+        # 0.0 is how the hook signal says A TURN IS IN PROGRESS (an `.active`
+        # marker at or after the Stop). The anchor must never speak over that:
+        # it would report a session that is mid-answer as idle for an hour and
+        # recycle it out from under its own reply.
+        return hook_age if hook_age <= 0.0 else max(hook_age, anchor_age or 0.0)
     claude_uuid = row.get("claude_uuid") or meta.get("claude_uuid")
     at = sessions._pane_activity_at(cwd, claude_uuid, user_home)
     if at is None:
-        return None
-    return max(0.0, now - at)
+        return anchor_age
+    return max(0.0, now - at, anchor_age or 0.0)
 
 
 def _start_recycle(cfg: Any, slug: str, sid: str, row: dict, meta: dict, md_path,

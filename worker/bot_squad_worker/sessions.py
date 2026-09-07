@@ -2394,7 +2394,11 @@ def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None,
     # Update metadata
     # T-0575: this resurrect CONSUMES the recycle-v2 "remembered" state — drop
     # it so decide_dispatch never offers an already-resumed session again.
-    for _k in ("resumable", "recycled_at", "resume_hint"):
+    # T-1060: ...and the system-wake anchor with them. It preserves the idle
+    # moment of the lifetime that just ended; carrying it into a fresh pane
+    # would have the resumed session born already past its deadline.
+    for _k in ("resumable", "recycled_at", "resume_hint",
+               "system_wake_anchor_at"):
         meta.pop(_k, None)
     meta["status"] = "active"
     meta["sid"] = new_sid

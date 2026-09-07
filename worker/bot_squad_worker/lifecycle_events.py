@@ -135,6 +135,24 @@ def _marker_mtime(cwd: str, sid: str, kind: str) -> float | None:
         return None
 
 
+def hook_turn_in_progress(cwd: str, sid: str) -> bool:
+    """True when a turn is RUNNING — an ``.active`` marker at or after the Stop.
+
+    :func:`hook_idle_age` folds this case into ``0.0``, which a caller cannot
+    tell apart from a turn that ended this very instant. T-1060 needed the
+    distinction: the system-wake anchor may lengthen an idle reading, but never
+    over a session that is mid-answer. Asked of the markers rather than derived
+    from the folded return, so the two can never drift apart.
+    """
+    if not cwd or not sid:
+        return False
+    stop = _marker_mtime(cwd, sid, MARKER_STOP)
+    if stop is None:
+        return False
+    active = _marker_mtime(cwd, sid, MARKER_ACTIVE)
+    return active is not None and active >= stop
+
+
 def hook_idle_age(cwd: str, sid: str, now: float) -> float | None:
     """Stall time (seconds) from the HOOK signal, or None when there is none.
 

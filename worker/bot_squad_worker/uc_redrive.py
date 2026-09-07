@@ -866,6 +866,15 @@ def check_project(cfg: Any, slug: str, *, now: float | None = None) -> dict:
             A.dispatch("ensure_user_conversation", {
                 "slug": slug, "global_user_id": gid,
                 "message_ref": rec.get("text"),
+                # T-1060: this is the SYSTEM re-driving an idle attendant, not
+                # the user messaging it. Every nudge here is a real turn, and
+                # this cadence (1800s) is shorter than the recycle window
+                # (3300s) — unmarked, an open campaign pinned its attendant
+                # permanently below the idle deadline, so it never took a
+                # deliberate suspend and only ever left gc_sessions ghosts on
+                # disk. The marker makes the ensure preserve the idle moment it
+                # is about to overwrite instead of resetting it.
+                "system_wake": True,
             })
         except Exception:
             log.exception("uc_redrive: redrive dispatch failed for %s/%s", slug, key)

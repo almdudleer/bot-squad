@@ -2328,7 +2328,8 @@ _ENSURE_UCONV_REQUIRED = {"slug", "global_user_id"}
 # T-0623: optional explicit model override for the fresh-spawn path; absent
 # falls through to sessions.spawn's role default (user-conversation -> claude-sonnet-5).
 # T-0676 items 3/6: optional thread_id — see _action_ensure_user_conversation.
-_ENSURE_UCONV_ALLOWED = _ENSURE_UCONV_REQUIRED | {"message_ref", "model", "thread_id"}
+_ENSURE_UCONV_ALLOWED = _ENSURE_UCONV_REQUIRED | {"message_ref", "model",
+                                                   "thread_id", "system_wake"}
 
 
 def _thread_scoped_read_write_block(slug: str, global_user_id: str, thread_id: Any) -> str:
@@ -2549,6 +2550,29 @@ def _find_suspended_user_conversation(
     return winner[1] if winner else None
 
 
+def _clear_system_wake_anchor(cfg: Any, slug: str, sid: str) -> None:
+    """T-1060: hand ``sid``'s recycle clock back to its own activity.
+
+    Called on every ``ensure_user_conversation`` that is NOT a system wake —
+    i.e. the moment a human actually messages the attendant. Best-effort: the
+    routing of a durable message never fails on this bookkeeping.
+    """
+    from bot_squad_worker import idle_timeout as _idle
+    from bot_squad_worker import sessions as _s
+    try:
+        md_path = _s._find_session_md(cfg.data_dir / slug / "sessions", sid, None)
+        if md_path is None:
+            return
+        with _s.session_md_lock(md_path):
+            meta = _s._read_session_metadata(md_path)
+            if meta is None or not _idle.clear_system_wake_anchor(meta):
+                return
+            _s._write_session_metadata(md_path, meta, atomic=True)
+    except Exception:  # noqa: BLE001 — never break routing on bookkeeping
+        log.debug("ensure_user_conversation: clearing the system-wake anchor "
+                  "failed for %s/%s", slug, sid, exc_info=True)
+
+
 def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
     """Ensure a live user-conversation session is attending ``(slug,
     global_user_id)``; spawn one on incoming user mail if none is running.
@@ -2575,7 +2599,10 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
                      to read/reply into THAT topic's isolated thread instead
                      of the project's whole mixed history, killing the
                      cross-topic bleed / misrouted-reply pair. Absent/None
-                     behaves byte-identically to before this change).
+                     behaves byte-identically to before this change);
+                     system_wake (T-1060: this ensure is the SYSTEM re-driving
+                     the attendant, not a human messaging it — see the anchor
+                     bookkeeping in the reuse branch below).
     Returns: {ok, sid, spawned: bool}
     """
     extra = set(params) - _ENSURE_UCONV_ALLOWED
@@ -2602,6 +2629,11 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
     # None (DM / non-topic message) leaves every prompt byte-identical to
     # before this change.
     thread_id = params.get("thread_id")
+    # T-1060: WHO is waking this attendant. uc_redrive's re-drive is the system
+    # poking a session that already went idle; every other caller of this
+    # action is a real inbound message from the user. The two must not have the
+    # same effect on the recycle clock — see the anchor bookkeeping below.
+    system_wake = bool(params.get("system_wake"))
 
     # Validate the gid up front (raises on a crafted value): it is the
     # per-(slug,gid) lock-file segment below, so it must be a single safe
@@ -2630,6 +2662,25 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
         # Reuse: a live attendant already holds this (slug, gid) → route to it.
         existing = _sessions.live_user_conversation_sid(cfg, slug, gid)
         if existing is not None:
+            # T-1060 — the recycle clock, decided BEFORE anything is injected.
+            #
+            # The nudge below is a real turn: the Stop hook fires and
+            # `idle_timeout._idle_age`'s primary signal resets. uc_redrive's
+            # steady cadence (1800s) is shorter than the recycle window
+            # (3300s), so an attendant under an open re-drive campaign was
+            # pinned permanently below its deadline and could never take a
+            # DELIBERATE suspend — measured live, all six SessionMds ever
+            # written for the stakeholder's gid carry `suspend_source:
+            # gc_sessions`. A system wake therefore PRESERVES the idle moment
+            # it is about to overwrite; a human's message CLEARS that anchor,
+            # because his turn is the one the clock is supposed to follow.
+            # Stamped here rather than after the injection: the Stop hook that
+            # resets the clock lands seconds later.
+            from bot_squad_worker import idle_timeout as _idle
+            if system_wake:
+                _idle.mark_system_wake(cfg, slug, existing)
+            else:
+                _clear_system_wake_anchor(cfg, slug, existing)
             if message_ref and str(message_ref).strip():
                 # Best-effort wake — the attendant re-reads its thread for the
                 # new message. A pane-timing hiccup must never fail the ensure

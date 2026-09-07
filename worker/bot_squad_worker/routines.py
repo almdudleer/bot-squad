@@ -1478,6 +1478,31 @@ def _live_routine_handler(cfg: Any, slug: str) -> Optional[str]:
     return _live_session_with_owner(cfg, slug, ROUTINE_HANDLER_OWNER)
 
 
+def handler_needed(cfg: Any, slug: str) -> bool:
+    """True while this project has at least one ACTIVE monitor routine whose
+    breach routes to the shared handler (``on_breach`` anything but
+    ``notify`` — the same dispatch :func:`monitor_sweep` makes between
+    :func:`_notify_breach` and :func:`_handle_fire`).
+
+    T-1064 (stakeholder, repeated): «если есть рутины, должен быть поднят,
+    либо подниматься срабатыванием рутины (часто сталкиваюсь с тем, что он
+    умер)». T-0952 made the handler ALWAYS exit on idle and rely solely on
+    the next breach to resurrect it — a deliberate choice at the time, but
+    for as long as this returns True that gap is not a quiet idle, it is a
+    hole in triage coverage between breaches. :func:`idle_timeout.
+    recycle_plan` reads this to keep the handler resident (nudge, never
+    handoff_exit) instead of only reacting after the fact.
+
+    Cheap: reuses :func:`_monitor_routines`'s mtime-gated cache — the same
+    read ``monitor_sweep`` already does on its own 5s tick, not a fresh
+    directory walk.
+    """
+    for r in _monitor_routines(cfg, slug):
+        if r.status == ACTIVE and (r.monitor or {}).get("on_breach") != "notify":
+            return True
+    return False
+
+
 def _live_session_with_owner(cfg: Any, slug: str, owner: str) -> Optional[str]:
     from bot_squad_worker import sessions as S
 
@@ -1592,11 +1617,17 @@ def _handler_brief(cfg: Any, slug: str, routine: Routine, event: FireEvent,
         f"and follow that routine's ## Instruction. Many routines are "
         f"deliberately born-red with a documented known-bad baseline — "
         f"escalate only NEW findings, never the baseline. Stay resident: "
-        f"when idle, you are waiting for the next breach, not done. On "
-        f"timeout/context-full you ride the SAME lifecycle as every other "
-        f"role: write your forward-state into your role artifact (`bsq "
-        f"compact-save \"<the whole doc>\"`) before you go — the next "
-        f"handler this project spawns reads it instead of starting blind.\n\n"
+        f"when idle, you are waiting for the next breach, not done. T-1064: "
+        f"as long as ANY active monitor still routes here, the system keeps "
+        f"you alive on your own cadence (a keep-alive nudge, or a "
+        f"compact-in-place at your context ceiling) instead of letting you "
+        f"exit and wait for the next breach to resurrect you — a dead "
+        f"handler between breaches used to be the stakeholder's repeated "
+        f"complaint. You only actually exit once no active monitor routes "
+        f"here any more; at that point (or at context-full regardless) write "
+        f"your forward-state into your role artifact (`bsq compact-save "
+        f"\"<the whole doc>\"`) before you go — the next handler this project "
+        f"spawns reads it instead of starting blind.\n\n"
         f"The breach that attached you:\n\n"
     )
     return (_handler_continuity_prompt(cfg, slug) + head

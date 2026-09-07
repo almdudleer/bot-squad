@@ -702,6 +702,55 @@ def test_walking_skeleton_file_metric_crossing_threshold_spawns_with_event(
     assert st["last_fired_at"] == R._iso(T0 + timedelta(seconds=40))
 
 
+# --- T-1064: handler_needed — idle_timeout's read of "is a holder owed" ----
+
+def test_handler_needed_false_with_no_routines_declared(mcfg):
+    cfg, slug, _ = mcfg
+    assert R.handler_needed(cfg, slug) is False
+
+
+def test_handler_needed_true_for_an_active_default_on_breach_monitor(mcfg, tmp_path):
+    """The default (``on_breach`` absent) routes to the shared handler on
+    breach — same predicate ``monitor_sweep`` uses to choose
+    ``_handle_fire`` over ``_notify_breach``."""
+    cfg, slug, _ = mcfg
+    metric = tmp_path / "metric.txt"
+    metric.write_text("1")
+    _declare_file_monitor(cfg, slug, metric)
+    assert R.handler_needed(cfg, slug) is True
+
+
+def test_handler_needed_false_when_on_breach_is_notify_only(mcfg, tmp_path):
+    """``on_breach: notify`` never attaches AI (:func:`R._notify_breach`) —
+    a project whose only monitors are notify-only owes the handler nothing."""
+    cfg, slug, _ = mcfg
+    metric = tmp_path / "metric.txt"
+    metric.write_text("1")
+    R.declare(cfg, slug, instruction="investigate",
+             trigger="monitor", monitor=_spec(on_breach="notify"),
+             provenance="T-1064", now=T0)
+    assert R.handler_needed(cfg, slug) is False
+
+
+def test_handler_needed_false_for_a_paused_monitor(mcfg, tmp_path):
+    cfg, slug, _ = mcfg
+    metric = tmp_path / "metric.txt"
+    metric.write_text("1")
+    rid = _declare_file_monitor(cfg, slug, metric)
+    R._set_status(cfg, slug, rid, R.PAUSED)
+    assert R.handler_needed(cfg, slug) is False
+
+
+def test_handler_needed_ignores_a_schedule_routine(mcfg, tmp_path):
+    """Schedule-triggered routines spawn their own one-shot session
+    (``_spawn_for_routine``, out of scope since T-0933) — they never route
+    to the shared handler, so they must never make it look owed."""
+    cfg, slug, _ = mcfg
+    R.declare(cfg, slug, instruction="run the thing", trigger="schedule",
+             schedule="0 * * * *", provenance="T-1064", now=T0)
+    assert R.handler_needed(cfg, slug) is False
+
+
 def test_sweep_respects_probe_interval(mcfg, tmp_path):
     cfg, slug, _ = mcfg
     metric = tmp_path / "metric.txt"

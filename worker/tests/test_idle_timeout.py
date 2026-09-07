@@ -1434,6 +1434,111 @@ def test_keepalive_nudge_text_with_target_steers_to_maintenance(monkeypatch):
     assert "NOT" in text  # "NOT by itself a reason to set drive=off"
 
 
+# --- T-1064: routine-handler keep-alive while a monitor still routes to it -
+
+def _routine_handler_row(sid: str, *, cwd_repo: Path, status="active"):
+    return {"sid": sid, "status": status, "window": "routine-handler",
+            "task_id": None, "role": "routine-handler", "cwd": str(cwd_repo),
+            "claude_uuid": "uuid-" + sid, "linux_user": ""}
+
+
+def _make_handler_cfg(tmp_path, *, sid, extra_md=None):
+    md = {"owner": "routine-handler"}
+    if extra_md:
+        md.update(extra_md)
+    return _make_cfg(tmp_path, sid=sid, window="routine-handler", task_id=None,
+                     extra_md=md)
+
+
+def test_routine_handler_nudge_default_and_override(monkeypatch):
+    monkeypatch.delenv("BOT_SQUAD_ROUTINE_HANDLER_NUDGE_SEC", raising=False)
+    assert (IT.routine_handler_nudge_sec()
+            == IT.DEFAULT_ROUTINE_HANDLER_NUDGE_SEC == 1800)
+    monkeypatch.setenv("BOT_SQUAD_ROUTINE_HANDLER_NUDGE_SEC", "60")
+    assert IT.routine_handler_nudge_sec() == 60
+    # garbage / non-positive falls back to the default (never collapse to 0)
+    monkeypatch.setenv("BOT_SQUAD_ROUTINE_HANDLER_NUDGE_SEC", "-5")
+    assert IT.routine_handler_nudge_sec() == 1800
+    monkeypatch.setenv("BOT_SQUAD_ROUTINE_HANDLER_NUDGE_SEC", "nope")
+    assert IT.routine_handler_nudge_sec() == 1800
+
+
+def test_routine_handler_nudge_text_names_the_reason_and_says_stay():
+    text = IT._routine_handler_nudge_text()
+    assert "routine-handler" in text
+    assert "ROUTINE BREACH" in text
+    assert "do not exit" in text.lower()
+
+
+def test_routine_handler_nudged_while_a_monitor_still_routes_to_it(
+        tmp_path, keepalive_seams, monkeypatch):
+    """T-1064 core fix: an idle routine-handler with an ACTIVE monitor still
+    routing its breach to it is nudged, never recycled — the direct answer
+    to the stakeholder's repeated «часто сталкиваюсь с тем, что он умер»."""
+    from bot_squad_worker import routines
+    monkeypatch.setattr(routines, "handler_needed", lambda cfg, slug: True)
+    sid = "S-almdudleer-bot-squad-routine-handler-p1"
+    cfg, data = _make_handler_cfg(tmp_path, sid=sid)
+    row = _routine_handler_row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert len(keepalive_seams["calls"]["keepalive"]) == 1
+    assert keepalive_seams["calls"]["keepalive"][0][0] == sid
+    assert keepalive_seams["calls"]["terminate"] == []
+    meta = S._read_session_metadata(data / "bot-squad" / "sessions" / f"{sid}.md")
+    assert "routine_handler_keepalive_last_at" in meta
+    assert meta["status"] == "active"  # never suspended
+
+
+def test_routine_handler_recycles_when_nothing_routes_to_it(
+        tmp_path, keepalive_seams, monkeypatch):
+    """Control: T-0952's original handoff_exit still applies once
+    :func:`routines.handler_needed` reads False — this is a conditional
+    keep-alive, not a blanket 'the handler never recycles' regression."""
+    from bot_squad_worker import routines
+    monkeypatch.setattr(routines, "handler_needed", lambda cfg, slug: False)
+    sid = "S-almdudleer-bot-squad-routine-handler-p1"
+    cfg, data = _make_handler_cfg(tmp_path, sid=sid)
+    keepalive_seams["state"]["tokens"] = 5000  # below threshold: terminate now
+    row = _routine_handler_row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert keepalive_seams["calls"]["keepalive"] == []
+    assert keepalive_seams["calls"]["terminate"] == [sid]
+
+
+def test_routine_handler_nudge_anti_loop_blocks_within_same_window(
+        tmp_path, keepalive_seams, monkeypatch):
+    from bot_squad_worker import routines
+    monkeypatch.setattr(routines, "handler_needed", lambda cfg, slug: True)
+    sid = "S-almdudleer-bot-squad-routine-handler-p1"
+    just_sent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    cfg, data = _make_handler_cfg(
+        tmp_path, sid=sid,
+        extra_md={"routine_handler_keepalive_last_at": just_sent})
+    row = _routine_handler_row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is False
+    assert keepalive_seams["calls"]["keepalive"] == []
+
+
+def test_routine_handler_nudge_never_shares_the_operators_last_at_field(
+        tmp_path, keepalive_seams, monkeypatch):
+    """The two keep-alives must not read/write the same md field — a
+    routine-handler that (somehow) also carried an operator stamp must still
+    nudge on its own clock."""
+    from bot_squad_worker import routines
+    monkeypatch.setattr(routines, "handler_needed", lambda cfg, slug: True)
+    sid = "S-almdudleer-bot-squad-routine-handler-p1"
+    just_sent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    cfg, data = _make_handler_cfg(
+        tmp_path, sid=sid, extra_md={"operator_keepalive_last_at": just_sent})
+    row = _routine_handler_row(sid, cwd_repo=data.parent / "repo")
+    assert IT.maybe_recycle(cfg, "bot-squad", row, now=time.time(),
+                            user_home="/home/x") is True
+    assert len(keepalive_seams["calls"]["keepalive"]) == 1
+
+
 # --- T-0930: dev drive-unmet nudge (5min, independent of the operator's) ---
 
 @pytest.fixture
@@ -1900,9 +2005,11 @@ def test_uc_exit_scoped_to_the_role_not_all_exempt_sessions(tmp_path, seams):
 # prove each plan is actually what runs.
 # ============================================================================
 
-def _plan(role, *, window="demo", meta=None, attached=False, tasks_alive=False):
+def _plan(role, *, window="demo", meta=None, attached=False, tasks_alive=False,
+          routines_pending=False):
     return IT.recycle_plan(role=role, window=window, meta=meta or {},
-                           attached=attached, tasks_alive=tasks_alive)
+                           attached=attached, tasks_alive=tasks_alive,
+                           routines_pending=routines_pending)
 
 
 def test_recycle_plan_table():
@@ -1931,12 +2038,16 @@ def test_recycle_plan_table():
     # ...and the cap never overrides the human's own pane.
     assert IT.recycle_plan(role="dev", window="demo", meta={}, attached=True,
                            tasks_alive=True, nudge_capped=True) == IT.PLAN_STAY
-    # T-0952: the single shared routine-handler always exits — it is never
-    # task-bound (the routine it is mid-triage on is not a ticket it owns),
-    # so it is NOT in WORKER_ROLES and `tasks_alive=True` here is a control
-    # proving that, not an expectation it changes anything.
+    # T-1064: the single shared routine-handler exits ONLY while nothing
+    # routes to it (`routines_pending=False`, the default T-0952 shipped —
+    # `tasks_alive=True` here is a control proving it is NOT in WORKER_ROLES,
+    # not an expectation it changes anything). While a monitor still routes
+    # its breach to the handler it is kept resident instead.
     assert _plan("routine-handler") == IT.PLAN_HANDOFF_EXIT
     assert _plan("routine-handler", tasks_alive=True) == IT.PLAN_HANDOFF_EXIT
+    assert _plan("routine-handler", routines_pending=True) == IT.PLAN_NUDGE
+    assert (_plan("routine-handler", routines_pending=True, tasks_alive=False)
+            == IT.PLAN_NUDGE)
     # anything unrecognised keeps the pre-T-0945 default
     assert _plan("", tasks_alive=True) == IT.PLAN_HANDOFF_EXIT
     assert _plan("some-future-role") == IT.PLAN_HANDOFF_EXIT

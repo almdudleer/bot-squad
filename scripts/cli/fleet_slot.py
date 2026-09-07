@@ -145,6 +145,88 @@ Design, and every clause is a measured failure from T-0968
   per run and buys nothing. ``--disk-series`` still takes one on demand, for
   whoever gathers the further evidence that would re-open the question.
 
+* **MEMORY AND THE RUN QUEUE ARE A SECOND AND THIRD QUESTION, AND D-STATE
+  ANSWERS NEITHER (T-1031).** At 2026-09-06 22:57Z the gate printed
+  ``admission PASSED — d_state=7`` on a box at load1 77.73 with SwapFree at
+  0.7% of 8.00 GB and Committed_AS 38.29 GB against a CommitLimit of 23.67. It
+  would have admitted a build. **D-state was RIGHT**: that was not an IO event,
+  and the instrument answers about IO by construction. So two more readings
+  were calibrated rather than the first one being repaired — 325 samples in
+  five conditions produced on this box between 00:37Z and 01:20Z on
+  2026-09-07: a healthy/parked host; a 24-spinner CPU oversubscription; two
+  anon-reclaim cgroups; a 48 MB swap-eviction cgroup; and an IO control of six
+  streaming-read cgroups.
+
+  =====================  ===  ================  ================  ================  ================
+  condition                n  r_state min/med/max  d_state min/med/max  psi_mem_full min/med/max  so pages/s min/med/max
+  =====================  ===  ================  ================  ================  ================
+  healthy / parked        90     1 /  2 /  6       0 /  4 / 16      0.00/0.05/0.39      0 /  0 /   2
+  anon reclaim (weak)     50     1 /  2 /  5       1 /  5 / 10      0.15/1.58/5.22      0 /  0 /   0
+  CPU oversubscription    50    25 / 26 / 31       1 /  5 / 11      0.00/0.00/0.00      0 /  0 /   6
+  anon reclaim            45     1 /  1 /  5       1 /  3 /  7      0.18/0.73/5.46      0 /  0 /   0
+  IO (streaming reads)    50     1 /  1 /  6       1 / 9.5/ 28      0.00/0.01/0.18      0 /  0 /   0
+  swap eviction           40     1 /  2 /  3       0 /  3 / 26      0.00/9.10/16.81     0 / 46 / 143
+  =====================  ===  ================  ================  ================  ================
+
+  **REJECTED, each with the number that rejected it.** Every one of these was
+  proposed as the memory gate, and every one of them refuses a HEALTHY host:
+
+  * ``SwapFree`` — a 5% floor refuses **100% of samples in every condition,
+    including all 90 healthy ones.** This box has sat at 1.2-1.7% swap free,
+    STATIC, all night while healthy. Swap FULL and swap THRASHING are
+    different states and only the second is a reason to stop; a SwapFree gate
+    would have stopped the fleet all night for nothing.
+  * ``Committed_AS/CommitLimit`` — p651's candidate, and p651 argued against
+    banking it on one event. A 1.5 ceiling refuses **100% of samples in every
+    condition**, and the ratio AT THE EVENT (1.617) is BELOW the healthy
+    median measured two hours later (1.63): the reading moved the wrong way.
+    An overcommit ratio above 1.0 is ordinary Linux.
+  * ``MemAvailable`` — 16.5-17.4 GB in every condition, including during real
+    memory pressure. A 4 GB floor refuses **0% of samples anywhere.** Blind.
+  * ``loadavg1`` — describes, never decides, and the CPU control shows why
+    in-condition: with 24 spinners already running, load1 read **12.39 while
+    r_state already read 28.** Load needs a minute to say what the run queue
+    says now, which is the T-0994 objection restated for this resource.
+  * ``wa`` (iowait share of CPU time) and ``/proc/pressure/io`` — proposed for
+    BUILD admission specifically, on the sound reasoning that a build is
+    IO-bound. Measured, neither can bind anything **on this box**: healthy wa
+    ran a median of 47.2% and a max of 75.9% over 90 samples, and psi_io_full
+    a median of 55.1 — while the deliberate IO control ran 55.9 / 84.1 and
+    57.9. The healthy and the loaded distributions overlap almost completely,
+    because this host is IO-bound at rest. Any ceiling low enough to catch the
+    IO control refuses a healthy host outright. D-state, which separated 0%
+    healthy from 8% of the IO control's samples at its ceiling of 20, remains
+    the IO gate and is why it was chosen over exactly this class of reading in
+    T-0994.
+  * ``si``/``so`` — **RECORDED, never gated.** ``so`` alone sustained with
+    ``si`` near zero is the kernel evicting cold pages (DESCRIPTIVE, not a
+    stop); ``si`` AND ``so`` both sustained is thrashing (a stop). The
+    swap-eviction control produced exactly the first shape — so 46-143
+    pages/s, si 0 — and it is not a reason to refuse anybody. The thrashing
+    arm could NOT be produced on this host: at ~1.2% swap free there is no
+    room left to sustain ``so``, so a si+so ceiling would ship unexercised.
+    ``status --swap-rates`` takes the two-point sample on demand.
+
+  **ENFORCED — two more ceilings, each proven to fire AND to pass:**
+
+  * ``r_state_max`` (default 24) — the RUN QUEUE, counted in the same walk of
+    ``/proc/<pid>/stat`` that already produces d_state, so it costs nothing.
+    **0 of 275 samples** over it across every non-CPU condition; **100% of the
+    CPU control's** over it. At 22:57Z load1 was 77.73 with d_state 7, so
+    ~70 of that load was RUNNABLE — an inference from the two recorded values
+    (load counts R+D), not a measurement of r_state, which nobody took.
+  * ``psi_mem_full_max`` (default 10.0) — ``/proc/pressure/memory`` full
+    avg10, the share of the last ten seconds in which EVERY non-idle task was
+    stalled on memory. Healthy max 0.39 over 90 samples (25x of margin); the
+    swap-eviction control ran a 9.10 median and a 16.81 peak, so 40% of its
+    samples refuse. It is memory-SPECIFIC: the IO control that drove d_state
+    to 28 left it at 0.18 and the CPU control left it at 0.00, so the three
+    gates do not double-count one event. On a kernel without PSI the file is
+    absent and this gate reports itself INACTIVE rather than refusing — an
+    optional instrument that is missing must not make the gate unsatisfiable,
+    which is the failure the D-state blind-gate rule is deliberately NOT
+    generalised into.
+
 Usage::
 
     fleet_slot.py run --kind container --note "T-0994 api suite" -- docker run ...
@@ -536,19 +618,29 @@ def slots(sd: Path) -> int:
 # Admission readings — files only, so they survive the collapse they describe
 # --------------------------------------------------------------------------
 
-def d_state_count() -> int | None:
-    """Processes in uninterruptible sleep, from ``/proc/<pid>/stat``.
+def proc_state_counts() -> tuple[int | None, int | None]:
+    """``(D, R)`` — uninterruptible and RUNNABLE — from ONE walk of ``/proc``.
 
-    D-state is the honest saturation gauge: load average LAGS BY CONSTRUCTION
-    and inverted the attribution mid-incident on 2026-09-06 — at 14:37:39Z our
+    Both counts come out of the same read of ``/proc/<pid>/stat``, so counting
+    the run queue while already counting D-state costs nothing: no extra walk,
+    no extra syscall class, no second instrument to keep in step.
+
+    D-state is the honest IO gauge: load average LAGS BY CONSTRUCTION and
+    inverted the attribution mid-incident on 2026-09-06 — at 14:37:39Z our
     load was ~0 while D-state was 602, which read as "not us"; one sample later
     D-state was 66, because the 602 was the BACKLOG DRAINING.
+
+    R is the same objection answered for the other resource. ``loadavg`` counts
+    R+D over a decaying minute; this counts R **now**. Measured in-condition
+    (T-1031): with 24 spinners already running, ``loadavg1`` read 12.39 while
+    this function read 28. Adding load1 to the gate would have gated on a
+    number that had not arrived yet.
     """
     try:
         entries = os.listdir("/proc")
     except OSError:
-        return None
-    n = 0
+        return None, None
+    d = r = 0
     for name in entries:
         if not name.isdigit():
             continue
@@ -561,9 +653,152 @@ def d_state_count() -> int | None:
         if close < 0:
             continue
         fields = raw[close + 2:].split()
-        if fields and fields[0] == "D":
-            n += 1
-    return n
+        if not fields:
+            continue
+        if fields[0] == "D":
+            d += 1
+        elif fields[0] == "R":
+            r += 1
+    return d, r
+
+
+def d_state_count() -> int | None:
+    """Processes in uninterruptible sleep. See :func:`proc_state_counts`."""
+    return proc_state_counts()[0]
+
+
+#: PSI fields sampled on every admission. ``avg10`` and not ``avg60``: the
+#: gate decides about the next ten minutes of work from the last ten seconds
+#: of the host, and a minute-scale average reintroduces exactly the lag that
+#: disqualified ``loadavg`` (T-0994).
+_PSI_FIELDS = (
+    ("memory", "some"), ("memory", "full"), ("cpu", "some"), ("io", "full"),
+)
+
+
+def psi_readings() -> dict:
+    """``avg10`` pressure-stall values, or ``None`` on a kernel without PSI.
+
+    A FILE, like every other instrument in this module: ``/proc/pressure/*``
+    has no daemon behind it and cannot time out.
+
+    ``memory full avg10`` is the share of the last ten seconds in which EVERY
+    non-idle task was stalled on memory. It is the reading that separates the
+    two states the fleet keeps confusing (T-1031): swap FULL is a static
+    property of this host and is not a reason to stop; memory STALLING is.
+    """
+    out: dict[str, float | None] = {}
+    for res, kind in _PSI_FIELDS:
+        out[f"psi_{res}_{kind}_avg10"] = None
+    for res, _ in _PSI_FIELDS:
+        try:
+            with open(f"/proc/pressure/{res}", "rb") as fh:
+                text = fh.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            kind = parts[0]
+            key = f"psi_{res}_{kind}_avg10"
+            if key not in out:
+                continue
+            for tok in parts[1:]:
+                k, _, v = tok.partition("=")
+                if k == "avg10":
+                    try:
+                        out[key] = float(v)
+                    except ValueError:
+                        pass
+    return out
+
+
+def memory_readings() -> dict:
+    """Swap, commit, availability and the cumulative paging counters.
+
+    **Every reading here is RECORDED AND NOT GATED, and each one was measured
+    against a ceiling before it was demoted** — the numbers are in the module
+    docstring. They are kept because the next reader deserves the values that
+    refused the candidates, not a sentence saying they were refused.
+
+    ``pswpin``/``pswpout`` are CUMULATIVE. si/so are RATES, and a rate needs
+    two points: :func:`swap_rate_sample` takes them on demand, and the
+    ``admissions.ndjson`` series lets anyone derive the rate between any two
+    tickets after the fact without having paid for a sleep on the run path.
+    """
+    rec: dict[str, float | int | None] = {
+        "swap_free_pct": None, "swap_total_gb": None, "committed_ratio": None,
+        "mem_available_gb": None, "pswpin": None, "pswpout": None,
+    }
+    mem: dict[str, int] = {}
+    try:
+        with open("/proc/meminfo", "rb") as fh:
+            for line in fh.read().decode("utf-8", "replace").splitlines():
+                k, _, v = line.partition(":")
+                parts = v.split()
+                if parts:
+                    try:
+                        mem[k] = int(parts[0])
+                    except ValueError:
+                        pass
+    except OSError:
+        mem = {}
+    if mem.get("SwapTotal"):
+        rec["swap_free_pct"] = round(
+            100.0 * mem.get("SwapFree", 0) / mem["SwapTotal"], 2)
+        rec["swap_total_gb"] = round(mem["SwapTotal"] / 1048576.0, 2)
+    if mem.get("CommitLimit"):
+        rec["committed_ratio"] = round(
+            mem.get("Committed_AS", 0) / mem["CommitLimit"], 3)
+    if "MemAvailable" in mem:
+        rec["mem_available_gb"] = round(mem["MemAvailable"] / 1048576.0, 2)
+    try:
+        with open("/proc/vmstat", "rb") as fh:
+            for line in fh.read().decode("utf-8", "replace").splitlines():
+                k, _, v = line.partition(" ")
+                if k in ("pswpin", "pswpout"):
+                    try:
+                        rec[k] = int(v)
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return rec
+
+
+def swap_rate_sample(span: float = 1.0) -> dict:
+    """si/so in PAGES PER SECOND, from two reads of ``/proc/vmstat``.
+
+    Off the run path — it costs ``span`` seconds — and reported by ``status``,
+    which is where a human looks when they are deciding what a swap number
+    means. **It gates nothing**, and the rule for reading it is p686's:
+
+    * ``so`` alone, sustained, ``si`` near zero — the kernel is evicting cold
+      pages. DESCRIPTIVE. Not a stop. The T-1031 control produced exactly this
+      shape: so 46-143 pages/s with si at 0.
+    * ``si`` AND ``so`` both sustained — THRASHING. That is a stop.
+    * ``swpd`` creeping with ``si`` near zero — eviction winning; still not
+      thrashing.
+
+    No ceiling ships for it: this host sits at ~1.2% swap free, so there is no
+    room left to sustain ``so``, the thrashing arm could not be produced here,
+    and this module does not ship a threshold it could not fire.
+    """
+    first = memory_readings()
+    t0 = time.time()
+    time.sleep(max(0.0, span))
+    second = memory_readings()
+    dt = time.time() - t0
+    out = {"si_pages_s": None, "so_pages_s": None,
+           "swap_rate_span_s": round(dt, 3)}
+    if dt <= 0:
+        return out
+    for key, name in (("pswpin", "si_pages_s"), ("pswpout", "so_pages_s")):
+        a, b = first.get(key), second.get(key)
+        if a is not None and b is not None:
+            out[name] = round((b - a) / dt, 2)
+    return out
 
 
 def _disk_queue_point(device: str) -> int | None:
@@ -633,13 +868,26 @@ def loadavg() -> float | None:
 def admission_readings(sd: Path | None = None, *, disk_series: bool = False) -> dict:
     """The gate readings, sampled now. Recorded WITH the run, not remembered.
 
-    Only two readings are taken by default, and the asymmetry between them is
-    the whole finding of this ticket's calibration work:
+    Three readings DECIDE and the rest DESCRIBE, and the asymmetry between
+    them is the whole finding of two rounds of calibration work:
 
-    * ``d_state`` — **the gate.** It discriminated 3 quiet / 10-13 working /
-      76-82 during a known heavy build.
-    * ``loadavg1`` — **describes, never decides.** It lags by construction and
-      inverted the attribution mid-incident on 2026-09-06.
+    * ``d_state`` — **the IO gate** (T-0994). It discriminated 3 quiet /
+      10-13 working / 76-82 during a known heavy build.
+    * ``r_state`` — **the run-queue gate** (T-1031), free from the same walk.
+      1-6 across 275 samples of five conditions; 25-31 under a deliberate 3x
+      CPU oversubscription.
+    * ``psi_memory_full_avg10`` — **the memory gate** (T-1031). 0.00-0.39
+      healthy; 9.10 median under a swap-eviction control; 0.18 during an IO
+      event that drove d_state to 28, so it does not double-count IO.
+    * ``loadavg1`` — **describes, never decides.** It lags by construction, it
+      inverted the attribution mid-incident on 2026-09-06, and it was still
+      reading 12.39 while ``r_state`` already read 28.
+    * ``swap_free_pct``, ``committed_ratio``, ``mem_available_gb`` —
+      **RECORDED, TESTED, AND REJECTED as gates.** A SwapFree floor at 5% and
+      a commit ceiling at 1.5 each refuse 100% of samples in every condition
+      measured, including 90 healthy ones; a 4 GB MemAvailable floor refuses
+      0% even during real memory pressure. The values stay because the next
+      calibration needs them; nothing reads them as a threshold.
 
     ``docker ps`` latency is deliberately NOT sampled: it is a daemon-health
     metric, this function is called for containerless work too, and it was
@@ -652,11 +900,15 @@ def admission_readings(sd: Path | None = None, *, disk_series: bool = False) -> 
     """
     sd = sd or state_dir()
     cfg = _config(sd)
+    d, r = proc_state_counts()
     rec = {
         "at": time.time(),
-        "d_state": d_state_count(),
+        "d_state": d,
+        "r_state": r,
         "loadavg1": loadavg(),
     }
+    rec.update(psi_readings())
+    rec.update(memory_readings())
     if disk_series:
         disk = disk_queue_series(cfg.get("disk_device"),
                                  samples=int(cfg.get("disk_samples", 10)),
@@ -685,6 +937,44 @@ def d_state_max(sd: Path) -> int | None:
         return 20
 
 
+def r_state_max(sd: Path) -> int | None:
+    """The enforced RUN-QUEUE ceiling, or None when disarmed.
+
+    Default 24 = 3x this box's 8 cores, and the number is what the calibration
+    supports rather than what the arithmetic suggests: **0 of 275 samples**
+    across a healthy/parked host, two anon-reclaim controls and an IO control
+    were over it, while **100% of the CPU control's** samples (24 spinners)
+    were. The state this ticket was filed for read load1 77.73 with d_state 7,
+    so roughly 70 of that load was runnable — load counts R+D.
+    """
+    env = os.environ.get("BOT_SQUAD_FLEET_RSTATE_MAX")
+    raw = env if env is not None else _config(sd).get("r_state_max", 24)
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 24
+
+
+def psi_mem_full_max(sd: Path) -> float | None:
+    """The enforced MEMORY-STALL ceiling, or None when disarmed.
+
+    Default 10.0% of ``/proc/pressure/memory`` ``full avg10``. Healthy maximum
+    measured 0.39 over 90 samples (25x of margin); the swap-eviction control
+    ran a 9.10 median and a 16.81 peak, so **the guard is one a real event on
+    this host actually fires**, not a number taken from a blog post.
+    """
+    env = os.environ.get("BOT_SQUAD_FLEET_PSI_MEM_MAX")
+    raw = env if env is not None else _config(sd).get("psi_mem_full_max", 10.0)
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 10.0
+
+
 def admission_check(sd: Path | None = None, *, disk_series: bool = False
                     ) -> tuple[bool, str, dict]:
     """Sample the readings and decide admission on the ONE that discriminates.
@@ -697,18 +987,58 @@ def admission_check(sd: Path | None = None, *, disk_series: bool = False
     """
     sd = sd or state_dir()
     rec = admission_readings(sd, disk_series=disk_series)
+    refusals: list[str] = []
+    passes: list[str] = []
+
+    # --- IO (T-0994). Untouched: the instrument is sound and it answers about
+    # --- IO by construction. What T-1031 added is a SECOND question, not a
+    # --- repair of this one.
     ceiling = d_state_max(sd)
     d = rec.get("d_state")
     if ceiling is None:
-        return True, f"d_state={d} (ceiling disarmed)", rec
-    if d is None:
+        passes.append(f"d_state={d} (ceiling disarmed)")
+    elif d is None:
         # Refuse to conclude from an instrument that did not report. A gate
         # that admits on a missing reading is a gate that is absent exactly
         # when /proc is unreadable.
-        return False, "d_state NOT MEASURED — refusing to admit on a blind gate", rec
-    if d > ceiling:
-        return False, f"d_state={d} over the ceiling of {ceiling}", rec
-    return True, f"d_state={d} within the ceiling of {ceiling}", rec
+        refusals.append("d_state NOT MEASURED — refusing to admit on a blind gate")
+    elif d > ceiling:
+        refusals.append(f"d_state={d} over the ceiling of {ceiling}")
+    else:
+        passes.append(f"d_state={d} within the ceiling of {ceiling}")
+
+    # --- The run queue (T-1031). Same instrument, same walk, other column.
+    r_ceiling = r_state_max(sd)
+    r = rec.get("r_state")
+    if r_ceiling is None:
+        passes.append(f"r_state={r} (ceiling disarmed)")
+    elif r is None:
+        refusals.append("r_state NOT MEASURED — refusing to admit on a blind gate")
+    elif r > r_ceiling:
+        refusals.append(f"r_state={r} over the ceiling of {r_ceiling}")
+    else:
+        passes.append(f"r_state={r} within the ceiling of {r_ceiling}")
+
+    # --- Memory STALL, not memory FULLNESS (T-1031).
+    m_ceiling = psi_mem_full_max(sd)
+    m = rec.get("psi_memory_full_avg10")
+    if m_ceiling is None:
+        passes.append(f"psi_memory_full_avg10={m} (ceiling disarmed)")
+    elif m is None:
+        # An OPTIONAL instrument that a kernel may legitimately not have. The
+        # blind-gate rule above is for /proc itself being unreadable, which is
+        # a broken host; CONFIG_PSI=n is a normal one, and refusing every run
+        # on it would be a gate that can never pass.
+        passes.append("psi_memory_full_avg10 NOT AVAILABLE (kernel without PSI) "
+                      "— memory gate INACTIVE")
+    elif m > m_ceiling:
+        refusals.append(f"psi_memory_full_avg10={m} over the ceiling of {m_ceiling}")
+    else:
+        passes.append(f"psi_memory_full_avg10={m} within the ceiling of {m_ceiling}")
+
+    if refusals:
+        return False, "; ".join(refusals), rec
+    return True, "; ".join(passes), rec
 
 
 def _record_admission(sd: Path, rec: dict) -> None:
@@ -730,7 +1060,17 @@ def _admission_line(rec: dict) -> str:
     def _v(k):
         v = rec.get(k)
         return "NOT MEASURED" if v is None else v
-    line = f"admission: d_state={_v('d_state')} load1={_v('loadavg1')} (load DESCRIBES, never decides)"
+    line = (f"admission: d_state={_v('d_state')} r_state={_v('r_state')} "
+            f"psi_mem_full={_v('psi_memory_full_avg10')} [these three GATE] "
+            f"swap_free={_v('swap_free_pct')}% "
+            f"commit={_v('committed_ratio')} "
+            f"mem_avail={_v('mem_available_gb')}GB load1={_v('loadavg1')} "
+            f"(load DESCRIBES, never decides — and so do swap_free, commit and "
+            f"mem_avail: each was measured against a ceiling and each refused a "
+            f"HEALTHY host)")
+    if rec.get("si_pages_s") is not None or rec.get("so_pages_s") is not None:
+        line += (f" si={_v('si_pages_s')}/s so={_v('so_pages_s')}/s "
+                 f"over {_v('swap_rate_span_s')}s [RECORDED, NOT GATED]")
     if rec.get("disk_queue_series"):
         line += (f" disk_queue_median={_v('disk_queue_median')} "
                  f"series={rec['disk_queue_series']} [RECORDED, NOT GATED]")
@@ -1366,11 +1706,15 @@ def snapshot(sd: Path | None = None) -> dict:
             "process group, because the interval it exists to cover — the gap "
             "between an owner's commands — is exactly the interval with no "
             "process to point at; a lapsed lease is reclaimed on the record. "
-            "The only ENFORCED health reading is "
-            "D-state — /proc/diskstats field 12 and docker-ps latency were both "
+            "THREE ENFORCED health readings, one per resource: D-state (IO), "
+            "r_state (the run queue) and /proc/pressure/memory full avg10 "
+            "(memory stall). /proc/diskstats field 12 and docker-ps latency were "
             "tested and rejected for admission control (field 12 stayed 18-39 while "
-            "D-state went 3->89; docker ps answered in 204ms at load 80). Reservations "
-            "bound, health readings describe."),
+            "D-state went 3->89; docker ps answered in 204ms at load 80), and so "
+            "were SwapFree, Committed_AS/CommitLimit and MemAvailable: a 5% swap "
+            "floor and a 1.5 commit ceiling each refuse 100% of samples on a "
+            "HEALTHY host, and MemAvailable refuses 0% during real memory "
+            "pressure. Reservations bound, health readings describe."),
     }
 
 
@@ -1529,6 +1873,8 @@ def _cmd_admit(args) -> int:
 
 def _cmd_status(args) -> int:
     snap = snapshot()
+    if getattr(args, "swap_rates", False):
+        snap["readings"].update(swap_rate_sample())
     if args.json:
         print(json.dumps(snap, indent=2))
         return 0
@@ -1674,6 +2020,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("status", help="who holds what, who is queued, and what was checked")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--swap-rates", action="store_true",
+                   help="also take a two-point si/so sample (costs ~1s; "
+                        "RECORDED, NOT GATED — so alone is eviction, si AND so "
+                        "together is thrashing)")
     s.set_defaults(fn=_cmd_status)
 
     a = sub.add_parser("acquire", help="take a slot and print its token")

@@ -57,6 +57,12 @@ def _env(state: Path, slots: int | None = None, dstate_max: str | None = "") -> 
     for every test that is not about the ceiling: this suite runs on a shared,
     frequently-saturated box, and a test whose verdict depends on the host's
     D-state at that second measures the host, not the gate.
+
+    The run-queue and memory-stall ceilings added by T-1031 are disarmed here
+    for exactly the same reason and always: a peer's build or a co-tenant's
+    memory event would otherwise decide these tests. The suite that exercises
+    THOSE gates is test_t1031_memory_admission.py, which injects readings
+    rather than hoping for a condition.
     """
     env = dict(os.environ)
     env["BOT_SQUAD_FLEET_SLOTS_DIR"] = str(state)
@@ -71,6 +77,8 @@ def _env(state: Path, slots: int | None = None, dstate_max: str | None = "") -> 
         env.pop("BOT_SQUAD_FLEET_DSTATE_MAX", None)
     else:
         env["BOT_SQUAD_FLEET_DSTATE_MAX"] = dstate_max
+    env["BOT_SQUAD_FLEET_RSTATE_MAX"] = ""
+    env["BOT_SQUAD_FLEET_PSI_MEM_MAX"] = ""
     return env
 
 
@@ -495,7 +503,8 @@ def test_disk_series_is_available_on_demand_and_never_gates(tmp_path):
     assert "NOT GATED" in rec["disk_note"]
 
     # A huge disk reading cannot refuse anything, because nothing reads it as a
-    # threshold: the only enforced ceiling is D-state.
+    # threshold. Three readings are enforced — D-state, r_state and PSI memory
+    # (T-1031) — and this is not one of them.
     (state / "config.json").write_text(json.dumps({"disk_queue_max": 0, "slots": 1}))
     ran = _run(state, "run", "--note", "still runs", "--disk-series",
                "--", sys.executable, "-c", "print('RAN')")

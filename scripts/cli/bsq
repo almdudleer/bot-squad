@@ -8246,6 +8246,26 @@ def _stamp_filed_by(text: str, value: str) -> str:
     return head + "\n".join(fm_lines) + close + rest
 
 
+_UNEXPECTED_PARAMS_RE = re.compile(r"unexpected params:\s*\[([^\]]*)\]")
+
+
+def _unexpected_params(msg: str) -> set[str]:
+    """The param names the WORKER ITSELF listed as unexpected.
+
+    The worker refuses an unknown param with ``<action> got unexpected params:
+    ['filed_by']`` — ``sorted(extra)`` of a set difference, so the names are
+    always right there in the message. Reading them is what lets a deploy-skew
+    retry drop EXACTLY the unknown param instead of guessing at some leaner
+    param shape (see the T-0972 note in ``cmd_task_new`` for what guessing
+    cost). Returns an empty set when the message is not that shape — the caller
+    must then refuse rather than retry blind.
+    """
+    m = _UNEXPECTED_PARAMS_RE.search(msg)
+    if not m:
+        return set()
+    return {tok.strip().strip("'\"") for tok in m.group(1).split(",") if tok.strip()}
+
+
 def cmd_task_new(args) -> None:
     slug = resolve_slug()
     prov = (getattr(args, "provenance", None) or "").strip()
@@ -8299,20 +8319,60 @@ def cmd_task_new(args) -> None:
     optimistic = {**params, "provenance": prov}
     if filer_sid:
         optimistic["filed_by"] = filer_sid
+    dropped: set[str] = set()
     try:
         res = post("task_new", optimistic, fatal=False)
     except WorkerError as e:
-        if "unexpected params" not in str(e):
-            die(str(e))
-        res = post("task_new", params)
+        msg = str(e)
+        if "unexpected params" not in msg:
+            die(msg)
+        # T-0972: retry by dropping ONLY the params the worker NAMED. What was
+        # here before retried with a fixed lean dict that ALSO omitted
+        # `provenance` — correct when it was written, for a pre-T-0519 worker
+        # that had no provenance gate to fail. Every worker has had that gate
+        # for months, so that path could no longer succeed at all: it could
+        # only convert "I do not know param X" into "you did not give me
+        # provenance" — a refusal naming a param the FIRST call had no problem
+        # with, and pointing whoever reads it at the wrong thing entirely.
+        #
+        # Measured 2026-09-07: T-1052 added `filed_by` to this call. bsq is
+        # instant-live by symlink and the worker rides a deploy, so the install
+        # worker rejected it, this shim swallowed that and retried bare, and
+        # `bsq task new` was dead fleet-wide for ~15 minutes behind
+        # "task_new requires provenance". Two wrong hypotheses and a worker
+        # restart were spent on the named param before anyone read the second
+        # call. A compatibility shim that outlived its incompatibility is a
+        # defect generator, so this one now degrades on EVIDENCE (the names the
+        # worker gave) instead of on a guess frozen at authoring time.
+        dropped = _unexpected_params(msg) & set(optimistic)
+        if not dropped:
+            die("task new: the worker rejected params without naming any this "
+                "call actually sent — not retrying blind.\n"
+                f"  worker said: {msg}")
+        retry = {k: v for k, v in optimistic.items() if k not in dropped}
+        print(f"note: this worker does not accept {sorted(dropped)} — retrying "
+              "without it (deploy the worker to close the skew).",
+              file=sys.stderr)
+        try:
+            res = post("task_new", retry, fatal=False)
+        except WorkerError as e2:
+            die(f"task new: dropping {sorted(dropped)} did not help.\n"
+                f"  first call: {msg}\n"
+                f"  retry:      {e2}")
+    if dropped:
+        # Only what the worker could not take is stamped post-hoc; everything
+        # it accepted was already written at the gate.
         path = Path(res["file_path"])
         try:
-            text = _stamp_provenance(path.read_text(encoding="utf-8"), prov)
-            if filer_sid:
+            text = path.read_text(encoding="utf-8")
+            if "provenance" in dropped:
+                text = _stamp_provenance(text, prov)
+            if "filed_by" in dropped and filer_sid:
                 text = _stamp_filed_by(text, filer_sid)
             _write_atomic(path, text)
         except OSError as ex:
-            die(f"task new: created {res['id']} but failed to stamp provenance/filed_by: {ex}")
+            die(f"task new: created {res['id']} but failed to stamp "
+                f"{sorted(dropped)}: {ex}")
     # Say what was STORED when it differs from what was typed — a normalisation
     # the caller cannot see is the same silence this ticket is about, pointed
     # the other way.

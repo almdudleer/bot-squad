@@ -1,4 +1,4 @@
-"""T-0121: tests for scripts/lint/backlog_frontmatter.py."""
+"""T-0121/T-0975: tests for scripts/lint/backlog_frontmatter.py."""
 from __future__ import annotations
 
 import importlib.util
@@ -55,9 +55,14 @@ def _write_task(backlog_dir: Path, task_id: str, status: str) -> Path:
 def test_lint_clean_when_all_statuses_canonical(tmp_path, lint):
     bl = tmp_path / "s" / "backlog"
     bl.mkdir(parents=True)
-    for st in ("planned", "open", "in_progress", "totest", "reopened", "closed"):
-        _write_task(bl, f"T-000{ord(st[0])%9+1}", st)
-    assert lint.lint_dir(tmp_path) == []
+    statuses = ("planned", "open", "in_progress", "totest", "reopened", "closed")
+    for i, st in enumerate(statuses, start=1):
+        _write_task(bl, f"T-{i:04d}", st)
+    result = lint.lint_dir(tmp_path)
+    assert result.ok
+    assert result.unreadable == []
+    assert result.offenders == []
+    assert result.total == 6
     assert lint.main([str(tmp_path)]) == 0
 
 
@@ -66,8 +71,9 @@ def test_lint_flags_legacy_done_status(tmp_path, lint):
     bl.mkdir(parents=True)
     _write_task(bl, "T-0001", "open")
     bad = _write_task(bl, "T-0002", "done")
-    offenders = lint.lint_dir(tmp_path)
-    assert offenders == [(bad, "done")]
+    result = lint.lint_dir(tmp_path)
+    assert result.offenders == [(bad, "done")]
+    assert not result.ok
     assert lint.main([str(tmp_path)]) == 1
 
 
@@ -76,32 +82,37 @@ def test_lint_flags_other_bad_values(tmp_path, lint):
     bl.mkdir(parents=True)
     _write_task(bl, "T-0001", "backlog")  # T-0111 real case
     _write_task(bl, "T-0002", "wontfix")
-    offenders = lint.lint_dir(tmp_path)
-    assert sorted(s for _, s in offenders) == ["backlog", "wontfix"]
+    result = lint.lint_dir(tmp_path)
+    assert sorted(s for _, s in result.offenders) == ["backlog", "wontfix"]
 
 
 def test_lint_skips_md_without_frontmatter(tmp_path, lint):
+    """A file with no `---` fence at all isn't a ticket — tolerated."""
     bl = tmp_path / "s" / "backlog"
     bl.mkdir(parents=True)
     (bl / "T-0001-x.md").write_text("just a body, no frontmatter\n")
-    assert lint.lint_dir(tmp_path) == []
+    result = lint.lint_dir(tmp_path)
+    assert result.ok
+    assert result.unreadable == []
 
 
 def test_lint_skips_md_with_no_status_line(tmp_path, lint):
     bl = tmp_path / "s" / "backlog"
     bl.mkdir(parents=True)
     (bl / "T-0001-x.md").write_text("---\nid: T-0001\ntitle: x\n---\n\nbody\n")
-    assert lint.lint_dir(tmp_path) == []
+    result = lint.lint_dir(tmp_path)
+    assert result.ok
 
 
 def test_lint_handles_quoted_status(tmp_path, lint):
-    """YAML allows 'open' or "open" — strip quotes before checking."""
+    """YAML allows 'open' or "open" — a real YAML reader unquotes it for us."""
     bl = tmp_path / "s" / "backlog"
     bl.mkdir(parents=True)
     (bl / "T-0001-x.md").write_text(
         '---\nid: T-0001\ntitle: x\nstatus: "closed"\n---\n\nbody\n'
     )
-    assert lint.lint_dir(tmp_path) == []
+    result = lint.lint_dir(tmp_path)
+    assert result.ok
 
 
 def test_lint_walks_multiple_slugs(tmp_path, lint):
@@ -110,14 +121,17 @@ def test_lint_walks_multiple_slugs(tmp_path, lint):
         bl.mkdir(parents=True)
         _write_task(bl, "T-0001", "open")
     _write_task(tmp_path / "a" / "backlog", "T-0002", "done")
-    offenders = lint.lint_dir(tmp_path)
-    assert len(offenders) == 1
-    assert offenders[0][1] == "done"
+    result = lint.lint_dir(tmp_path)
+    assert len(result.offenders) == 1
+    assert result.offenders[0][1] == "done"
+    assert result.total == 3
 
 
 def test_lint_returns_zero_when_data_dir_missing(tmp_path, lint):
     missing = tmp_path / "does-not-exist"
-    assert lint.lint_dir(missing) == []
+    result = lint.lint_dir(missing)
+    assert result.ok
+    assert result.total == 0
     assert lint.main([str(missing)]) == 0
 
 
@@ -125,3 +139,72 @@ def test_lint_module_constant_matches_api(lint):
     """SSOT cross-check: keep the lint set in lockstep with routes_backlog."""
     from app.routes_backlog import _VALID_STATUSES as api_set
     assert set(lint.VALID_STATUSES) == api_set
+
+
+# --- T-0975: unreadable frontmatter must be REPORTED, never silently skipped ---
+
+
+def test_lint_flags_unquoted_title_starting_with_quote(tmp_path, lint):
+    """T-0013's actual shape: an unquoted title beginning with `"`."""
+    bl = tmp_path / "s" / "backlog"
+    bl.mkdir(parents=True)
+    bad = bl / "T-0013-x.md"
+    bad.write_text(
+        '---\nid: T-0013\ntitle: "You\'re all set" post-install screen\nstatus: closed\n---\n\nbody\n'
+    )
+    result = lint.lint_dir(tmp_path)
+    assert not result.ok
+    assert len(result.unreadable) == 1
+    assert result.unreadable[0][0] == bad
+    assert result.total == 1
+    assert result.read_ok == 0
+    assert lint.main([str(tmp_path)]) == 1
+
+
+def test_lint_flags_unquoted_title_with_bare_colon(tmp_path, lint):
+    """T-0171's actual shape: an unquoted title containing a bare `: `."""
+    bl = tmp_path / "s" / "backlog"
+    bl.mkdir(parents=True)
+    bad = bl / "T-0171-x.md"
+    bad.write_text(
+        "---\nid: T-0171\ntitle: Detached-installation: per-server field\nstatus: closed\n---\n\nbody\n"
+    )
+    result = lint.lint_dir(tmp_path)
+    assert not result.ok
+    assert len(result.unreadable) == 1
+    assert result.unreadable[0][0] == bad
+
+
+def test_lint_unreadable_file_is_not_silently_dropped_from_denominator(tmp_path, lint):
+    """A tool that returns a clean number over a partial corpus is the defect
+    (T-0975): the unreadable file must still count toward `total`, and
+    `read_ok` must be strictly less than `total`."""
+    bl = tmp_path / "s" / "backlog"
+    bl.mkdir(parents=True)
+    _write_task(bl, "T-0001", "open")
+    (bl / "T-0002-x.md").write_text(
+        '---\nid: T-0002\ntitle: "unterminated quote\nstatus: closed\n---\n\nbody\n'
+    )
+    result = lint.lint_dir(tmp_path)
+    assert result.total == 2
+    assert len(result.unreadable) == 1
+    assert result.read_ok == 1
+
+
+def test_split_frontmatter_ignores_dash_runs_in_title(lint):
+    """A title containing "---" must not shift a naive `text.split("---")` —
+    the real closing fence is found by a line-by-line scan (T-0975)."""
+    text = "---\nid: T-0001\ntitle: before --- after\nstatus: open\n---\n\nbody\n"
+    block = lint.split_frontmatter(text)
+    assert block == "id: T-0001\ntitle: before --- after\nstatus: open"
+
+
+def test_lint_prints_denominator_summary(tmp_path, lint, capsys):
+    bl = tmp_path / "s" / "backlog"
+    bl.mkdir(parents=True)
+    _write_task(bl, "T-0001", "open")
+    (bl / "T-0002-x.md").write_text('---\nid: T-0002\ntitle: "bad\nstatus: open\n---\n\nbody\n')
+    lint.main([str(tmp_path)])
+    err = capsys.readouterr().err
+    assert "read 1 of 2 file(s)" in err
+    assert "1 unreadable" in err

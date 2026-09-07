@@ -4036,8 +4036,7 @@ def _action_compact(params: dict[str, Any]) -> dict[str, Any]:
     md_path = _sessions._session_file(cfg.data_dir, slug, sid)
     meta = _sessions._read_session_metadata(md_path) or {}
     task_id = meta.get("task_id")
-    role = meta.get("role") or _sessions._derive_role(
-        meta.get("window"), task_id, meta.get("initiative"))
+    role = _sessions._role_of(meta)  # T-0952: owner-keyed (routine-handler) too
 
     rec_path = _telemetry._record_path(cfg, slug, sid)
     rec = _telemetry._read_json(rec_path)
@@ -4149,8 +4148,7 @@ def _action_compact_write_state(params: dict[str, Any]) -> dict[str, Any]:
         raise ActionError(f"compact_write_state: no session md for sid {sid!r}")
 
     task_id = meta.get("task_id")
-    role = meta.get("role") or _sessions._derive_role(
-        meta.get("window"), task_id, meta.get("initiative"))
+    role = _sessions._role_of(meta)  # T-0952: owner-keyed (routine-handler) too
 
     if task_id and task_id != "~":
         raise ActionError(

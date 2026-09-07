@@ -184,6 +184,11 @@ done-or-not judgement — *«Это должна решать сама сесс�
   dev / TL, a bound task alive      nudge          «продолжать только пока
                                                    какая-то из их задач жива»
   dev / TL, no bound task alive     handoff_exit   handoff → exit, NO compact
+  routine-handler (T-0952)          handoff_exit   handoff → exit, NO compact
+                                                   (into its OWN role
+                                                   artifact — the next breach's
+                                                   fresh handler reads it
+                                                   instead of starting blind)
   anything else                     handoff_exit
 
 THE COMPACT IS THE PART THAT NEEDS A REASON, and only ``compact_exit`` has
@@ -657,7 +662,21 @@ def recycle_plan(*, role: str | None, window: str | None, meta: dict | None,
        :func:`worker_nudge_max`. This is the one place the "nudge forever"
        loop is broken, and it is broken by a real terminal action rather than
        by a longer cadence.
-    6. anything else ⇒ ``handoff_exit`` (the pre-T-0945 default for every
+    6. **routine-handler (T-0952)** — always ``handoff_exit``. The single
+       shared handler (T-0933) is never task-bound — the routine it is mid-
+       triage on is not a ticket this session owns, so ``tasks_alive`` has
+       nothing to read and :data:`WORKER_ROLES`'s "nudge while alive" case
+       does not apply. This is NOT "leave it out and let it fall through to
+       step 7" by accident: without its own step it silently rode the ``dev``
+       default before its role was recognised at all, which is the exact gap
+       this ticket closes — an explicit row here is what keeps it in the
+       table if ``WORKER_ROLES`` semantics change later. Recycling it is
+       intentional, not a bug to route around: T-0933's shared-handler dedup
+       (``routines._live_routine_handler``) spawns a fresh one on the next
+       breach if none is live, and that fresh incarnation reads this one's
+       handoff (its role artifact) instead of starting blind — see
+       :func:`routines._handler_brief`.
+    7. anything else ⇒ ``handoff_exit`` (the pre-T-0945 default for every
        non-exempt session, unchanged).
 
     ``nudge_capped`` is an INPUT, not a lookup, for the same reason
@@ -676,6 +695,8 @@ def recycle_plan(*, role: str | None, window: str | None, meta: dict | None,
         if recycle_gate.operator_drive_on(role=r, meta=meta):
             return PLAN_NUDGE
         return PLAN_COMPACT_EXIT if uc_exit_sec() > 0 else PLAN_HANDOFF_EXIT
+    if r == "routine-handler":
+        return PLAN_HANDOFF_EXIT
     if r in WORKER_ROLES:
         if not tasks_alive:
             return PLAN_HANDOFF_EXIT
@@ -915,8 +936,7 @@ def _maybe_recycle_leased(cfg: Any, slug: str, sid: str, row: dict, md_path,
     if meta is None:
         return False
 
-    role = row.get("role") or meta.get("role") or sessions._derive_role(
-        meta.get("window"), meta.get("task_id"), meta.get("initiative"))
+    role = row.get("role") or sessions._role_of(meta)  # T-0952: owner-keyed too
     pane = autocompact._pane_for(sid)
     window = row.get("window") or meta.get("window")
 

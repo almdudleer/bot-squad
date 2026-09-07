@@ -1931,6 +1931,12 @@ def test_recycle_plan_table():
     # ...and the cap never overrides the human's own pane.
     assert IT.recycle_plan(role="dev", window="demo", meta={}, attached=True,
                            tasks_alive=True, nudge_capped=True) == IT.PLAN_STAY
+    # T-0952: the single shared routine-handler always exits — it is never
+    # task-bound (the routine it is mid-triage on is not a ticket it owns),
+    # so it is NOT in WORKER_ROLES and `tasks_alive=True` here is a control
+    # proving that, not an expectation it changes anything.
+    assert _plan("routine-handler") == IT.PLAN_HANDOFF_EXIT
+    assert _plan("routine-handler", tasks_alive=True) == IT.PLAN_HANDOFF_EXIT
     # anything unrecognised keeps the pre-T-0945 default
     assert _plan("", tasks_alive=True) == IT.PLAN_HANDOFF_EXIT
     assert _plan("some-future-role") == IT.PLAN_HANDOFF_EXIT
@@ -1953,7 +1959,8 @@ def test_recycle_plan_attach_beats_every_role():
     for role, meta in (("user-conversation", {}),
                        ("operator", {"drive": "off"}),
                        ("dev", {}),
-                       ("teamlead", {})):
+                       ("teamlead", {}),
+                       ("routine-handler", {})):
         assert _plan(role, meta=meta) != IT.PLAN_STAY, role      # control
         assert _plan(role, meta=meta, attached=True) == IT.PLAN_STAY, role
 

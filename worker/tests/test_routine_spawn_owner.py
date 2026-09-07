@@ -20,6 +20,7 @@ written on REJECTED inputs, so they fail if the fix is widened into a hole.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import types
 from datetime import timedelta
@@ -540,6 +541,76 @@ def test_handler_brief_names_the_standing_role(real_spawn_cfg, tmp_path):
     assert "[ROUTINE BREACH R-NNNN]" in brief
     assert "Stay resident" in brief
     assert rid in brief  # the triggering breach rides along
+
+
+# ---------------------------------------------------------------------------
+# T-0952 — the shared handler reads its PREDECESSOR's forward-state on spawn
+# instead of starting blind on every recycle («не пишет в рутину свои
+# хендоффы, хотя должен»).
+# ---------------------------------------------------------------------------
+
+def test_handler_brief_has_no_continuity_claim_when_nothing_was_ever_written(
+        real_spawn_cfg, tmp_path):
+    """Negative control: a brand-new project's first-ever handler must not be
+    told it has a predecessor that doesn't exist."""
+    cfg, slug, _ = real_spawn_cfg
+    metric = tmp_path / "metric5.txt"
+    metric.write_text("42")
+    rid = _declare_spawn_monitor(cfg, slug, metric)
+    routine = R.load(cfg, slug, rid)
+    ev = R.FireEvent(kind="fire", value=42.0, threshold=10,
+                     judge="gt", breach_first_seen="2026-08-30T00:00:00Z")
+
+    assert R._handler_state_artifact(cfg, slug) is None
+    brief = R._handler_brief(cfg, slug, routine, ev, now=T0)
+    assert "role artifact your predecessor wrote" not in brief
+    assert "FRESH incarnation" not in brief
+
+
+def test_handler_brief_reads_predecessor_state_when_present(real_spawn_cfg, tmp_path):
+    """The core fix: a prior incarnation's role artifact is folded into the
+    NEXT handler's boot brief, so it does not start blind."""
+    cfg, slug, _ = real_spawn_cfg
+    artifacts = cfg.data_dir / slug / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    prior = artifacts / "role-routine-handler-S-u-routine-handler.md"
+    prior.write_text(
+        "---\nassignment: routine-handler\nkind: routine-handler\n"
+        "sid: S-u-routine-handler-p1\nupdated: 2026-09-06T00:00:00Z\n---\n\n"
+        "# ROUTINE-HANDLER forward state\n\nR-0099 is under active triage.\n")
+
+    metric = tmp_path / "metric6.txt"
+    metric.write_text("42")
+    rid = _declare_spawn_monitor(cfg, slug, metric)
+    routine = R.load(cfg, slug, rid)
+    ev = R.FireEvent(kind="fire", value=42.0, threshold=10,
+                     judge="gt", breach_first_seen="2026-08-30T00:00:00Z")
+
+    assert R._handler_state_artifact(cfg, slug) == prior
+    brief = R._handler_brief(cfg, slug, routine, ev, now=T0)
+    assert str(prior) in brief
+    # the FILE is referenced, not inlined — a growing triage history must not
+    # be pasted into every future breach message.
+    assert "R-0099" not in brief
+    assert brief.index(str(prior)) < brief.index("SINGLE shared ROUTINE-HANDLER")
+
+
+def test_handler_state_artifact_spans_the_pre_fix_naming(real_spawn_cfg):
+    """The glob spans BOTH the pre-T-0952 filename (``role-dev-*``, from
+    before the handler had its own role) and the post-fix one (``role-
+    routine-handler-*``): a fresh handler continues from whichever is
+    NEWEST, not whichever name happens to match first."""
+    cfg, slug, _ = real_spawn_cfg
+    artifacts = cfg.data_dir / slug / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    old = artifacts / "role-dev-S-u-routine-handler.md"
+    new = artifacts / "role-routine-handler-S-u-routine-handler.md"
+    old.write_text("old state")
+    new.write_text("new state")
+    os.utime(old, (1, 1))
+    os.utime(new, (1_000_000, 1_000_000))
+
+    assert R._handler_state_artifact(cfg, slug) == new
 
 
 # ---------------------------------------------------------------------------

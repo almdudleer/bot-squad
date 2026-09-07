@@ -379,7 +379,7 @@ def _gather(cfg: Any, now: float | None = None) -> list[dict]:
     from bot_squad_worker import assignment as _assignment
     from bot_squad_worker import operator_redrive as _redrive
     from bot_squad_worker.sessions import (
-        _read_session_metadata, _derive_role, live_pane_map)
+        _read_session_metadata, _role_of, live_pane_map)
     now = now if now is not None else time.time()
     cutoff = stale_cutoff_sec()
     pane_map = live_pane_map()  # SID -> live pane, the truth (md pane_id is empty)
@@ -408,8 +408,7 @@ def _gather(cfg: Any, now: float | None = None) -> list[dict]:
             # operator pause) — not an ungraceful death.
             if str(meta.get("status", "")).lower() != "active":
                 continue
-            role = meta.get("role") or _derive_role(
-                meta.get("window"), meta.get("task_id"), meta.get("initiative"))
+            role = _role_of(meta)  # T-0952: honors the routine-handler owner too
             # T-0563/T-0564/T-0616: never recycle a non-allowlisted project or
             # any of the human's own sessions — user-conversation role,
             # hand-launched user-session window, recycle_exempt md marker (a

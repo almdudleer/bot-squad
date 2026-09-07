@@ -1421,6 +1421,13 @@ def _live_routine_session(cfg: Any, slug: str, rid: str) -> Optional[str]:
 #: справляется [...] всё должно в одной быть»). Per-routine sharding is an
 #: explicit LATER («если перестанет [справляться] в перспективе. Но пока что
 #: оч далеко до этой перспективы»). No colon, so plain `_OWNER_RE` accepts it.
+#:
+#: T-0952: this same string is ALSO how ``sessions._role_of`` recognises the
+#: handler as its own ``routine-handler`` role (keyed on ``owner``, checked
+#: BEFORE the window-marker derivation) — which is what puts it in
+#: ``idle_timeout.recycle_plan``'s table instead of falling to the ``dev``
+#: default. See :func:`_handler_state_artifact` / :func:`_handler_brief` for
+#: the other half: reading a prior incarnation's handoff back in on spawn.
 ROUTINE_HANDLER_OWNER = "routine-handler"
 
 
@@ -1463,6 +1470,62 @@ def _handler_breach_message(cfg: Any, slug: str, routine: Routine,
             f"baseline; escalate only what it says to escalate).")
 
 
+def _handler_state_artifact(cfg: Any, slug: str) -> Optional[Path]:
+    """A PRIOR handler incarnation's continuity file, if one exists (T-0952).
+
+    Sid-INDEPENDENT by necessity: this is read while composing the boot brief
+    for a session that does not exist yet, so there is no sid to key off. The
+    handler's identity is the project-wide OWNER (T-0933's ``ROUTINE_HANDLER_
+    OWNER``), which every incarnation's window and role artifact name embed
+    regardless of pane number — see :func:`bot_squad_worker.assignment.
+    role_artifact` (``role-<role>-<window-base>.md``) — so a substring glob on
+    it finds the file whatever role string wrote it. That deliberately spans
+    the T-0952 rename (``role-dev-*`` from before the handler had its own
+    role, ``role-routine-handler-*`` after): picking the most-recently-
+    modified match means a fresh handler always continues from whichever
+    incarnation wrote last, old naming or new. Returns ``None`` when nothing
+    has ever been written (a brand-new project) or the directory is missing.
+    """
+    artifacts_dir = Path(cfg.data_dir) / slug / "artifacts"
+    try:
+        matches = [p for p in artifacts_dir.glob(f"role-*{ROUTINE_HANDLER_OWNER}*.md")
+                  if p.is_file()]
+    except OSError:
+        return None
+    if not matches:
+        return None
+    return max(matches, key=lambda p: p.stat().st_mtime)
+
+
+def _handler_continuity_prompt(cfg: Any, slug: str) -> str:
+    """T-0952: the "don't start blind" half — a fresh handler is spawned fresh
+    on every breach that finds none live (T-0933 dedup), and until now that
+    brief never looked at what the PREVIOUS incarnation wrote down before it
+    was recycled. Reuses :func:`autocompact.boot_prompt_from_artifact` (the
+    same reload prompt T-0471 crash recovery boots a dead session through) so
+    a routine-handler incarnation is told to read its predecessor's state —
+    and, once it is stale, is told THAT instead of trusting it blind — exactly
+    like every other role's relaunch. ``""`` when nothing has ever been
+    written (first-ever handler for this project): no false claim of a
+    predecessor that doesn't exist.
+    """
+    path = _handler_state_artifact(cfg, slug)
+    if path is None:
+        return ""
+    from bot_squad_worker import autocompact as _autocompact
+    try:
+        staleness = _autocompact.artifact_staleness(str(path), cfg=cfg, slug=slug)
+        prompt = _autocompact.boot_prompt_from_artifact(
+            role="routine-handler", assignment_id=None,
+            artifact_path=str(path), staleness=staleness)
+    except Exception:  # noqa: BLE001 — a broken continuity read must never
+        # block a breach from attaching AI at all.
+        log.exception("routine-handler: continuity read failed for %s (%s)",
+                     slug, path)
+        return ""
+    return prompt + "\n\n"
+
+
 def _handler_brief(cfg: Any, slug: str, routine: Routine, event: FireEvent,
                    now: Optional[datetime] = None) -> str:
     """The boot brief for a FRESH shared handler — orientation plus the breach
@@ -1470,7 +1533,13 @@ def _handler_brief(cfg: Any, slug: str, routine: Routine, event: FireEvent,
     4 assignment primitives + TRIGGER EVENT), prefixed with the standing
     role: this session is the ONE handler for every routine in the project,
     and later breaches arrive as ``[ROUTINE BREACH R-NNNN]`` messages rather
-    than new sessions."""
+    than new sessions.
+
+    T-0952: ALSO prefixed with :func:`_handler_continuity_prompt` when a prior
+    incarnation left one — otherwise this brief is the whole of what a fresh
+    handler ever knows, and every earlier triage (open incidents, baselines
+    it has already learned) is lost on every recycle. This is the fix for
+    "each fire starts blind"."""
     routines_dir = Path(cfg.data_dir) / slug / "routines"
     head = (
         f"You are the SINGLE shared ROUTINE-HANDLER session for project "
@@ -1481,10 +1550,15 @@ def _handler_brief(cfg: Any, slug: str, routine: Routine, event: FireEvent,
         f"and follow that routine's ## Instruction. Many routines are "
         f"deliberately born-red with a documented known-bad baseline — "
         f"escalate only NEW findings, never the baseline. Stay resident: "
-        f"when idle, you are waiting for the next breach, not done.\n\n"
+        f"when idle, you are waiting for the next breach, not done. On "
+        f"timeout/context-full you ride the SAME lifecycle as every other "
+        f"role: write your forward-state into your role artifact (`bsq "
+        f"compact-save \"<the whole doc>\"`) before you go — the next "
+        f"handler this project spawns reads it instead of starting blind.\n\n"
         f"The breach that attached you:\n\n"
     )
-    return head + spawn_brief(cfg, slug, routine, event, now=now)
+    return (_handler_continuity_prompt(cfg, slug) + head
+            + spawn_brief(cfg, slug, routine, event, now=now))
 
 
 def _spawn_routine_handler(cfg: Any, slug: str, routine: Routine,

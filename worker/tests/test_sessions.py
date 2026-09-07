@@ -5948,6 +5948,25 @@ def test_role_of_unset_falls_through_to_derive():
     assert S._role_of({"window": "claude"}) == "dev"
 
 
+def test_role_of_routine_handler_keyed_on_owner():
+    """T-0952: the single shared routine-handler (T-0933) is recognised by its
+    OWNER, not by a new window-name pattern — its window ('routine-handler')
+    matches none of `_derive_role`'s markers and would otherwise fall to the
+    `dev` default, which is the exact gap this ticket closes."""
+    import bot_squad_worker.sessions as S
+    from bot_squad_worker.routines import ROUTINE_HANDLER_OWNER
+
+    assert S._role_of({"window": "routine-handler",
+                       "owner": ROUTINE_HANDLER_OWNER}) == "routine-handler"
+    # the window-only derivation is untouched — still falls to dev.
+    assert S._derive_role("routine-handler", None, None) == "dev"
+    # an unrelated owner (e.g. a per-routine schedule session) must NOT match.
+    assert S._role_of({"window": "dev", "owner": "routine:R-0001"}) == "dev"
+    # a stored morph stamp still wins over the owner (T-0509 precedence).
+    assert S._role_of({"window": "routine-handler", "owner": ROUTINE_HANDLER_OWNER,
+                       "role": "operator"}) == "operator"
+
+
 def test_morph_user_to_dev_sets_role_and_task(tmp_path):
     """user → dev (on taking a task): stamps role=dev + the primary task_id."""
     import bot_squad_worker.sessions as S

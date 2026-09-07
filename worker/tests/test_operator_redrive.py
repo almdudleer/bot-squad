@@ -231,22 +231,36 @@ def test_empty_backlog_is_idle(cfg_slug):
 
 
 def test_operator_pending_is_a_property_not_a_hand_list():
-    """T-0951: the operator's follow-up. Pin the PROPERTY (dev-takeable OR
-    operator-gated) against every known status, rather than only against the
-    two examples exercised above — a hand-listed exclusion set can miss a new
-    status silently (T-0990 was exactly this shape, the same night); an
-    allow-list built from the property cannot drift the same way because
-    ``pickup.PICKUP_STATUSES`` is the same set every dev-takeable computation
-    already uses."""
+    """T-0951, second pass (operator review): the FIRST version of this test
+    computed its expectation from the same two sets the implementation reads
+    (``pickup.PICKUP_STATUSES | _OPERATOR_GATED_STATUSES``) — X == X by
+    construction, unable to fail no matter how many statuses it looped over,
+    and specifically blind to the one thing its docstring claimed to catch: a
+    TENTH status added to ``task_states.TICKET_STATUSES`` that nobody sorted
+    into either set falls out of both sides identically and the assertion
+    stays green.
+
+    This version asserts against a LITERAL map, written by hand, one line per
+    status — so a new status can only pass this test if a human puts it in
+    the map and says which side of the line it is on. ``set(EXPECTED) ==
+    set(TICKET_STATUSES)`` is the line that actually does the catching; drop
+    it and the rest of this test degrades back to the same tautology."""
     from bot_squad_worker import task_states
 
-    expected_pending = pickup.PICKUP_STATUSES | ord_._OPERATOR_GATED_STATUSES
-    for status in task_states.TICKET_STATUSES:
-        assert ord_._is_operator_pending(status) == (status in expected_pending), status
-    # And the two facts that make the property non-trivial, named directly:
-    assert "totest" not in expected_pending        # the human's queue
-    assert "blocked_on_user" not in expected_pending  # waits on the human
-    assert "to_accept" in expected_pending          # the operator's own queue
+    EXPECTED = {
+        "planned": True, "open": True, "in_progress": True, "paused": True,
+        "reopened": True,          # dev-takeable (pickup.PICKUP_STATUSES)
+        "to_accept": True,         # operator-gated (_OPERATOR_GATED_STATUSES)
+        "totest": False,           # the human's queue (T-0944)
+        "blocked_on_user": False,  # waits on the human
+        "closed": False,           # terminal
+    }
+    # The guard: fails the moment TICKET_STATUSES gains or loses a member
+    # this map doesn't already name — the only line that can actually catch
+    # a silently-unsorted new status.
+    assert set(EXPECTED) == set(task_states.TICKET_STATUSES)
+    for status, want in EXPECTED.items():
+        assert ord_._is_operator_pending(status) is want, status
 
 
 def test_count_pending_backlog_counts_only_actionable(cfg_slug):

@@ -14,6 +14,8 @@ import importlib.util
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
+import yaml
+
 _BSQ_PATH = Path(__file__).resolve().parent / "bsq"
 _loader = SourceFileLoader("bsq_mod_ts", str(_BSQ_PATH))
 _spec = importlib.util.spec_from_loader("bsq_mod_ts", _loader)
@@ -60,3 +62,37 @@ def test_wrapper_flags_duplicate_input_as_clarification(tmp_path, monkeypatch):
                  bsq._load_backlog_tickets("demo"))
     assert cands[0].id == "T-0010"
     assert cands[0].dup is True
+
+
+# ---------------------------------------------------------------------------
+# T-1047 decision site 2 — the T-0577 dedupe gate ranks on `title`, so a
+# folded title must not silently drop the tail of the title from ranking.
+# ---------------------------------------------------------------------------
+def test_folded_title_still_ranks_on_its_full_text(tmp_path, monkeypatch):
+    # A real 204ch live title (T-1003), run through the real (unpinned-width)
+    # pyyaml dumper to reproduce the fold a pre-T-1044 writer produced — the
+    # old flat reader kept only the first line, opening quote attached, and
+    # lost every word after "pace mirror guard:".
+    real_title = (
+        "the api/worker task_states byte-identity guard can never run in the "
+        "same invocation as the pace mirror guard: they derive the worker "
+        "tree from parents[3] vs parents[2], so each mount satisfies exactly "
+        "one"
+    )
+    fm_block = yaml.dump({"id": "T-1003", "title": real_title, "status": "planned"},
+                         allow_unicode=True, sort_keys=False, default_flow_style=False)
+    assert "\n " in fm_block, "fixture didn't actually fold — width default must be 80"
+    d = tmp_path / "data" / "demo" / "backlog"
+    d.mkdir(parents=True)
+    (d / "T-1003-x.md").write_text(f"---\n{fm_block}---\n\nbody\n", encoding="utf-8")
+    monkeypatch.setattr(bsq, "backlog_dir", lambda slug: d)
+
+    tickets = bsq._load_backlog_tickets("demo")
+    assert tickets[0].title == real_title  # not truncated at the fold
+
+    rank = bsq._load_task_search().rank
+    # Query built from the TAIL of the title only — the words the old reader
+    # dropped at the fold. A ranker still weighting on the truncated title
+    # would score this as no title overlap at all.
+    cands = rank("parents[3] vs parents[2] each mount satisfies exactly one", tickets)
+    assert cands[0].id == "T-1003"

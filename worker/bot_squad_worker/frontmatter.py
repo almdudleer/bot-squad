@@ -1,12 +1,21 @@
 """Shared YAML-frontmatter parser/writer for bot-squad task + session md files.
 
 SINGLE SOURCE OF TRUTH (T-0075). This module is byte-identical mirrored at
-``worker/bot_squad_worker/frontmatter.py`` and ``api/app/frontmatter.py`` —
-edit BOTH copies together (same convention as ``idalloc.py``). It imports only
-the stdlib + ``yaml`` so the two copies can stay identical. Pinned below the
-docstring by the mirror registry in ``worker/tests/test_module_mirrors.py``,
-gated on every push by ``scripts/lint/module_mirrors.py`` (T-0743) — before that
-this pair had no guard of any kind.
+``worker/bot_squad_worker/frontmatter.py``, ``api/app/frontmatter.py`` and
+``scripts/cli/frontmatter.py`` — edit ALL THREE copies together (same
+convention as ``idalloc.py``/``priority.py``). It imports only the stdlib +
+``yaml`` so the copies can stay identical. Pinned below the docstring by the
+mirror registry in ``worker/tests/test_module_mirrors.py``, gated on every
+push by ``scripts/lint/module_mirrors.py`` (T-0743) — before that this pair
+had no guard of any kind.
+
+T-1047 added the third copy: ``scripts/cli``'s own ``bsq read_frontmatter``
+was a hand-rolled "key: value lines only" reader that could not represent
+what this parser does — folded scalars, quoted-scalar escapes, and
+block-style lists all mis-read, on 458 of 950 live ticket titles alone. The
+worker package cannot be imported across the ``scripts/cli`` boundary (see
+``task_search.py``/``priority.py``), so the fix is a third mirrored copy, not
+an import.
 
 WHY THIS EXISTS
 ---------------

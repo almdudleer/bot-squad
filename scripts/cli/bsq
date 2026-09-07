@@ -588,33 +588,47 @@ def resolve_bundle_ids(slug: str, raw: str | None, primary: str,
     return out
 
 
-def _strip_surrounding_quotes(v: str) -> str:
-    """Strip one layer of matching surrounding single/double quotes (T-0208).
+def _load_frontmatter():
+    """Load the sibling ``frontmatter.py`` helper (T-1047) — the ONE md
+    frontmatter parser/writer (T-0075), byte-identical to
+    ``worker/bot_squad_worker/frontmatter.py`` and pinned against it by the
+    module-mirror gate.
 
-    The shared pyyaml dump (T-0075) and ``bsq task new`` write quoted YAML
-    scalars like ``initiative: "x.md"`` / ``priority: '110'``. The flat
-    reader below must hand downstream consumers (spawn, init_path
-    resolution, expert scan) the bare value, not one with literal quotes —
-    otherwise e.g. the spawn validator rejects ``"x.md"`` on its
-    ``.endswith(".md")`` check.
-    """
-    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
-        return v[1:-1]
-    return v
+    Loaded the same way as ``task_search.py``/``priority.py`` (see
+    ``_load_task_search`` below): the worker package is not importable from
+    here, and a hand-rolled second parser is exactly the drift this ticket
+    exists to end — bsq's own "key: value lines only" reader mis-parsed
+    folded scalars, quoted-scalar escapes and block-style lists on 458 of 950
+    live ticket titles."""
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+    p = Path(__file__).resolve().parent / "frontmatter.py"
+    if "bsq_frontmatter" in sys.modules:
+        return sys.modules["bsq_frontmatter"]
+    loader = SourceFileLoader("bsq_frontmatter", str(p))
+    spec = importlib.util.spec_from_loader("bsq_frontmatter", loader)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["bsq_frontmatter"] = mod
+    loader.exec_module(mod)
+    return mod
 
 
 def read_frontmatter(path: Path) -> dict:
-    """Tiny flat-YAML frontmatter reader (key: value lines only)."""
+    """A ticket/session md's frontmatter, via the shared pyyaml parser (T-1047).
+
+    Used to be a "key: value lines only" flat reader that mis-parsed pyyaml's
+    own output on four independent axes: a scalar folded past 80 columns read
+    truncated (title 458/950 live tickets, gate_reason 3/3); a quoted scalar's
+    internal escapes came back mangled instead of unescaped (T-0013); a
+    block-style list read as completely empty (30 tickets); and a nested
+    mapping (``session_history_ts``) couldn't be represented at all. Real
+    pyyaml — the same parser the writers use — has none of those failure
+    modes by construction, so this now delegates to it instead of patching
+    each one.
+    """
     text = path.read_text()
-    m = re.match(r"\A---\n(.*?)\n---\n", text, re.DOTALL)
-    if not m:
-        return {}
-    fm: dict = {}
-    for line in m.group(1).splitlines():
-        mm = re.match(r"^([A-Za-z0-9_]+):\s*(.*)$", line)
-        if mm:
-            fm[mm.group(1)] = _strip_surrounding_quotes(mm.group(2).strip())
-    return fm
+    parsed = _load_frontmatter().parse_or_none(text)
+    return parsed[0] if parsed else {}
 
 
 # T-0591 (F3.3): non-placeholder Verbatim discipline on stakeholder-sourced

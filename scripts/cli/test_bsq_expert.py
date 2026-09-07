@@ -137,6 +137,61 @@ def test_higher_overlap_ranks_first(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# T-1047 decision site 1 — expert discovery must survive block/folded
+# session_history, not just the flow-style `_write_ticket` fixtures above.
+# ---------------------------------------------------------------------------
+def _write_raw_ticket(tmp_path: Path, tid: str, fm_block: str, body: str = "") -> Path:
+    d = _backlog(tmp_path)
+    p = d / f"{tid}-x.md"
+    p.write_text(f"---\n{fm_block}\n---\n\n{body}\n")
+    return p
+
+
+def test_block_format_session_history_still_finds_expert(tmp_path):
+    # T-0003's real shape, copied byte-for-byte off the live board: block-style
+    # session_history, which the old flat reader returned as completely empty
+    # (T-1047 arm 3) — the expert it names must still surface.
+    _write_raw_ticket(
+        tmp_path, "T-0003",
+        "id: T-0003\n"
+        'title: Active operator session is displayed as "suspended" in the UI\n'
+        "status: closed\n"
+        "session_history:\n"
+        "- S-almdudleer-operator-shown-active-p35\n",
+    )
+    _write_ticket(tmp_path, "T-0200", body="Related: [[T-0003]].")
+    ranked = _find(tmp_path, ["T-0200"], [_session("S-almdudleer-operator-shown-active-p35")])
+    assert [c["sid"] for c in ranked] == ["S-almdudleer-operator-shown-active-p35"]
+    assert ranked[0]["confidence"] == "high"
+
+
+def test_folded_flow_session_history_still_finds_every_expert(tmp_path):
+    # T-0207's real shape, copied byte-for-byte off the live board: a flow
+    # list folded past pyyaml's 80-column width. The ticket's own measurement
+    # found the OLD reader recovered 2 of the 4 real SIDs here — all 4 must
+    # come back now (T-1047 arm 1).
+    sids = [
+        "S-almdudleer-route-all-backlog-ticket-creation-throug-p87",
+        "S-almdudleer-route-all-backlog-ticket-creation-throug-p106",
+        "S-almdudleer-route-all-backlog-ticket-creation-throug-p109",
+        "S-almdudleer-route-all-backlog-ticket-creation-throug-p120",
+    ]
+    _write_raw_ticket(
+        tmp_path, "T-0207",
+        "id: T-0207\n"
+        "title: Route ALL backlog-ticket creation through the bsq task_new allocator — operator\n"
+        "  dispatch templating direct-writes T-NNNN files and collides\n"
+        "status: closed\n"
+        f"session_history: [{sids[0]}, {sids[1]},\n"
+        f"  {sids[2]}, {sids[3]}]\n",
+    )
+    _write_ticket(tmp_path, "T-0300", body="Related: [[T-0207]].")
+    ranked = _find(tmp_path, ["T-0300"], [_session(s) for s in sids])
+    assert {c["sid"] for c in ranked} == set(sids)
+    assert all(c["confidence"] == "high" for c in ranked)
+
+
+# ---------------------------------------------------------------------------
 # _related_tickets
 # ---------------------------------------------------------------------------
 def test_related_tickets_reverse_xref(tmp_path):

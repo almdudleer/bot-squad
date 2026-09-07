@@ -83,6 +83,17 @@ MIRRORS: tuple[Mirror, ...] = (
         why="the single md frontmatter parser/writer (T-0075) — a split write path corrupts task md",
     ),
     Mirror(
+        name="frontmatter_cli",
+        left="worker/bot_squad_worker/frontmatter.py",
+        right="scripts/cli/frontmatter.py",
+        split_marker=FUTURE_MARKER,
+        why="T-1047: bsq's own flat 'key: value lines only' reader mis-parsed folded scalars, "
+            "quoted-scalar escapes and block-style lists on 458 of 950 live ticket titles; "
+            "the worker package cannot be imported across the scripts/cli boundary, so bsq "
+            "now shares this SAME pyyaml parser as a third mirrored copy instead of a fourth "
+            "divergent implementation",
+    ),
+    Mirror(
         name="secret_crypto",
         left="worker/bot_squad_worker/secret_crypto.py",
         right="api/app/secret_crypto.py",

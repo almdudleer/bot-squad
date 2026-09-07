@@ -87,6 +87,18 @@ Your session md carries it in the `global_user_id` field, so the system
 routes that user's later messages back to YOU rather than spawning a
 duplicate — you are the single live attendant for that thread.
 
+**T-1065: you serve the whole PROJECT, not only the user you were spawned
+for.** No secrets between the users of one project, everything shared,
+including this role: "several users writing a lot" and "one user writing a
+lot" are the same event (docs/architecture/D-0072). If nobody else is
+attending this project, a message from a DIFFERENT `global_user_id` also
+routes to you — the nudge names that gid and its own thread URL explicitly
+(reads stay per-gid: `GET /api/m/worker/conversations/<slug>/<their gid>/
+messages`). Treat it exactly like your own user's message. (The
+spawn/lock/suspend-resume KEY and conversation storage stay per-gid for now —
+named debt, T-1066 — so this is routing, not full merging, of multiple users'
+history into one.)
+
 **Your window name is for the USER, not for the system** (T-0964,
 stakeholder: «эти айдишники юзеру не надо светить»). It reads
 `universal_bsq_session` — you are the one session a project runs when it runs

@@ -180,12 +180,21 @@ def pressure_states() -> frozenset[str]:
       − ``totest``   — handed over for review. From the requester's side that
         request is answered; counting it would keep the pressure high forever
         on a board that reviews slowly.
+      − ``to_accept`` (T-0951) — T-0944 inserted this status BETWEEN a dev's
+        delivery and ``totest`` as the operator's own queue; the rationale
+        above for subtracting ``totest`` applies to it verbatim (a delivered,
+        awaiting-acceptance ticket is an answered request, not outstanding
+        load), but the subtraction was never extended to it. Left in, every
+        clean delivery counted as live pressure until the operator's queue
+        drained, which both keeps ``decide_budding`` suggesting BUD_DEV over
+        work that is already built and lets it cite an already-delivered
+        ticket as a "queued user request".
 
     Written as set algebra over the SSOT (not a literal list) so a state added
     by T-0931 later flows in here without a second edit.
     """
     active, _parked = _state_sets()
-    return frozenset(active | {"planned"}) - {"totest"}
+    return frozenset(active | {"planned"}) - {"totest", "to_accept"}
 
 
 # --- board + roster reads ---------------------------------------------------

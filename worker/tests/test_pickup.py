@@ -68,6 +68,10 @@ def test_a_fresh_prioritised_open_ticket_is_takeable():
 @pytest.mark.parametrize("status,reject", [
     ("closed", "terminal:closed"),
     ("totest", "awaiting-review"),
+    # T-0951: a delivered-but-unaccepted ticket gets its own named reject —
+    # not the generic "not-a-pickup-status", which is how it went uncounted
+    # by drive_stop's residue (see test_pickup_scope.py for that half).
+    ("to_accept", "awaiting-acceptance"),
     ("", "not-a-pickup-status:missing"),
     ("bogus", "not-a-pickup-status:bogus"),
     # T-0931: blocked_on_user is deliberately excluded, like paused's inverse —

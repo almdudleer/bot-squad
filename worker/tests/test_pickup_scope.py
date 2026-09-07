@@ -266,6 +266,21 @@ def test_totest_is_out_of_every_scope_and_keeps_its_own_reason(board, scope):
     assert _rejects(q) == {"T-t": "awaiting-review"}
 
 
+@pytest.mark.parametrize("scope", sorted(_SCOPE_CASES))
+def test_to_accept_is_out_of_every_scope_and_counted_as_awaiting_acceptance(
+        board, scope):
+    """T-0951: the delivered-but-unaccepted twin of the test above. A to_accept
+    ticket is mechanically excluded (never readmitted by a scope) with its own
+    reason, and is counted under ``drive_scope["awaiting_acceptance"]`` — which
+    is what lets drive_stop tell "done" apart from "delivered, not accepted"."""
+    cfg, slug = board
+    _write_task(cfg, slug, "T-a", status="to_accept")
+    q = pickup.pickup_queue(cfg, slug, now_epoch=NOW, scope=scope)
+    assert q["pickup"] == []
+    assert _rejects(q) == {"T-a": "awaiting-acceptance"}
+    assert q["drive_scope"]["awaiting_acceptance"] == 1
+
+
 # ---------------------------------------------------------------------------
 # DoD 3 — the scope comes from the pace config, and nothing else stores it
 # ---------------------------------------------------------------------------

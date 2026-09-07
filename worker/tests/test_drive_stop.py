@@ -177,6 +177,39 @@ def test_an_empty_pickup_band_with_residue_is_not_the_done_state(scope_with_resi
     assert rec["reason"] != drive_stop.STOP_DONE
 
 
+def test_a_board_of_only_delivered_to_accept_work_is_not_the_done_state(board):
+    """T-0951: THE second failure this bundle now prevents, alongside residue.
+    A to_accept ticket is mechanically excluded and never lands in the triage
+    band, so ``triage_in_scope`` alone is blind to it — before the fix this
+    evaluated STOP_DONE and posted «ВСЁ СДЕЛАНО» over unaccepted deliveries."""
+    cfg, slug = board
+    _alert_on(cfg, slug)
+    _write_task(cfg, slug, "T-0951a", status="to_accept")
+    _write_task(cfg, slug, "T-0951b", status="to_accept")
+
+    rec = drive_stop.evaluate(cfg, slug, now_epoch=NOW)
+
+    assert rec["takeable"] == 0
+    assert rec["triage_in_scope"] == 0     # what the old predicate alone saw
+    assert rec["awaiting_acceptance"] == 2  # what it was blind to
+    assert rec["reason"] == drive_stop.STOP_TRIAGE_BLOCKED
+    assert rec["reason"] != drive_stop.STOP_DONE
+
+
+def test_the_awaiting_acceptance_line_is_in_the_rendered_message(board):
+    cfg, slug = board
+    _alert_on(cfg, slug)
+    _write_task(cfg, slug, "T-0951a", status="to_accept")
+
+    rec = drive_stop.evaluate(cfg, slug, now_epoch=NOW)
+    text = drive_stop.alert_text(rec)
+
+    assert not text.startswith(drive_stop.HEADLINE_DONE)
+    assert text.startswith(drive_stop.HEADLINE_TRIAGE_BLOCKED)
+    assert "to_accept" in text
+    assert "1 задача" in text
+
+
 def test_the_predicate_reads_l2s_constant_not_a_copy_of_the_field_name(scope_with_residue):
     """The residue arrives under ``pickup.TRIAGE_IN_SCOPE_KEY``. Pinning the
     equality here means a rename in the lane below turns this red instead of

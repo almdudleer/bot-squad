@@ -6673,7 +6673,14 @@ def archive_dead_teammates(cfg: Any, slug: str) -> dict:
                 reason = "exited-no-task"
             elif st is None:
                 reason = "exited-task-missing"
-            elif st in ("totest", "closed"):
+            elif st in ("totest", "closed", "to_accept"):
+                # T-0951: to_accept is a dev's normal, clean delivery point
+                # since T-0944 (graceful_exit.DONE_STATUSES) — the dev
+                # deliberately isn't respawned once it's there. Missing it
+                # here sent 100% of exited deliveries into the else branch
+                # below (crashed/abandoned semantics) to linger as a
+                # "exited-stale" zombie for up to session_stale_sec() (24h
+                # default) instead of archiving promptly on this tick.
                 reason = f"exited-{st}"
             else:
                 # T-0233: the task is still open (open/in_progress/reopened/

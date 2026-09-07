@@ -404,12 +404,30 @@ def test_operator_busy_backlog_is_left_alone(tmp_path, seams):
     assert seams["calls"]["suspend"] == []
 
 
-def test_operator_totest_task_still_pending(tmp_path, seams):
-    """A totest task is DONE for the dev but still PENDING for the operator
-    (it must close it) — so the operator does NOT exit yet."""
+def test_operator_totest_backlog_does_not_block_exit(tmp_path, seams):
+    """T-0951: ``totest`` is the HUMAN's queue (T-0944 — "to test это для меня
+    уже, человека"), not the operator's to close. Before the fix this counted
+    as operator-pending, which combined with ``operator_redrive`` to respawn a
+    fresh operator over a totest-only board forever: each boot found nothing
+    takeable, went idle/drive-off, and was replaced — zero state transitions,
+    ever, since only the HUMAN can move a totest ticket."""
     sid = "S-almdudleer-bot-squad-operator-p1"
     cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None)
     _write_task(data, "T-0099", "totest")
+    row = _row(sid, role="operator", window="operator", task_id=None,
+               cwd_repo=data.parent / "repo")
+    assert GE.maybe_exit(cfg, "bot-squad", row, now=time.time(),
+                         user_home="/home/x") is True
+    assert seams["calls"]["suspend"] == [sid]
+
+
+def test_operator_to_accept_task_still_pending(tmp_path, seams):
+    """The twin of the test above: ``to_accept`` IS the operator's own queue
+    (T-0944) — accepting it into ``totest`` is operator work, so a to_accept
+    backlog still blocks exit."""
+    sid = "S-almdudleer-bot-squad-operator-p1"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="operator", task_id=None)
+    _write_task(data, "T-0099", "to_accept")
     row = _row(sid, role="operator", window="operator", task_id=None,
                cwd_repo=data.parent / "repo")
     assert GE.maybe_exit(cfg, "bot-squad", row, now=time.time(),

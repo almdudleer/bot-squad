@@ -230,13 +230,40 @@ def test_empty_backlog_is_idle(cfg_slug):
     assert spawns == []
 
 
+def test_operator_pending_is_a_property_not_a_hand_list():
+    """T-0951: the operator's follow-up. Pin the PROPERTY (dev-takeable OR
+    operator-gated) against every known status, rather than only against the
+    two examples exercised above — a hand-listed exclusion set can miss a new
+    status silently (T-0990 was exactly this shape, the same night); an
+    allow-list built from the property cannot drift the same way because
+    ``pickup.PICKUP_STATUSES`` is the same set every dev-takeable computation
+    already uses."""
+    from bot_squad_worker import task_states
+
+    expected_pending = pickup.PICKUP_STATUSES | ord_._OPERATOR_GATED_STATUSES
+    for status in task_states.TICKET_STATUSES:
+        assert ord_._is_operator_pending(status) == (status in expected_pending), status
+    # And the two facts that make the property non-trivial, named directly:
+    assert "totest" not in expected_pending        # the human's queue
+    assert "blocked_on_user" not in expected_pending  # waits on the human
+    assert "to_accept" in expected_pending          # the operator's own queue
+
+
 def test_count_pending_backlog_counts_only_actionable(cfg_slug):
+    """T-0951: "actionable" means actionable BY THE OPERATOR, not merely
+    non-closed. ``totest`` is the HUMAN's queue and ``blocked_on_user`` waits
+    on the human (T-0944) — neither is a thing a respawned operator can move,
+    so counting either as pending produced a respawn loop with zero state
+    transitions on a board holding only those statuses. ``to_accept`` stays
+    pending: accepting it into ``totest`` IS operator work."""
     cfg, slug, _ = cfg_slug
     _write_task(cfg, slug, "T-1", status="open")
     _write_task(cfg, slug, "T-2", status="in_progress")
-    _write_task(cfg, slug, "T-3", status="totest")
+    _write_task(cfg, slug, "T-3", status="to_accept")
     _write_task(cfg, slug, "T-4", status="closed")        # terminal -> not counted
     _write_task(cfg, slug, "T-5", status="open", archived=True)  # off-board -> not counted
+    _write_task(cfg, slug, "T-6", status="totest")        # human's queue -> not counted
+    _write_task(cfg, slug, "T-7", status="blocked_on_user")  # waits on human -> not counted
     assert ord_.count_pending_backlog(cfg, slug) == 3
 
 
@@ -354,16 +381,37 @@ def test_respawn_prompt_states_the_scope_even_when_none_is_set(cfg_slug, monkeyp
 
 def test_respawn_prompt_states_an_empty_queue_out_loud(cfg_slug, monkeypatch):
     """Pending backlog exists (so the tick fires) but nothing is TAKEABLE — a
-    totest ticket is review work. The brief must say the queue is empty instead
-    of omitting the section, which a reader takes as "not computed"."""
+    to_accept ticket is the operator's own to accept, not to pick up. The
+    brief must say the queue is empty instead of omitting the section, which a
+    reader takes as "not computed".
+
+    T-0951: was seeded with a ``totest`` ticket, which count_pending_backlog no
+    longer counts as pending (it's the human's queue) — ``to_accept`` keeps
+    this test's original "pending but not takeable" shape."""
     cfg, slug, spawns = cfg_slug
     monkeypatch.setattr(S, "_live_agent_sids", lambda: set())
-    _write_task(cfg, slug, "T-1", status="totest")
+    _write_task(cfg, slug, "T-1", status="to_accept")
 
     assert ord_.tick(cfg, slug)["action"] == "respawned"
     prompt = spawns[0]["prompt"]
     assert pickup.EMPTY_PICKUP_LINE in prompt
     assert "T-1" not in prompt
+
+
+def test_totest_only_board_does_not_loop_the_operator(cfg_slug, monkeypatch):
+    """T-0951 regression: a board holding only blocked_on_user + totest
+    tickets is fully waiting on the human. Before the fix, both counted as
+    pending and the tick respawned an operator every cooldown forever — each
+    boot sees an empty pickup queue, goes idle/drive-off, and gets replaced —
+    for zero state transitions, ever."""
+    cfg, slug, spawns = cfg_slug
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set())
+    _write_task(cfg, slug, "T-1", status="totest")
+    _write_task(cfg, slug, "T-2", status="blocked_on_user")
+
+    res = ord_.tick(cfg, slug)
+    assert res["action"] != "respawned"
+    assert spawns == []
 
 
 def test_a_broken_pickup_computation_never_blocks_the_respawn(cfg_slug, monkeypatch):

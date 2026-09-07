@@ -201,15 +201,33 @@ def test_an_in_progress_label_left_by_a_dead_dev_still_counts_as_queued(tmp_path
 
 
 def test_parked_and_finished_tasks_are_not_user_pressure(tmp_path):
-    """A closed task is done, a totest task is handed over for review, and a
-    blocked_on_user task is waiting on HIM (T-0931) — none of the three is
-    something he is waiting on a session for."""
+    """A closed task is done, a totest task is handed over for review, a
+    to_accept task is delivered awaiting the operator's acceptance (T-0951),
+    and a blocked_on_user task is waiting on HIM (T-0931) — none of the four
+    is something he is waiting on a session for."""
     cfg = _make_cfg(tmp_path)
     _task(cfg, "T-0001", "in_progress")
     _task(cfg, "T-0002", "closed")
     _task(cfg, "T-0003", "totest")
     _task(cfg, "T-0004", "blocked_on_user")
     _task(cfg, "T-0005", "paused")
+    _task(cfg, "T-0006", "to_accept")
+    _root(cfg, task_id="T-0001", role="dev")
+
+    d = budding.decide_budding(cfg, "test-project", ROOT)
+
+    assert d["observation"]["queued_requests"] == []
+    assert d["verdict"] == budding.HOLD
+
+
+def test_delivered_to_accept_tickets_do_not_suggest_budding(tmp_path):
+    """T-0951 regression: two devs deliver into to_accept and exit; the
+    operator's acceptance queue is slow. Before the fix, both tickets counted
+    as queued pressure and this would fire BUD_DEV over work already built."""
+    cfg = _make_cfg(tmp_path)
+    _task(cfg, "T-0001", "in_progress")
+    _task(cfg, "T-0002", "to_accept")
+    _task(cfg, "T-0003", "to_accept")
     _root(cfg, task_id="T-0001", role="dev")
 
     d = budding.decide_budding(cfg, "test-project", ROOT)
@@ -227,9 +245,11 @@ def test_pressure_states_track_the_t0931_state_ssot(tmp_path):
     assert "blocked_on_user" in parked, (
         "T-0931's headline state vanished — a dev blocked on the user would "
         "start counting as queued pressure again")
-    # The two deliberate adjustments, spelled out (see pressure_states()).
-    assert budding.pressure_states() == frozenset(active | {"planned"}) - {"totest"}
+    # The deliberate adjustments, spelled out (see pressure_states()).
+    assert budding.pressure_states() == (
+        frozenset(active | {"planned"}) - {"totest", "to_accept"})
     assert "totest" not in budding.pressure_states()
+    assert "to_accept" not in budding.pressure_states()  # T-0951
     assert "closed" not in budding.pressure_states()
     assert "planned" in budding.pressure_states()
 

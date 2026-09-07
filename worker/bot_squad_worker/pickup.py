@@ -480,10 +480,18 @@ def classify_ticket(
         reason = str(meta.get("gate_reason") or "").strip()
         reject = "gated:" + (reason if reason else "unspecified")
     elif status not in PICKUP_STATUSES:
-        # ``totest`` is the real member of this set: review work, not pickup
-        # work. An unrecognised status is named as itself rather than assumed.
-        reject = ("awaiting-review" if status == "totest"
-                  else f"not-a-pickup-status:{status or 'missing'}")
+        # ``totest``/``to_accept`` are the real members of this set: delivered
+        # work awaiting review/acceptance, not pickup work. Each gets its own
+        # name (T-0951: a to_accept ticket used to fall into the generic
+        # ``not-a-pickup-status`` bucket, indistinguishable from a garbage
+        # status, which is how it went uncounted by drive_stop's residue).
+        # Any other unrecognised status is named as itself rather than assumed.
+        if status == "totest":
+            reject = "awaiting-review"
+        elif status == "to_accept":
+            reject = "awaiting-acceptance"
+        else:
+            reject = f"not-a-pickup-status:{status or 'missing'}"
     elif scope_statuses is not None and status not in scope_statuses:
         # T-0829: the configured drive scope. Ranked HERE — immediately after the
         # other status facts and before the world facts (held / lane / blocked) —
@@ -776,6 +784,14 @@ def pickup_queue(cfg: Any, slug: str, *, now_epoch: Optional[float] = None,
     drive_scope["out_of_scope"] = sum(
         1 for r in banded[BAND_EXCLUDED]
         if str(r["reject"] or "").startswith("out-of-drive-scope:")
+    )
+    # T-0951: delivered-but-unaccepted tickets are mechanically excluded (never
+    # a sanity signal), so they never reach BAND_TRIAGE and the residue above
+    # is blind to them. Reported under its own name for the same reason
+    # ``out_of_scope`` is: ``drive_stop`` reads it programmatically to keep
+    # from declaring a board "done" while delivered work still sits unaccepted.
+    drive_scope["awaiting_acceptance"] = sum(
+        1 for r in banded[BAND_EXCLUDED] if r["reject"] == "awaiting-acceptance"
     )
 
     return {

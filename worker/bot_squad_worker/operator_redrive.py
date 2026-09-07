@@ -52,12 +52,35 @@ log = logging.getLogger(__name__)
 # or a fast-exiting operator stampeding the spawn path. Override via env in tests.
 _SPAWN_COOLDOWN_SEC = int(os.environ.get("BOT_SQUAD_OPERATOR_REDRIVE_COOLDOWN", "90"))
 
-# A board task is "pending" (keeps the operator on) unless it is terminal. closed
-# is the only terminal status (task status schema: planned/open/in_progress/
-# totest/reopened/closed); an archived task is off-board intent. Everything else —
-# including totest awaiting close — is still backlog the operator must clear, so
-# "empty backlog (nothing actionable left) is the only idle state" (clarification-03).
-_TERMINAL_STATUSES = frozenset({"closed"})
+# T-0951: "pending" must answer "is there backlog the OPERATOR ITSELF can still
+# move" — not "is there any non-closed status at all". Counting a status
+# nothing can act on produces a respawn loop with zero state transitions: a
+# board holding only such statuses respawns an operator every
+# _SPAWN_COOLDOWN_SEC forever (each boot sees "PICKUP QUEUE: EMPTY", goes
+# drive=off, compact_exits, and 90s later the next one boots identical) — full
+# operator-boot context plus a paid /compact per cycle, indefinitely.
+# `graceful_exit.work_done` reads this SAME count (its operator done-signal),
+# so the fix is here, not duplicated there.
+#
+# The property, not a hand-list of exclusions (T-0990 tonight was exactly a
+# hand-listed set silently missing a status the runtime property would have
+# caught): a status is operator-pending iff it is dev-takeable
+# (`pickup.PICKUP_STATUSES` — a fresh dev CAN be dispatched onto it) OR
+# operator-gated (nothing dispatches it, but the OPERATOR ITSELF is the one
+# who moves it forward — today only `to_accept`, T-0944's "accept into
+# totest" step). `totest` (the HUMAN's queue) and `blocked_on_user` (waits on
+# the human) are neither, so they fall out on their own — no exclusion list to
+# keep in sync, and a brand-new status defaults to NOT pending (idle) rather
+# than to pending-forever (a respawn loop), which is the safe direction to
+# fail in. `pickup` already has no import of this module (checked; the
+# reverse import already exists, lazily, a few lines below), so this adds no
+# new coupling.
+_OPERATOR_GATED_STATUSES = frozenset({"to_accept"})
+
+
+def _is_operator_pending(status: str) -> bool:
+    from bot_squad_worker import pickup as _pickup
+    return status in _pickup.PICKUP_STATUSES or status in _OPERATOR_GATED_STATUSES
 
 
 def _enabled() -> bool:
@@ -167,8 +190,9 @@ def _save_state(cfg: Any, slug: str, state: dict) -> None:
 
 def count_pending_backlog(cfg: Any, slug: str) -> int:
     """Count board tasks that still need clearing — top-level ``backlog/*.md``
-    whose status is not terminal (``closed``) and which are not archived. The
-    ``_gc/`` archive subdir is a child dir, so a top-level glob never re-counts
+    whose status is operator-pending (see :func:`_is_operator_pending`: dev-
+    takeable or operator-gated) and which are not archived. The ``_gc/``
+    archive subdir is a child dir, so a top-level glob never re-counts
     already-archived tasks. An empty result is the operator's only idle state."""
     from bot_squad_worker import frontmatter as _fm
 
@@ -188,7 +212,7 @@ def count_pending_backlog(cfg: Any, slug: str) -> int:
         if str(meta.get("archived", "")).strip().lower() in ("true", "yes", "1", "on"):
             continue
         status = str(meta.get("status", "")).strip().lower()
-        if status in _TERMINAL_STATUSES:
+        if not _is_operator_pending(status):
             continue
         n += 1
     return n

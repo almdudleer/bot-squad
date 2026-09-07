@@ -73,10 +73,15 @@ def test_the_brief_is_the_same_text_the_redrive_injects(cfg_slug):
 
 def test_pending_backlog_counts_work_the_pickup_queue_does_not_offer(cfg_slug):
     """The gap this action closes, asserted directly: two pending tickets, one
-    takeable. A count cannot tell an operator which one to dispatch at."""
+    takeable. A count cannot tell an operator which one to dispatch at.
+
+    T-2 is ``to_accept`` (the operator's own queue, T-0944/T-0951) rather than
+    ``totest`` (the HUMAN's queue, which count_pending_backlog no longer
+    counts as operator-actionable pending work) — chosen so this still
+    illustrates "pending but not takeable" rather than "not pending at all"."""
     cfg, slug = cfg_slug
     _write_task(cfg, slug, "T-1", status="reopened", priority="P1")
-    _write_task(cfg, slug, "T-2", status="totest", priority="P1")
+    _write_task(cfg, slug, "T-2", status="to_accept", priority="P1")
 
     from bot_squad_worker import operator_redrive as ord_
     assert ord_.count_pending_backlog(cfg, slug) == 2

@@ -400,13 +400,20 @@ def evaluate(cfg: Any, slug: str, *, now_epoch: Optional[float] = None,
     ds = (q.get("drive_scope") if q else None) or {}
     takeable = len(q.get("pickup")) if q else 0
     residue = int(ds.get(_pickup.TRIAGE_IN_SCOPE_KEY) or 0)
+    # T-0951: a to_accept ticket is mechanically excluded from pickup (never a
+    # triage/sanity signal), so it is invisible to `residue` above — a board
+    # whose only remaining work is delivered-but-unaccepted deliveries would
+    # otherwise evaluate as STOP_DONE and post «ВСЁ СДЕЛАНО» over them.
+    awaiting_acceptance = int(ds.get("awaiting_acceptance") or 0)
     stop = resolve_stop_when(cfg, slug, drive)
 
     # The scope-side stop, per the predicate handed down by T-0829. The residue
-    # is what separates the two: an empty pickup band ALONE is not "done".
+    # (+ awaiting_acceptance) is what separates the two: an empty pickup band
+    # ALONE is not "done".
     scope_reason: Optional[str] = None
     if takeable == 0:
-        scope_reason = STOP_DONE if residue == 0 else STOP_TRIAGE_BLOCKED
+        scope_reason = (STOP_DONE if residue == 0 and awaiting_acceptance == 0
+                         else STOP_TRIAGE_BLOCKED)
 
     # spend_quota ADDS a terminus; it never removes the scope one (the stated
     # departure from D-0069 — see the module docstring). Budget-consumed wins
@@ -430,6 +437,7 @@ def evaluate(cfg: Any, slug: str, *, now_epoch: Optional[float] = None,
         "board_problem": board_problem,
         "takeable": takeable,
         "triage_in_scope": residue,
+        "awaiting_acceptance": awaiting_acceptance,
         "out_of_scope": int(ds.get("out_of_scope") or 0),
         "scope": ds.get("scope"),
         "scope_problem": ds.get("problem"),
@@ -516,11 +524,17 @@ def alert_text(rec: dict) -> str:
             f"и ничего не ждёт твоего решения."
         )
     elif reason == STOP_TRIAGE_BLOCKED:
-        verb, pron = _agree(rec["triage_in_scope"])
-        lines.append(
-            f"{slug}: взять нечего, но {_plural_task(rec['triage_in_scope'])} "
-            f"в scope {verb} твоего решения — драйв {pron} сам не возьмёт."
-        )
+        if rec.get("triage_in_scope"):
+            verb, pron = _agree(rec["triage_in_scope"])
+            lines.append(
+                f"{slug}: взять нечего, но {_plural_task(rec['triage_in_scope'])} "
+                f"в scope {verb} твоего решения — драйв {pron} сам не возьмёт."
+            )
+        else:
+            # T-0951: reachable now with triage_in_scope==0 — the only
+            # residue is delivered-but-unaccepted (to_accept) work, reported
+            # below via the awaiting_acceptance line.
+            lines.append(f"{slug}: взять нечего, но это не «всё сделано».")
     else:
         pct = stop.get("spend_pct")
         pct_s = f"{float(pct):.0f}%" if pct is not None else "?"
@@ -558,6 +572,14 @@ def alert_text(rec: dict) -> str:
         lines.append(
             f"Вне scope: {_plural_task(rec['out_of_scope'])} — "
             f"этот режим драйва {pron} не трогает."
+        )
+    if rec.get("awaiting_acceptance"):
+        # T-0951: named on its own line rather than folded into the triage
+        # sentence above — it is a DIFFERENT fact (delivered, not judged), and
+        # it is what can make STOP_TRIAGE_BLOCKED fire with triage_in_scope==0.
+        lines.append(
+            f"Доставлено, не принято оператором (to_accept): "
+            f"{_plural_task(rec['awaiting_acceptance'])}."
         )
     return "\n".join(lines)
 

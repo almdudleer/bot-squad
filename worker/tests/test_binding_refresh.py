@@ -150,6 +150,25 @@ def test_exited_totest_dev_is_archived(tmp_path, monkeypatch):
     assert meta["last_task_id"] == "T-0001"
 
 
+def test_exited_to_accept_dev_is_archived(tmp_path, monkeypatch):
+    """T-0951: to_accept is a dev's normal, clean delivery point since T-0944
+    (graceful_exit.DONE_STATUSES) — a dev that delivers into it and exits must
+    archive promptly, exactly like the pre-existing totest/closed cases, not
+    linger as an "exited-stale" zombie for up to 24h."""
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "to_accept")
+    p = _seed_session(cfg, "S-u-feat-dev-p1", window="feat-dev", task_id="T-0001")
+    # no live panes -> exited
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 1
+    meta = S._read_session_metadata(p)
+    assert str(meta["archived"]).lower() == "true"
+    assert meta["status"] == "suspended"
+    assert meta["task_id"] is None
+    assert meta["last_task_id"] == "T-0001"
+    assert meta["archive_reason"] == "auto-archive:exited-to_accept"
+
+
 def test_exited_in_progress_dev_is_not_archived(tmp_path):
     cfg = _make_cfg(tmp_path)
     _seed_task(cfg, "T-0001", "in_progress")

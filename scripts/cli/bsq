@@ -8334,28 +8334,43 @@ def _find_doc_file(slug: str, doc_id: str) -> Path | None:
 
 
 def _mutate_fm_list(path: Path, field: str, value: str, *, add: bool) -> None:
-    """Add/remove ``value`` from a YAML-frontmatter list field, idempotently."""
-    import yaml
+    """Add/remove ``value`` from a YAML-frontmatter list field, idempotently.
+
+    T-1049: parses AND serializes through the shared frontmatter module
+    (T-1047's third mirror), not a bare ``yaml.safe_load``/``safe_dump`` pair.
+    The bare dumper inherits none of what that module guarantees — no
+    flow-style list representer, so lists land in BLOCK form; no width pin
+    (T-1044), so a long scalar folds.
+
+    That mattered here more than the field being written, because
+    :func:`cmd_doc_link` calls this on the TICKET path (``related_docs``), so
+    it rewrites a ticket's WHOLE frontmatter. Measured on the API's identical
+    twin (``routes_docs._mutate_list_field``, same defect, fixed in the same
+    ticket): linking a doc folded the ticket's title and flipped its
+    ``session_history`` from flow to BLOCK — the field `bsq spawn`'s
+    expert-resume reads. A user action with nothing to do with sessions was
+    destroying the session record, silently.
+
+    Parser and dumper move together on purpose: the shared dumper writes a
+    timestamp UNQUOTED, and a bare ``yaml.safe_load`` would resolve that to a
+    ``datetime`` where the shared parser (which strips the timestamp resolver)
+    returns a ``str``. Splitting them changes a field's TYPE for every reader.
+    """
+    fm_mod = _load_frontmatter()
     text = path.read_text()
-    m = re.match(r"\A---\n(.*?)\n---\n(.*)\Z", text, re.DOTALL)
-    if not m:
+    parsed = fm_mod.parse_or_none(text)
+    if parsed is None:
         die(f"no frontmatter in {path}")
-    meta = yaml.safe_load(m.group(1)) or {}
-    if not isinstance(meta, dict):
-        meta = {}
-    body = m.group(2)
-    cur = meta.get(field) or []
-    if not isinstance(cur, list):
-        cur = [cur]
-    cur = [str(x) for x in cur]
+    meta, body = parsed
+    meta = dict(meta or {})
+    cur = fm_mod.as_list(meta.get(field))
     if add and value not in cur:
         cur.append(value)
     elif not add and value in cur:
         cur = [x for x in cur if x != value]
     meta[field] = cur
-    fm = yaml.safe_dump(meta, allow_unicode=True, sort_keys=False)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(f"---\n{fm}---\n\n{body.lstrip(chr(10))}")
+    tmp.write_text(fm_mod.dump(meta, body))
     os.replace(tmp, path)
 
 

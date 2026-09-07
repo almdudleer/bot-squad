@@ -29,6 +29,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app import artifact_nesting as AN
+from app.frontmatter import dump_frontmatter as _dump_frontmatter
+from app.frontmatter import parse_or_none as _parse_frontmatter
 from app.project_authz import require_project_member
 from app.routes_auth import require_auth
 
@@ -96,10 +98,13 @@ def _parse(path: Path) -> dict:
     meta: dict = {}
     body = text
     if m:
-        try:
-            meta = yaml.safe_load(m.group(1)) or {}
-        except yaml.YAMLError:
-            meta = {}
+        # T-1049: shared parser — it strips the timestamp resolver, so a
+        # `created:` written unquoted by the shared dumper comes back a STR.
+        # A bare yaml.safe_load returns a datetime instead; the endpoint still
+        # renders (FastAPI encodes it), so the cost is a silent type change for
+        # in-process readers, not a 500. Writer and readers move together.
+        parsed = _parse_frontmatter(text)
+        meta = dict(parsed[0]) if parsed else {}
         if not isinstance(meta, dict):
             meta = {}
         body = m.group(2).lstrip("\n")
@@ -136,9 +141,43 @@ def _find_doc(project_root: Path, doc_id: str) -> Path | None:
     return ref.path if ref is not None else None
 
 
+def _dump_frontmatter_doc(meta: dict, body: str) -> str:
+    """``---`` fenced frontmatter + body, via the shared dumper (T-1049)."""
+    return f"---\n{_dump_frontmatter(meta)}---\n\n{body.lstrip(chr(10))}"
+
+
 def _write_frontmatter(path: Path, meta: dict, body: str) -> None:
-    fm = yaml.safe_dump(meta, allow_unicode=True, sort_keys=False)
-    content = f"---\n{fm}---\n\n{body.lstrip(chr(10))}"
+    """T-1049: serialize through the SHARED dumper, not a bare ``yaml.safe_dump``.
+
+    The bare dumper inherits none of what ``app.frontmatter`` exists to
+    guarantee (T-0075): no flow-style list representer, so lists land in BLOCK
+    form that `scripts/cli/bsq`'s line-based reader sees as EMPTY; and no width
+    pin (T-1044), so a long scalar folds and that reader truncates it at the
+    fold.
+
+    This is not only a docs concern. :func:`_mutate_list_field` calls this on a
+    BACKLOG TICKET to add ``related_docs``, which rewrites that ticket's whole
+    frontmatter — measured on a real link: the ticket's ``session_history``
+    flipped flow -> block (invisible to `bsq`'s expert discovery) and its title
+    folded, purely as a side effect of linking a doc.
+
+    The readers in this module moved to the shared parser in the SAME change on
+    purpose, and the reason is a silent TYPE change rather than an outage. The
+    shared dumper writes ``created`` unquoted; a bare ``yaml.safe_load``
+    resolves that to a ``datetime`` where the shared parser (which strips the
+    timestamp resolver) returns a ``str``.
+
+    Measured on the writer-only mutant, so the claim is sized correctly: the
+    endpoints still return 200 and ``created`` still reaches the client as
+    ``'2026-09-07T08:28:24Z'`` — FastAPI's ``jsonable_encoder`` serializes a
+    datetime on the way out. What changes is the type every in-process reader
+    sees, and a bare ``json.dumps`` on it does raise. The hazard is therefore a
+    field that quietly changes type for consumers far from this module (cf.
+    ``routes_analytics`` L147's ``updated >= created``, which a mixed
+    str/datetime comparison would break, and whose L51 already documents this
+    class for backlog mds) — not a 500 here.
+    """
+    content = _dump_frontmatter_doc(meta, body)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(content, encoding="utf-8")
     os.replace(tmp, path)
@@ -274,18 +313,26 @@ def create_doc(slug: str, request: Request, body: NewDoc,
 
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    fm_lines = [
-        f"id: {doc_id}",
-        f"title: {json.dumps(title, ensure_ascii=False)}",
-        f"category: {category}",
-        "status: draft",
-        f"created: {now}",
-        "related_tickets: []",
-    ]
+    # T-1049: build the frontmatter as DATA and serialize it with the same
+    # shared dumper every other write in this module now uses. The previous
+    # hand-built f-string block was a THIRD frontmatter style in one file
+    # (beside `_write_frontmatter`'s bare safe_dump and the bare safe_load
+    # readers) and it escaped `title` with `json.dumps`, which is JSON quoting
+    # standing in for YAML quoting — close enough to work until it isn't.
+    # One writer means a title, a list or a value with a colon is quoted by the
+    # thing that also knows how to read it back.
+    meta: dict = {
+        "id": doc_id,
+        "title": title,
+        "category": category,
+        "status": "draft",
+        "created": now,
+        "related_tickets": [],
+    }
     if parent_doc_id is not None:
-        fm_lines.append(f"parent_doc_id: {parent_doc_id}")
-    fm = "\n".join(fm_lines)
-    content = f"---\n{fm}\n---\n\n# {title}\n\n(new {category} doc — T-0172 docs system)\n"
+        meta["parent_doc_id"] = parent_doc_id
+    body = f"# {title}\n\n(new {category} doc — T-0172 docs system)\n"
+    content = _dump_frontmatter_doc(meta, body)
     tmp = path.with_suffix(".md.tmp")
     tmp.write_text(content, encoding="utf-8")
     os.replace(tmp, path)
@@ -375,7 +422,10 @@ def _set_scalar_field(path: Path, field: str, value: str | None) -> None:
     m = _FRONTMATTER_RE.match(text)
     if not m:
         raise HTTPException(status_code=400, detail=f"no frontmatter in {path.name}")
-    meta = yaml.safe_load(m.group(1)) or {}
+    # T-1049: shared parser (see `_write_frontmatter` — writer and readers move
+    # together, or `created` silently changes type from str to datetime).
+    parsed = _parse_frontmatter(text)
+    meta = dict(parsed[0]) if parsed else {}
     if not isinstance(meta, dict):
         meta = {}
     body = m.group(2)
@@ -443,7 +493,10 @@ def _mutate_list_field(path: Path, field: str, value: str, *, add: bool) -> None
     m = _FRONTMATTER_RE.match(text)
     if not m:
         raise HTTPException(status_code=400, detail=f"no frontmatter in {path.name}")
-    meta = yaml.safe_load(m.group(1)) or {}
+    # T-1049: shared parser (see `_write_frontmatter` — writer and readers move
+    # together, or `created` silently changes type from str to datetime).
+    parsed = _parse_frontmatter(text)
+    meta = dict(parsed[0]) if parsed else {}
     if not isinstance(meta, dict):
         meta = {}
     body = m.group(2)

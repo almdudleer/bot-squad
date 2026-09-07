@@ -22,6 +22,55 @@ from typing import Iterator
 
 import yaml
 
+# T-1049: the shared frontmatter parser/writer, resolved as a SIBLING FILE.
+#
+# Three constraints meet here and only this shape satisfies all of them:
+#   1. This module is a BYTE-IDENTICAL mirror (api <-> worker, pinned by
+#      `worker/tests/test_module_mirrors.py`), so the same source text has to
+#      work in both packages.
+#   2. `frontmatter.py` is itself mirrored beside this file in every location,
+#      so "the copy next to me" is always the right copy.
+#   3. This file is also loaded BY PATH from outside either package —
+#      `scripts/cli/test_bsq_doc_id_derivation.py` loads the api copy with a
+#      SourceFileLoader to pin the CLI's id derivation against it, and there
+#      neither `app` nor `bot_squad_worker` is importable at all.
+#
+# A `try: from app... except ImportError: from bot_squad_worker...` dual import
+# satisfies (1) and (2) and FAILS (3) with ModuleNotFoundError on both branches
+# — measured: 16 reds in the scripts/cli suite. Path resolution has no package
+# dependency, which is why `scripts/cli/bsq::_load_frontmatter` (T-1047) already
+# does exactly this.
+#
+# Loaded lazily and cached under a path-derived key so the api and worker copies
+# cannot shadow one another in `sys.modules`.
+_FM_CACHE: dict = {}
+
+
+def _fm():
+    """The `frontmatter.py` sitting beside this file, whichever copy that is."""
+    path = Path(__file__).resolve().parent / "frontmatter.py"
+    key = str(path)
+    mod = _FM_CACHE.get(key)
+    if mod is None:
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+        name = "_shared_frontmatter_" + str(abs(hash(key)))
+        loader = SourceFileLoader(name, key)
+        spec = importlib.util.spec_from_loader(name, loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        _FM_CACHE[key] = mod
+    return mod
+
+
+def _dump_frontmatter(meta: dict) -> str:
+    return _fm().dump_frontmatter(meta)
+
+
+def _parse_frontmatter(text: str):
+    return _fm().parse_or_none(text)
+
+
 _FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n?(.*)\Z", re.DOTALL)
 
 # kinds, in the order children/listing prefer when surfacing summaries.
@@ -52,10 +101,12 @@ def _split_frontmatter(text: str) -> tuple[dict, str]:
     m = _FRONTMATTER_RE.match(text)
     if not m:
         return {}, text
-    try:
-        meta = yaml.safe_load(m.group(1)) or {}
-    except yaml.YAMLError:
-        meta = {}
+    # T-1049: shared parser. It strips the timestamp resolver, so a `created:`
+    # the shared dumper writes UNQUOTED comes back a STR — a bare safe_load
+    # returns a datetime instead, silently changing the type every downstream
+    # reader sees (and a bare json.dumps on it raises).
+    parsed = _parse_frontmatter(text)
+    meta = dict(parsed[0]) if parsed else {}
     if not isinstance(meta, dict):
         meta = {}
     return meta, m.group(2)
@@ -131,7 +182,9 @@ def with_frontmatter(meta: dict, body: str) -> str:
     same re-graft discipline as the task verbatim guard, T-0289)."""
     if not meta:
         return body
-    fm = yaml.safe_dump(meta, allow_unicode=True, sort_keys=False)
+    # T-1049: shared dumper — a bare safe_dump writes BLOCK lists and folds
+    # long scalars, both of which the board's line-based readers misread.
+    fm = _dump_frontmatter(meta)
     return f"---\n{fm}---\n\n{body.lstrip(chr(10))}"
 
 
@@ -250,7 +303,9 @@ def set_parent(ref: ArtifactRef, new_parent: str | None) -> None:
         meta.pop("parent_doc_id", None)
     else:
         meta["parent_doc_id"] = new_parent
-    fm = yaml.safe_dump(meta, allow_unicode=True, sort_keys=False)
+    # T-1049: shared dumper — a bare safe_dump writes BLOCK lists and folds
+    # long scalars, both of which the board's line-based readers misread.
+    fm = _dump_frontmatter(meta)
     out = f"---\n{fm}---\n\n{body.lstrip(chr(10))}"
     tmp = ref.path.with_suffix(ref.path.suffix + ".tmp")
     tmp.write_text(out, encoding="utf-8")

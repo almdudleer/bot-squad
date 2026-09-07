@@ -628,9 +628,81 @@ def worker_tasks_alive(cfg: Any, slug: str, task_ids: list[str], *,
         return False
 
 
+def board_pending(cfg: Any, slug: str) -> bool:
+    """True when the board has work the OPERATOR role could still move — the
+    input :func:`multi_role_plan`'s operator arm needs (T-0943).
+
+    Delegates to :mod:`operator_redrive`'s own pending count and pause flag
+    rather than re-deriving "is there work", so the drive nudge a multi-role
+    holder gets and the re-drive tick's own idle verdict can never disagree
+    about whether the board is moving.
+
+    Fails CLOSED (``False``): an unreadable board must degrade to "nothing to
+    nudge about", never to a nudge loop nobody can stop.
+    """
+    try:
+        from bot_squad_worker import operator_redrive as _ord
+        if _ord.is_paused(cfg, slug):
+            return False
+        return _ord.count_pending_backlog(cfg, slug) > 0
+    except Exception:  # noqa: BLE001 — a board read never breaks a tick
+        log.debug("idle_timeout: board_pending read failed for %s", slug,
+                  exc_info=True)
+        return False
+
+
+def multi_role_plan(*, roles, meta: dict | None, tasks_alive: bool,
+                    board_pending: bool, nudge_capped: bool = False,
+                    ) -> tuple[str | None, str | None]:
+    """``(plan, deciding_role)`` for a session holding MORE THAN ONE role — or
+    ``(None, None)`` when this table has nothing to say and the single-role
+    precedence in :func:`recycle_plan` applies unchanged.
+
+    T-0943. The stakeholder asked for the nudges to follow the ROLE, not the
+    session: «Та сессия, на которой висит роль оператора, должна получать
+    nudges, что движения по проекту нет, если drive on. Та сессия, на которой
+    висит роль девелопера по задаче, должна получать nudges по этой задаче».
+    A solo session holds all three, and its single derived role is
+    ``user-conversation`` — which :func:`recycle_plan` sends straight to
+    ``compact_exit``. So the session that IS the operator and IS the dev got
+    neither of the two nudges he named, and the board it was driving simply
+    stopped moving while the session waited to be recycled.
+
+    Deliberately NARROW, for cost (T-0948): it fires only for a holder of more
+    than one role, so every single-role session keeps its existing plan
+    byte-for-byte, and each arm needs REAL work to point at —
+
+      * ``operator`` + drive on + something actually pending on the board.
+        ``board_pending`` is an INPUT (this function stays pure, like
+        ``tasks_alive``): without it the arm would fire on every solo session
+        forever, since both the md ``drive`` field and the project drive block
+        default to ON, and «nudge forever» is the loop T-0948 exists to break.
+      * ``dev``/``teamlead`` + live bound work — T-0930's rule, reached through
+        the held role instead of the derived one.
+
+    ``nudge_capped`` short-circuits BOTH arms, so a multi-role holder that has
+    produced no progress across the escalation cap stops being nudged and falls
+    through to its ordinary plan. The dedicated-operator branch has no such cap
+    and is untouched here — widening a role's reach is not the place to change
+    what that role already does.
+    """
+    held = tuple(roles or ())
+    if len(held) < 2 or nudge_capped:
+        return None, None
+    if ("operator" in held and board_pending
+            and recycle_gate.operator_drive_on(role="operator", meta=meta)):
+        return PLAN_NUDGE, "operator"
+    if tasks_alive:
+        for r in held:
+            if r in WORKER_ROLES:
+                return PLAN_NUDGE, r
+    return None, None
+
+
 def recycle_plan(*, role: str | None, window: str | None, meta: dict | None,
                  attached: bool, tasks_alive: bool,
-                 nudge_capped: bool = False) -> str:
+                 nudge_capped: bool = False, roles=None,
+                 board_pending: bool = False) -> str:
     """THE per-role criterion (T-0945). Pure — no I/O, no clock — so the policy
     can be read and tested as a table rather than traced through the executor.
 
@@ -689,6 +761,16 @@ def recycle_plan(*, role: str | None, window: str | None, meta: dict | None,
     if not recycle_gate.role_exempt(r) and recycle_gate.user_session_exempt(
             role=r, window=window, meta=meta):
         return PLAN_STAY
+    # T-0943: a session holding SEVERAL roles is asked about each of them
+    # before the single derived role decides. ``roles=None`` (every caller
+    # before this ticket, and every single-role session) is a no-op — see
+    # :func:`multi_role_plan`.
+    multi, _deciding = multi_role_plan(
+        roles=roles, meta=meta, tasks_alive=tasks_alive,
+        board_pending=board_pending, nudge_capped=nudge_capped,
+    )
+    if multi is not None:
+        return multi
     if recycle_gate.role_exempt(r):                       # user-conversation
         return PLAN_COMPACT_EXIT if uc_exit_sec() > 0 else PLAN_STAY
     if r == "operator":
@@ -968,21 +1050,43 @@ def _maybe_recycle_leased(cfg: Any, slug: str, sid: str, row: dict, md_path,
                       exc_info=True)
 
     attached = recycle_gate.is_attached(pane, sid=sid, now=now)
+    # T-0943: the roles this session HOLDS. For every single-role session this
+    # is ``(role,)`` and nothing below changes; a solo session holds
+    # user-conversation + operator + dev at once, and the two nudge rules the
+    # stakeholder named have to reach it through the roles it holds rather than
+    # through the one role its window derives.
+    held = sessions.roles_of(meta, window=window)
     tasks_alive = False
-    if (role or "") in WORKER_ROLES:
+    worker_role = next((r for r in held if r in WORKER_ROLES), "")
+    if worker_role:
         tasks_alive = worker_tasks_alive(
-            cfg, slug, bound_task_ids(row, meta), role=role,
+            cfg, slug, bound_task_ids(row, meta), role=worker_role,
             initiative=(row.get("initiative") or meta.get("initiative")))
     # T-0948: the streak is re-checked against the ticket BEFORE the plan is
     # taken, so a session that reported progress since its last nudge has its
     # streak cleared and is never escalated on a stale count.
     _reset_streak_if_progressed(cfg, slug, row, meta, role=role)
     nudge_capped = worker_nudge_capped(meta, role)
+    # Only read the board for a multi-role holder that actually holds the
+    # operator role — every other session pays nothing for this ticket.
+    pending = (board_pending(cfg, slug)
+               if len(held) > 1 and "operator" in held else False)
     plan = recycle_plan(role=role, window=window, meta=meta, attached=attached,
-                        tasks_alive=tasks_alive, nudge_capped=nudge_capped)
+                        tasks_alive=tasks_alive, nudge_capped=nudge_capped,
+                        roles=held, board_pending=pending)
+    # Which HELD role produced a multi-role nudge — the cadence and the nudge
+    # text follow it, not the derived role. Without this a solo session driving
+    # the board would be nudged on the dev's 5-minute clock (`worker_nudge_sec`
+    # maps every non-coordinator role there), which is the T-0930 defect the
+    # operator's own 40-minute cadence exists to avoid.
+    _multi, nudge_role = multi_role_plan(
+        roles=held, meta=meta, tasks_alive=tasks_alive,
+        board_pending=pending, nudge_capped=nudge_capped,
+    )
+    acting_role = nudge_role or role
     if (plan == PLAN_HANDOFF_EXIT and nudge_capped and tasks_alive
             and idle_due(_idle_age(row, meta, user_home, now),
-                         worker_nudge_sec(role))):
+                         worker_nudge_sec(acting_role))):
         # Page the owner ONCE, at the moment the cap converts the nudge loop
         # into an exit — "N nudges produced no progress" is the fact nobody was
         # ever told before, and an exit nobody hears about is a silent give-up.
@@ -1077,11 +1181,11 @@ def _maybe_recycle_leased(cfg: Any, slug: str, sid: str, row: dict, md_path,
             if _maybe_compact_and_stay(cfg, slug, sid, row, meta, md_path, now,
                                        pane, user_home, role=role):
                 return True
-        if (role or "") == "operator":
+        if (acting_role or "") == "operator":
             return _maybe_keepalive_nudge(cfg, slug, sid, row, meta, md_path,
                                           now, pane, user_home)
         return _maybe_worker_nudge(cfg, slug, sid, row, meta, md_path, now,
-                                   pane, user_home, role=role)
+                                   pane, user_home, role=acting_role)
 
     # PLAN_COMPACT_EXIT / PLAN_HANDOFF_EXIT — decide whether to START this tick.
     # The deadline differs only by name: `uc_exit_sec()` defaults to

@@ -665,8 +665,27 @@ def tick(cfg: Any, slug: str) -> dict:
     # Continue-vs-respawn rides the T-0472 seam: a live operator means one is
     # already driving (continue — no-op, exactly one per project); none means the
     # prior incarnation exited (or never started), so re-drive spawns a fresh one.
+    #
+    # T-0943 — ASK WHO HOLDS THE ROLE, not who is named after it. The
+    # stakeholder: «поднять надо сначала просто бот-сквод сессию универсальную,
+    # если она не поднята, и драйв должен драйвить именно ее. А далее уже делать
+    # budding в оператора, на которого перейдет драйв, если надо
+    # оркестрировать». A project's only session HOLDS the operator role
+    # (``sessions.roles_of``), so the drive is already on a driver and minting
+    # a second one here is the duplicate T-0472 exists to prevent — it just
+    # arrives through a session this scan could not see.
+    #
+    # It does not leave that session un-driven: ``idle_timeout.multi_role_plan``
+    # gives an operator-role holder the drive nudge («nudges, что движения по
+    # проекту нет») while the board has pending work, which is the other half of
+    # the same ask. Suppressing the spawn without that would be a stall.
+    #
+    # The T-0937 SEAT gate below is NOT made redundant by this: the seat is also
+    # how a root that has no ``roles`` claim of its own (a hand-launched
+    # `user_session` pane) says it is driving, and it survives at operator TIER
+    # where this scan's preference rule would hand the board to a bud.
     from bot_squad_worker import dispatch as _dispatch
-    live = _dispatch.live_operator_sids(cfg, slug)
+    live = _dispatch.operator_role_holders(cfg, slug)
     if live:
         return {"action": "continue", "operator": live[0], "pending": pending}
 

@@ -127,6 +127,28 @@ def _initiative_stem(value: str | None) -> str:
     return normalize_id(v)
 
 
+def holds_dev_role(row: dict | None) -> bool:
+    """T-0943: does this session hold the ``dev`` role?
+
+    The gate this replaces asked ``row["role"] == "dev"`` — a single-valued
+    question that a solo session, whose derived role is ``user-conversation``,
+    always answered NO to. «Та сессия, на которой висит роль девелопера по
+    задаче, должна получать nudges по этой задаче»: a solo session holding a
+    ticket IS that session, and it was the one shape where nobody else was
+    watching the build either.
+
+    Reads the row's ``roles`` list (``sessions.roles_of``, carried on every
+    row since this ticket) and falls back to the single ``role`` for a row
+    built by an older producer — so a caller that has not been updated
+    degrades to the previous behaviour rather than to "nobody is a dev".
+    """
+    r = row or {}
+    roles = r.get("roles")
+    if not roles:
+        roles = [r.get("role")]
+    return "dev" in roles
+
+
 def _is_constant_team(row: dict, const_stems: set[str]) -> bool:
     """True when a session is a constant-team / queue-consumer (not a single-ticket dev).
 
@@ -423,7 +445,16 @@ def drift_check(cfg: Any, slug: str) -> dict:
     for row in rows:
         if row.get("status") != "active":
             continue
-        if row.get("role") != "dev":
+        # T-0943: the dev gate asks whether this session HOLDS the dev role,
+        # not whether dev is the only thing it is. «Та сессия, на которой висит
+        # роль девелопера по задаче, должна получать nudges по этой задаче» —
+        # a solo session holding a ticket is that session, and under the
+        # single-valued read it derived `user-conversation` and was skipped, so
+        # the one nudge that re-anchors a drifting build never reached the one
+        # shape where nobody else is watching the build at all. The `task_id`
+        # gate a few lines down still bounds this to a session actually holding
+        # a ticket, so a solo session with no binding is untouched.
+        if not holds_dev_role(row):
             continue  # coordinators self-manage; bound blast radius
         # T-0185: a constant-team / queue-consumer session has no single-ticket
         # DoD to re-anchor to, so a "you drifted from ticket X" nag is

@@ -873,6 +873,417 @@ def _role_of(
     )
 
 
+# ---------------------------------------------------------------------------
+# FLUID ROLES — a session holds a SET of roles, not one (T-0943)
+# ---------------------------------------------------------------------------
+#
+# Stakeholder (2026-08-31): «в целом роли не должны быть такими жесткими, типа
+# эта сессия четко оператор, эта сессия четко юзер [...] Если одна сессия
+# успевает все 3 [...] — окей, хорошо. Но если она перестает справляться с
+# чем-то, она должна просто ставить еще одну сессию как просто мозговой
+# процесс, и передавать ей одну из ролей. И в итоге сессии должны сообщать
+# просто эти роли системе, и система должна в ту сессию, которая выполняет
+# роль, давать правильный guidance.»
+#
+# And, after watching a solo session report doing nothing AS COMPLIANCE
+# (2026-09-07): «there's still a distinction between solo universal session
+# being treated as a separate user-session, while in fact it's user-session,
+# operator and dev all at once».
+#
+# THE DEFECT THIS CLOSES. Role was single-valued (:func:`_role_of`), so the one
+# session a project runs derived exactly ``user-conversation`` and read a
+# contract telling it to hand the building to a dev and the driving to an
+# operator — NEITHER OF WHICH EXISTED. It handed work to nobody, did nothing,
+# and reported that as correct behaviour. A solo session is not a narrower role
+# that escalates outward; it IS all three until it buds one off.
+#
+# WHAT THIS IS NOT: a fourth role. ``bot-squad`` below is the LABEL for holding
+# the three, computed from the set — adding a fourth role beside the three
+# would be the same mistake one level up.
+
+#: The three roles the stakeholder named, in the order he named them. Ordering
+#: is load-bearing: ``roles[0]`` is the PRIMARY (what a single-valued legacy
+#: reader sees, and which contract the brief serves in full).
+FLUID_ROLES = ("user-conversation", "operator", "dev")
+
+#: What a session alone in a project holds. Deliberately the same tuple — the
+#: solo shape is the composition of the three, not a set of its own.
+SOLO_ROLES = FLUID_ROLES
+
+#: Label rendered for a holder of the full set. HIS name for the state, agreed
+#: 2026-09-07: a **solo-session** is the row of the vocabulary table that holds
+#: operator + user-session + dev with nothing budded off. The other rows are
+#: named the same way, from the SET — see :func:`roles_label`.
+SOLO_ROLES_LABEL = "solo-session"
+
+#: The names the stakeholder gave the COMBINATIONS, 2026-09-07. The three roles
+#: stay the primitives; these name what holding a particular set IS, which is
+#: what a session and a human needed a word for.
+#:
+#:   solo-session       operator + user-session + dev   nothing budded
+#:   talking operator   operator + user-session         devs budded
+#:   working operator   operator + dev                  user-session budded
+#:   pure operator      operator                        both budded
+#:   attendant          user-session                    budded off
+#:   dev                dev                             budded off, one task
+#:
+#: (``user-session`` is his word for the role this code still spells
+#: ``user-conversation``; the enum rename is a separate migration and is NOT
+#: done here — the vocabulary is recorded so the two do not drift apart
+#: silently.)
+ROLE_SET_LABELS: dict[frozenset, str] = {
+    frozenset(SOLO_ROLES): SOLO_ROLES_LABEL,
+    frozenset({"operator", "user-conversation"}): "talking-operator",
+    frozenset({"operator", "dev"}): "working-operator",
+    frozenset({"operator"}): "pure-operator",
+    frozenset({"user-conversation"}): "attendant",
+}
+
+
+def declared_roles(meta: dict | None) -> tuple[str, ...] | None:
+    """The roles a session DECLARED on its md, or ``None`` when it declared none.
+
+    The ticket's own title is "sessions DECLARE roles to the system", so an
+    explicit ``roles:`` list is authoritative over every derivation below it.
+    Three states, and the third is why this returns ``None`` rather than an
+    empty tuple for "undeclared":
+
+      * key absent, or ``~`` (the registry's unset sentinel) → ``None``,
+        i.e. *undeclared* — :func:`roles_of` falls through to derivation.
+      * ``roles: []`` → ``()``, an explicit TOMBSTONE: this session holds
+        NOTHING. It suppresses derivation, which is the whole point — a
+        session that gave its last role away must not have the never-renamed
+        window silently re-mint it.
+      * a non-empty list → those roles, order preserved, duplicates dropped.
+
+    Accepts both a parsed list (pyyaml gives one for block AND inline style)
+    and a raw ``[a, b]`` string, so a hand-edited md reads the same.
+    """
+    m = meta or {}
+    if "roles" not in m:
+        return None
+    raw = m.get("roles")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s in ("", "~"):
+            return None
+        if s.startswith("[") and s.endswith("]"):
+            s = s[1:-1]
+        items = [x.strip().strip("'\"") for x in s.split(",")]
+    else:
+        try:
+            items = [str(x).strip() for x in raw]
+        except TypeError:
+            return None
+    return tuple(dict.fromkeys(x for x in items if x and x != "~"))
+
+
+def roles_of(
+    meta: dict | None,
+    *,
+    window: str | None = None,
+    task_id: str | None = None,
+    initiative: str | None = None,
+    extra_task_ids: list | None = None,
+    extra_initiatives: list | None = None,
+) -> tuple[str, ...]:
+    """Every role this session holds — the SSOT read for role-based routing.
+
+    Precedence:
+
+      1. an explicit ``roles:`` declaration (:func:`declared_roles`), including
+         the empty tombstone;
+      2. otherwise the single-valued role (:func:`_role_of`, which already
+         honours a ``bsq morph`` stamp over the window) — WIDENED to
+         :data:`SOLO_ROLES` when that role is ``user-conversation`` and the
+         window is the universal one. That widening is the ticket: the session
+         a project runs when it runs one holds user-conversation, operator AND
+         dev at once.
+
+    This returns the roles a session HOLDS (its capability), not the answer to
+    "who is the operator right now". Singleton resolution across the fleet —
+    a dedicated operator outranking the universal session's operator role — is
+    :func:`dispatch.operator_role_holders`' job, because it is a property of
+    the fleet and this is a pure read of one md.
+    """
+    declared = declared_roles(meta)
+    if declared is not None:
+        return declared
+    primary = _role_of(
+        meta,
+        window=window,
+        task_id=task_id,
+        initiative=initiative,
+        extra_task_ids=extra_task_ids,
+        extra_initiatives=extra_initiatives,
+    )
+    w = str(window if window is not None else (meta or {}).get("window") or "").strip()
+    if primary == "user-conversation" and _UNIVERSAL_WINDOW_RE.match(w):
+        return SOLO_ROLES
+    # T-0943: the window is a projection of the held SET («имя окна и сессии
+    # должно ставиться по комбинации ролей»), so it reads back as one. Only the
+    # combinations that HAVE a distinct name are here — `operator`,
+    # `user_session*`, `dev_*` already derive their single role above.
+    if primary == "operator":
+        combo = _ROLE_COMBO_WINDOWS.get(w.lower())
+        if combo:
+            return combo
+    return (primary,)
+
+
+def roles_label(roles) -> str:
+    """Render a held role SET as the one string a human (and a brief header)
+    reads — the stakeholder's own vocabulary (:data:`ROLE_SET_LABELS`), the bare
+    role for an unnamed single one, ``a+b`` for an unnamed combination, ``none``
+    for the tombstone.
+
+    Computed from the SET, so none of these can drift into being a fourth role
+    with semantics of its own: they are only ever what holding a particular
+    combination is CALLED.
+    """
+    r = tuple(roles or ())
+    if not r:
+        return "none"
+    named = ROLE_SET_LABELS.get(frozenset(r))
+    if named:
+        return named
+    if len(r) == 1:
+        return r[0]
+    return "+".join(r)
+
+
+#: Roles a session may DECLARE. The three primitives plus the coordinator /
+#: specialist roles the fleet already spawns — a declaration is a statement
+#: about work this session is doing, so it is bounded by the same enum
+#: everything else routes on.
+DECLARABLE_ROLES = ("user-conversation", "operator", "dev", "teamlead",
+                    "prod-teamlead", "qa", "routine-handler")
+
+
+#: T-0943 — the WINDOW NAME IS A PROJECTION OF THE ROLE SET, not a label
+#: assigned at birth. Stakeholder, 2026-09-07: «соответственно, имя окна и
+#: сессии должно ставиться по [комбинации ролей]».
+#:
+#: Only the combinations that need a NEW name are here. Three already have one
+#: and it is kept, because renaming an established name buys nothing and costs
+#: every mirror that matches it:
+#:   solo-session  -> ``universal_bsq_session``  (T-0964, and his own «просто
+#:                    бот-сквод сессия универсальная»)
+#:   pure operator -> ``operator``               (already the fleet's name, and
+#:                    it already derives the operator role)
+#:   routine-handler -> ``routine-handler``      (sideways from the three)
+#: Two combinations have NO name today and get one:
+ROLE_SET_WINDOWS: dict[frozenset, str] = {
+    frozenset(SOLO_ROLES): UNIVERSAL_WINDOW,
+    frozenset({"operator", "user-conversation"}): "talking_operator",
+    frozenset({"operator", "dev"}): "working_operator",
+    frozenset({"operator"}): "operator",
+    frozenset({"routine-handler"}): "routine-handler",
+}
+
+#: The read-back of the two new names. Both already derive role ``operator``
+#: (they end in ``operator``, which is what ``_OPERATOR_WINDOW_RE`` matches), so
+#: this only has to widen the SET — no mirror of ``_derive_role`` changes.
+_ROLE_COMBO_WINDOWS: dict[str, tuple[str, ...]] = {
+    "talking_operator": ("operator", "user-conversation"),
+    "talking-operator": ("operator", "user-conversation"),
+    "working_operator": ("operator", "dev"),
+    "working-operator": ("operator", "dev"),
+}
+
+
+def _client_attached(sid: str) -> bool:
+    """True when a human tmux client is looking at ``sid``'s pane.
+
+    Fails CLOSED (``True``) on any error: the cost of a wrong ``False`` is
+    renaming a window out from under him mid-sentence (T-1056), and the cost of
+    a wrong ``True`` is a deferred rename that a later declaration applies.
+    """
+    try:
+        from bot_squad_worker import autocompact as _ac
+        from bot_squad_worker import recycle_gate as _rg
+        pane = _ac._pane_for(sid)
+        if not pane:
+            return False          # no live pane at all — nothing to steal
+        return _rg.is_attached(pane, sid=sid)
+    except Exception:  # noqa: BLE001
+        log.debug("declare_roles: attach check failed for %s", sid, exc_info=True)
+        return True
+
+
+def window_for_roles(roles) -> str | None:
+    """The window name a session holding ``roles`` should carry, or ``None``
+    when the set alone does not determine one.
+
+    ``None`` is a real answer, not a gap, for the two shapes whose name carries
+    information the role set does not:
+
+      * **attendant** (``{user-conversation}``) — ``user_session_<who>``: which
+        USER it attends is not derivable from the set, and two attendants must
+        be tellable apart (:func:`user_facing_window` owns that choice).
+      * **dev** (``{dev}``) — ``dev_<feature-slug>``: named for the TASK.
+
+    Callers keep the current window on ``None`` rather than inventing one.
+    """
+    r = frozenset(roles or ())
+    if not r:
+        return None
+    return ROLE_SET_WINDOWS.get(r)
+
+
+def declare_roles(
+    cfg: Any,
+    slug: str,
+    sid: str,
+    *,
+    roles=None,
+    add=(),
+    drop=(),
+    claude_uuid: str | None = None,
+) -> dict:
+    """A session DECLARES the set of roles it holds. Returns
+    ``{ok, sid, roles, label, previous}``.
+
+    T-0943's title verb: «в итоге сессии должны сообщать просто эти роли
+    системе, и система должна в ту сессию, которая выполняет роль, давать
+    правильный guidance». Everything that routes by role reads
+    :func:`roles_of`, and this is the write side of it.
+
+    Exactly one of ``roles`` (replace the whole set) or ``add``/``drop`` (adjust
+    it) — an adjustment is resolved against what is on disk INSIDE the lock, so
+    two concurrent drops cannot each write a set computed from a stale read.
+
+    ``roles=[]`` writes the explicit tombstone: this session holds nothing.
+    That is a legitimate declaration, not an error — it is what a session says
+    after giving its last role away — and :func:`roles_of` honours it over the
+    window derivation, which is the whole reason the tombstone exists.
+
+    Guards:
+      * every name must be in :data:`DECLARABLE_ROLES`;
+      * TAKING ``operator`` is refused while a DEDICATED operator session other
+        than this one is live — the same T-0472 singleton `morph_session`
+        enforces, read from the same SSOT. Holding it as part of a wider set
+        (a solo-session) is not a second dispatcher and is not gated here:
+        that is exactly what ``dispatch.operator_role_holders``' preference
+        rule exists to resolve.
+
+    Writes only this session's own md, under :func:`session_md_lock`, re-read
+    inside the lock — role fields are the one thing on that file two ticks can
+    race for (T-0949).
+    """
+    from bot_squad_worker.actions import ActionError
+
+    if (roles is not None) and (add or drop):
+        raise ActionError(
+            "declare_roles: pass either the full set (roles) or an adjustment "
+            "(add/drop), not both — an adjustment is resolved against the md"
+        )
+    for name in list(roles or ()) + list(add) + list(drop):
+        if name not in DECLARABLE_ROLES:
+            raise ActionError(
+                f"declare_roles: unknown role {name!r} — one of "
+                f"{sorted(DECLARABLE_ROLES)}"
+            )
+
+    sessions_dir = Path(cfg.data_dir) / slug / "sessions"
+    md_path = _find_session_md(sessions_dir, sid, claude_uuid)
+    if md_path is None:
+        raise ActionError(
+            f"declare_roles: no session md for SID {sid!r} under {slug!r} — a "
+            f"declaration is a statement about a REGISTERED session (morph "
+            f"first if this pane has never been registered)"
+        )
+
+    with session_md_lock(md_path):
+        meta = _read_session_metadata(md_path) or {}
+        if not meta:
+            raise ActionError(
+                f"declare_roles: unreadable session metadata for SID {sid!r}")
+        previous = roles_of(meta)
+        if roles is not None:
+            new = tuple(dict.fromkeys(roles))
+        else:
+            new = tuple(x for x in previous if x not in set(drop))
+            new = new + tuple(x for x in add if x not in new)
+
+        taking_operator = "operator" in new and "operator" not in previous
+        if taking_operator:
+            from bot_squad_worker import dispatch as _dispatch
+            self_ids = {sid, meta.get("sid")}
+            others = [s for s in _dispatch.live_operator_sids(cfg, slug)
+                      if s not in self_ids]
+            if others:
+                raise ActionError(
+                    f"declare_roles: operator {others[0]} already drives "
+                    f"{slug!r} — exactly one dispatcher per project (T-0472); "
+                    f"route through it or let it recycle first"
+                )
+
+        meta["roles"] = list(new)
+        # Keep the single-valued mirror honest for every legacy reader: the
+        # primary role, or the `~` unset sentinel for a tombstone. Without
+        # this, `_role_of` would keep answering from a stale stamp and the
+        # declaration would only half-take (the T-0943 design's objection 7).
+        meta["role"] = new[0] if new else "~"
+
+        # T-0943: THE NAME IS A PROJECTION OF THE SET. «имя окна и сессии
+        # должно ставиться по [комбинации ролей]» — so a rename is part of this
+        # operation, not separate housekeeping, and it therefore follows
+        # BUDDING for free (the bud verbs call this). Two constraints from work
+        # that already landed: never rename a pane a human is attached to
+        # (T-1056), and compose with the resume-time rename rather than fight
+        # it (T-1054) — both are why the deferral is STAMPED rather than
+        # dropped.
+        target = window_for_roles(new)
+        current = str(meta.get("window") or _window_from_sid(sid) or "")
+        attached = _client_attached(sid)
+        rename_to = None
+        if target and target != current and not attached:
+            rename_to = target
+            meta.pop("pending_window", None)
+        elif target and target != current and attached:
+            meta["pending_window"] = target
+        elif target and target == current:
+            meta.pop("pending_window", None)
+        _write_session_metadata(md_path, meta, atomic=True)
+
+    out = {"ok": True, "sid": sid, "roles": list(new),
+           "label": roles_label(new), "previous": list(previous),
+           "renamed": False}
+    if target and target == current:
+        out["window"] = current
+    elif not target:
+        out["rename_reason"] = (
+            "no window name is derivable from this role set — the current one "
+            "carries information the set does not (which user, which task)")
+    elif rename_to is None:
+        out["pending_window"] = target
+        out["rename_reason"] = (
+            f"a client is attached to this pane — the rename to {target!r} is "
+            f"recorded and applies when the pane is free (T-1056: never steal a "
+            f"window from under him)")
+    else:
+        try:
+            ren = sync_session_name(cfg, slug, sid, rename_to)
+            out["renamed"] = bool(ren.get("ok"))
+            out["window"] = ren.get("name") or rename_to
+            if ren.get("new_sid"):
+                out["sid"] = ren["new_sid"]
+        except Exception as exc:  # noqa: BLE001 — the DECLARATION already took
+            log.exception("declare_roles: rename of %s to %r failed", sid,
+                          rename_to)
+            out["rename_reason"] = (
+                f"the roles were declared but the rename to {rename_to!r} "
+                f"failed ({exc}) — run `bsq team rename` yourself")
+
+    log.info("declare_roles[%s]: %s now holds %s (was %s)%s",
+             slug, sid, list(new) or "nothing", list(previous) or "nothing",
+             f" — renamed to {out.get('window')}" if out.get("renamed") else "")
+    return out
+
+
 def _cwd_matches_repo(
     cwd: Path | str | None,
     repo_path: Path,
@@ -1639,6 +2050,23 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 extra_task_ids=extra_task_ids,
                 extra_initiatives=extra_initiatives,
             ),
+            # T-0943: every role this session HOLDS, and the one string that
+            # names the set. ``role`` above stays the primary so every existing
+            # single-valued reader is untouched; a solo session now also reports
+            # the operator + dev roles it has been holding all along, which is
+            # what the routing and the nudges key on.
+            "roles": list(roles_of(
+                existing or {},
+                window=pane.window, task_id=task_id, initiative=initiative,
+                extra_task_ids=extra_task_ids,
+                extra_initiatives=extra_initiatives,
+            )),
+            "roles_label": roles_label(roles_of(
+                existing or {},
+                window=pane.window, task_id=task_id, initiative=initiative,
+                extra_task_ids=extra_task_ids,
+                extra_initiatives=extra_initiatives,
+            )),
             "window": pane.window,
             "cwd": pane.cwd,
             "started_at": started_at,
@@ -1777,6 +2205,14 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 "activity_at": None,
                 "active_at_prompt": False,
                 "role": md_role,
+                # T-0943: the held set, derived from the role this row already
+                # settled on — so a cwd-neutralized row (below) stays neutralized
+                # here too rather than re-deriving an elevated set from the md.
+                "roles": list(roles_of({**dict(meta), "role": md_role},
+                                       window=meta.get("window", ""))),
+                "roles_label": roles_label(roles_of(
+                    {**dict(meta), "role": md_role},
+                    window=meta.get("window", ""))),
                 # T-0220: True when an elevated window-derived role was
                 # neutralized because the persisted cwd didn't match the project.
                 "role_cwd_mismatch": role_cwd_mismatch,

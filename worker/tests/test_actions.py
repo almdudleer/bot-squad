@@ -151,6 +151,8 @@ def test_registry_lists_only_allowed_actions():
         # T-0466: per-session ~1h cache-window recycle postpone (bsq postpone).
         # T-0509 (M11/F11.2): user-session role morph (user→dev/teamlead/operator).
         "morph_session",
+        # T-0943: a session DECLARES the SET of roles it holds (bsq role).
+        "declare_roles",
         # Sessions polish batch (2026-05-13): unbind + archive lifecycle.
         "unbind_task", "unbind_initiative",
         # T-0324 (H2): safe primary re-home — the repair bind/unbind can't do.

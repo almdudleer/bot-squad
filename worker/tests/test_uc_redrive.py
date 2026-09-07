@@ -177,8 +177,13 @@ def test_idle_after_pressure_clears_redrives_exactly_once(cfg_slug, monkeypatch)
     assert len(dispatched) == 1
     name, params = dispatched[0]
     assert name == "ensure_user_conversation"
+    # T-1060: the re-drive marks itself as the SYSTEM waking an idle attendant,
+    # not the user messaging it — without that marker every nudge on this
+    # cadence resets the recycle clock and the attendant can never reach its
+    # idle deadline (so it never takes a deliberate suspend at all).
     assert params == {"slug": slug, "global_user_id": GID,
-                       "message_ref": "why no answer?"}
+                       "message_ref": "why no answer?",
+                       "system_wake": True}
 
     # Same unanswered message, immediately again — the next slot is not due.
     result2 = UC.check_project(cfg, slug, now=now + 1)

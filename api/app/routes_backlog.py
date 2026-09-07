@@ -610,6 +610,10 @@ async def set_task_context(
     `text` clears the section — allowed, since a session that has finished
     should be able to leave a clean final state, but it must be sent
     explicitly (a missing field is a 400, not a silent wipe).
+
+    T-1050: an optional `base_rev` in the payload CAS-guards the replace —
+    see `task_context_set`'s docstring. Omitted, this proxies exactly as
+    before.
     """
     _validate_task_id(task_id)
     if "text" not in payload:
@@ -621,13 +625,13 @@ async def set_task_context(
     backlog_dir = _backlog_dir(request, slug)
     _find_task_file(backlog_dir, task_id)
 
+    action_params = {"slug": slug, "task_id": task_id, "text": text}
+    if payload.get("base_rev") is not None:
+        action_params["base_rev"] = payload["base_rev"]
+
     client = request.app.state.worker_router.coordinator()
     try:
-        result = await client.call_action("task_context_set", {
-            "slug": slug,
-            "task_id": task_id,
-            "text": text,
-        })
+        result = await client.call_action("task_context_set", action_params)
     except WorkerError as e:
         raise HTTPException(status_code=502, detail=str(e))
     return result

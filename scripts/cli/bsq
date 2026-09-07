@@ -7929,6 +7929,10 @@ def cmd_ticket_status(args) -> None:
     print(f"  owner:      {fm.get('owner', '-')}")
     print(f"  initiative: {fm.get('initiative', '-')}")
     print(f"  updated:    {fm.get('updated', '-')}")
+    # T-1050: surfaced so a caller can `bsq ticket context <id> --file <f> \
+    # --base-rev <this>` without a separate read step.
+    if fm.get("context_rev") is not None:
+        print(f"  context_rev: {fm.get('context_rev')}")
     print(f"  file:       {path}")
 
 
@@ -8084,6 +8088,12 @@ def cmd_ticket_context(args) -> None:
     Text comes from `--file` or stdin rather than argv on purpose: a working
     area is paragraphs, and shell-quoting a multi-paragraph argument is exactly
     the friction that pushes people back to one-line notes.
+
+    T-1050: `--base-rev <N>` CAS-guards the replace — pass the `context_rev:`
+    you saw in the ticket's own frontmatter when you read it. A mismatch
+    refuses (naming what would be dropped) instead of silently overwriting an
+    intervening write, which is what a stale local copy does today with no
+    flag at all. Optional: omit it and this behaves exactly as before.
     """
     slug, tid, _path = resolve_ticket_ref(
         args.id, getattr(args, "slug", None), verb="ticket context")
@@ -8096,13 +8106,19 @@ def cmd_ticket_context(args) -> None:
             "(use --clear to empty the section)")
     if args.clear:
         text = ""
-    # T-0938: pass the SID so the ticket-update fan-out knows who wrote this and
-    # doesn't nudge you about your own Context write. `require_sid` is
-    # non-fatal here on purpose — a write from outside tmux still lands, it is
-    # just unattributed (and its author gets one redundant nudge).
-    res = post("task_context_set", {"slug": slug, "task_id": tid, "text": text,
-                                    "sid": _sid_or_blank(args.sid)})
-    print(f"context set on {slug}/{tid} ({res.get('bytes_written', 0)} bytes of body)")
+    params = {"slug": slug, "task_id": tid, "text": text,
+              # T-0938: pass the SID so the ticket-update fan-out knows who
+              # wrote this and doesn't nudge you about your own Context
+              # write. `require_sid` is non-fatal here on purpose — a write
+              # from outside tmux still lands, it is just unattributed (and
+              # its author gets one redundant nudge).
+              "sid": _sid_or_blank(args.sid)}
+    if args.base_rev is not None:
+        params["base_rev"] = args.base_rev
+    res = post("task_context_set", params)
+    rev = res.get("context_rev")
+    rev_s = f", now context_rev {rev}" if rev is not None else ""
+    print(f"context set on {slug}/{tid} ({res.get('bytes_written', 0)} bytes of body{rev_s})")
     _print_fanout(res, tid)
     _print_rollback(res)
 
@@ -9177,6 +9193,10 @@ def build_parser() -> argparse.ArgumentParser:
     tkc.add_argument("--file", help="read the new Context from this file (else stdin)")
     tkc.add_argument("--clear", action="store_true", help="empty the section")
     tkc.add_argument("--sid", help="override this session's SID")
+    tkc.add_argument("--base-rev", type=int, default=None,
+                     help="T-1050: CAS-guard — the context_rev you read this "
+                          "ticket's Context at; refuses (naming what would be "
+                          "dropped) if the live Context has moved on since")
     _tk_project_flag(tkc)
     tkc.set_defaults(func=cmd_ticket_context)
     tksm = tk_sub.add_parser(

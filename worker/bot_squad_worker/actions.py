@@ -3538,9 +3538,35 @@ def _snapshot_task_file(path: "Path", prev_text: str, action: str,
     return dest
 
 
+def _read_fm_int(fm_block: str, field: str) -> int:
+    """The integer value of a top-level ``field: N`` frontmatter line, or 0.
+
+    Deliberately NOT a full YAML parse: `field` here is always an
+    autoincrementing counter this module owns (see `rev_field` on
+    `_rewrite_task_body`), never free text, so a plain line match is exact and
+    carries none of T-1044/T-1047's folding/truncation hazard — those were
+    about long quoted scalars, not integers."""
+    m = re.search(rf"(?im)^{re.escape(field)}:\s*(-?\d+)\s*$", fm_block)
+    return int(m.group(1)) if m else 0
+
+
+def _set_fm_int_line(fm_lines: list[str], field: str, value: int) -> None:
+    """Set/append a ``field: N`` frontmatter line in place, mirroring the
+    existing ``updated:`` line-splice below rather than a second style."""
+    prefix = f"{field}:"
+    for i, ln in enumerate(fm_lines):
+        if ln.lstrip().startswith(prefix):
+            fm_lines[i] = f"{field}: {value}"
+            return
+    fm_lines.append(f"{field}: {value}")
+
+
 def _rewrite_task_body(action: str, slug: str, task_id: str, ts: str,
-                       transform, snapshot: bool = False
-                       ) -> tuple["Path", str, "Path | None"]:
+                       transform, snapshot: bool = False,
+                       rev_field: str | None = None,
+                       base_rev: int | None = None,
+                       conflict: "Callable[[int, str], Exception] | None" = None,
+                       ) -> tuple["Path", str, "Path | None", int | None]:
     """Read → `transform(body)` → atomically write one backlog task md.
 
     Factored out of `_action_task_progress_add`'s body rather than copied a
@@ -3555,6 +3581,20 @@ def _rewrite_task_body(action: str, slug: str, task_id: str, ts: str,
     the REPLACE writers, where a wrong target destroys authored text, and leave
     it off for the append-only ones, where the previous content is still there
     above what was appended.
+
+    T-1050: `rev_field`, given, names a frontmatter integer counter this
+    writer owns end-to-end — read INSIDE the lock (so the check and the write
+    it gates can never straddle a race), CAS-checked against `base_rev` when
+    the caller supplied one, and bumped by exactly 1 on every successful write
+    regardless of whether this call checked it, so the counter stays a true
+    revision count for whoever reads it next. `base_rev=None` skips the check
+    (a blind write, allowed) — see `_action_task_context_set` for why blind is
+    NOT refused here the way `work_state.write` refuses it. `conflict(cur_rev,
+    body)` builds the exception raised on mismatch; called, and raised, BEFORE
+    `transform` runs, so a refused write touches nothing on disk (extending
+    T-1045's "a refusal never partially applies" to this guard too).
+    Returns the fourth element as the counter's value after this write
+    (`None` when `rev_field` is unset).
     """
     cfg = _get_config()
     if cfg.projects.get(slug) is None:
@@ -3580,6 +3620,12 @@ def _rewrite_task_body(action: str, slug: str, task_id: str, ts: str,
         fm_block = fm_match.group(1)
         body = fm_match.group(2).lstrip("\n")
 
+        cur_rev = None
+        if rev_field is not None:
+            cur_rev = _read_fm_int(fm_block, rev_field)
+            if base_rev is not None and int(base_rev) != cur_rev:
+                raise conflict(cur_rev, body)
+
         try:
             new_body = transform(body)
         except ValueError as e:
@@ -3595,19 +3641,71 @@ def _rewrite_task_body(action: str, slug: str, task_id: str, ts: str,
         else:
             fm_lines.append(f"updated: {ts}")
 
+        new_rev = None
+        if rev_field is not None:
+            new_rev = (cur_rev or 0) + 1
+            _set_fm_int_line(fm_lines, rev_field, new_rev)
+
         atomic_write(path, f"---\n{chr(10).join(fm_lines)}\n---\n\n{new_body}")
-    return path, new_body, backup
+    return path, new_body, backup, new_rev
 
 
 _TASK_CONTEXT_SET_REQUIRED = {"slug", "task_id", "text"}
-_TASK_CONTEXT_SET_ALLOWED = _TASK_CONTEXT_SET_REQUIRED | {"sid"}
+_TASK_CONTEXT_SET_ALLOWED = _TASK_CONTEXT_SET_REQUIRED | {"sid", "base_rev"}
+
+#: T-1050: the frontmatter counter `task_context_set` owns end-to-end — see
+#: `_rewrite_task_body`'s `rev_field`.
+_CONTEXT_REV_FIELD = "context_rev"
+
+
+def _context_conflict(task_id: str, base_rev: int, cur_rev: int, body: str,
+                      new_text: str) -> ActionError:
+    """Build the refusal for a `task_context_set` CAS mismatch (T-1050).
+
+    This is the guard T-1045's heading check does not cover: a well-formed
+    but STALE local copy (every heading carried forward, just out of date)
+    overwrites an intervening write cleanly, because a heading-only check has
+    nothing to catch it on. A bare "the revision moved" tells a caller THAT
+    it lost a race but not WHAT it would lose by proceeding anyway — so this
+    also names the paragraphs the live Context holds that the caller's
+    replacement doesn't, the same way a human would eyeball the two copies.
+
+    The detector is coarse by design (whole-paragraph presence, not a diff):
+    `set_context` demotes `## ` to `### ` inside the section, so paragraph
+    boundaries (blank lines) survive a REPLACE far more reliably than any
+    finer-grained match would, and "coarse but concrete" beats a subtle
+    similarity score nobody can eyeball under a refusal message.
+    """
+    from bot_squad_worker.task_body import parse_body
+    old_ctx = parse_body(body).get("context", "")
+    paras = [p.strip() for p in re.split(r"\n\s*\n", old_ctx) if p.strip()]
+    dropped = [p for p in paras if p not in (new_text or "")]
+    if dropped:
+        preview = "\n---\n".join(
+            (p if len(p) <= 400 else p[:400] + "…") for p in dropped[:5])
+        more = f" (+{len(dropped) - 5} more)" if len(dropped) > 5 else ""
+        drop_msg = (
+            f"this write would drop {len(dropped)} paragraph(s) that are in the "
+            f"LIVE Context but not in your replacement text{more}:\n\n{preview}")
+    else:
+        drop_msg = (
+            "no paragraph in the live Context is obviously absent from your "
+            "replacement text, but the revision moved under you anyway — "
+            "something else changed; re-read before trusting your copy")
+    return ActionError(
+        f"task_context_set: {task_id}'s Context moved on — this write was based "
+        f"on context_rev {base_rev}, the live Context is now at context_rev "
+        f"{cur_rev}, so {drop_msg}. Re-read the live `## Context`, merge by hand "
+        f"into the CURRENT text, then write again with `bsq ticket context "
+        f"{task_id} --file <f> --base-rev {cur_rev}`."
+    )
 
 
 def _action_task_context_set(params: dict[str, Any]) -> dict[str, Any]:
     """REPLACE a task's `## Context` — the working area every session shares.
 
-    Required params: slug, task_id, text (optional: sid, for the audit line)
-    Returns: {ok, task_id, bytes_written, path, backup_path}
+    Required params: slug, task_id, text (optional: sid, base_rev)
+    Returns: {ok, task_id, bytes_written, path, backup_path, context_rev}
 
     Replaces rather than appends, deliberately: Context is meant to say what is
     TRUE NOW, so the next session reads a current state instead of
@@ -3621,6 +3719,23 @@ def _action_task_context_set(params: dict[str, Any]) -> dict[str, Any]:
     T-0891: the replaced bytes are snapshotted first and `backup_path` names
     where — `data/` is outside git, so this write had no undo at all until a
     mis-resolved id destroyed a closed ticket's authored sections for good.
+
+    T-1050: `base_rev`, given, CAS-guards the replace against a well-formed
+    but STALE local copy silently dropping an intervening write — the loss
+    shape T-1045's heading check does not cover (a stale body carries every
+    heading forward, it is just out of date). Mirrors `work_state.write`'s
+    `base_rev` pattern with ONE deliberate difference: `base_rev` here is
+    OPTIONAL, and a blind write (omitted) is never refused for that reason
+    alone. `work_state.write` refuses a blind write over non-empty content on
+    purpose, because THAT doc's failure mode was nobody writing at all and
+    the fix was to force every writer onto the CAS path. This verb's
+    ordinary case is different — it is called "dozens of times a night"
+    (T-1050 DoD 3) with no rev concept until now — so making `base_rev`
+    mandatory would refuse the healthy, single-holder write on day one, which
+    the ticket rules out explicitly ("a guard that fires on the normal case
+    is worse than none"). A caller opts into the protection by reading the
+    ticket's live `context_rev` and passing it back; a caller that doesn't
+    gets exactly today's behaviour.
     """
     extra = set(params) - _TASK_CONTEXT_SET_ALLOWED
     if extra:
@@ -3631,21 +3746,33 @@ def _action_task_context_set(params: dict[str, Any]) -> dict[str, Any]:
     text = params["text"]
     if not isinstance(text, str):
         raise ActionError("task_context_set: text must be a string")
+    base_rev = params.get("base_rev")
+    if base_rev is not None:
+        try:
+            base_rev = int(base_rev)
+        except (TypeError, ValueError):
+            raise ActionError(
+                f"task_context_set: base_rev must be an int, got {base_rev!r}")
 
     from datetime import datetime, timezone
     from bot_squad_worker.task_body import set_context
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    path, new_body, backup = _rewrite_task_body(
-        "task_context_set", params["slug"], params["task_id"], ts,
-        lambda body: set_context(body, text), snapshot=True)
-    _note_ticket_author(_get_config(), params["slug"], params["task_id"],
+    task_id = params["task_id"]
+    path, new_body, backup, new_rev = _rewrite_task_body(
+        "task_context_set", params["slug"], task_id, ts,
+        lambda body: set_context(body, text), snapshot=True,
+        rev_field=_CONTEXT_REV_FIELD, base_rev=base_rev,
+        conflict=lambda cur_rev, body: _context_conflict(
+            task_id, base_rev, cur_rev, body, text))
+    _note_ticket_author(_get_config(), params["slug"], task_id,
                         params.get("sid"), ("context",))
-    return {"ok": True, "task_id": params["task_id"],
+    return {"ok": True, "task_id": task_id,
             "bytes_written": len(new_body), "path": str(path),
             "backup_path": str(backup) if backup else None,
+            "context_rev": new_rev,
             "will_notify": _ticket_fanout_preview(
-                _get_config(), params["slug"], params["task_id"], params.get("sid"))}
+                _get_config(), params["slug"], task_id, params.get("sid"))}
 
 
 _TASK_SUMMARY_SET_REQUIRED = {"slug", "task_id", "text"}
@@ -3683,7 +3810,7 @@ def _action_task_summary_set(params: dict[str, Any]) -> dict[str, Any]:
     from bot_squad_worker.task_body import set_summary
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    path, new_body, backup = _rewrite_task_body(
+    path, new_body, backup, _rev = _rewrite_task_body(
         "task_summary_set", params["slug"], params["task_id"], ts,
         lambda body: set_summary(body, text), snapshot=True)
     _note_ticket_author(_get_config(), params["slug"], params["task_id"],

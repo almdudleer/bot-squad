@@ -188,6 +188,53 @@ def test_monitor_spec_grep_c_footgun_exempts_nonzero_exit_judge():
     assert trig.spec["judge"] == "nonzero_exit"
 
 
+# --- T-0989: a comment must not decide the footgun verdict either way -----
+#
+# cmd runs via _run_shell_probe's shell=True — the shell never executes a
+# `#`-comment, so text living in one is prose, not code. Neither direction
+# may key off it: a footgun only NAMED in a comment is not a real footgun,
+# and a guard (`|| true`) written only in a comment is not a real guard.
+
+@pytest.mark.parametrize("cmd", [
+    "journalctl -u x | grep -v boom  # avoid grep -c false positive",
+    "cat /var/log/x  # diff this against yesterday by hand if it breaches",
+    "echo 5  # cmp with the old threshold before raising it",
+])
+def test_monitor_spec_footgun_pattern_named_only_in_comment_is_allowed(cmd):
+    """The regression this ticket is about: a comment MENTIONING grep -c/
+    diff/cmp must not refuse a cmd whose actual (executed) code never uses
+    them — a comment is not code the shell runs."""
+    trig = R.MonitorTrigger(_spec(cmd=cmd))
+    assert trig.spec["cmd"] == cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "grep -c boom /var/log/x  # this is fine, trust me",
+    "diff a.txt b.txt  # guarded with || true",
+])
+def test_monitor_spec_footgun_guard_written_only_in_comment_still_refused(cmd):
+    """The other half: a REAL footgun must still be refused even when the
+    comment claims (or merely mentions) a guard — only code the shell
+    actually runs can satisfy the guard."""
+    with pytest.raises(R.RoutineError):
+        R.MonitorTrigger(_spec(cmd=cmd))
+
+
+def test_monitor_spec_footgun_quoted_hash_is_not_a_comment():
+    """A literal '#' inside quotes is data, not a comment marker — a real
+    guard after it must still be recognized."""
+    cmd = "grep -c '#boom' /var/log/x || true"
+    trig = R.MonitorTrigger(_spec(cmd=cmd))
+    assert trig.spec["cmd"] == cmd
+
+
+def test_monitor_spec_footgun_still_refused_with_no_comment_at_all():
+    """Comment-stripping must not accidentally swallow real code that has
+    no comment in it — the base T-0708 case stays refused."""
+    with pytest.raises(R.RoutineError):
+        R.MonitorTrigger(_spec(cmd="grep -c boom /var/log/x"))
+
+
 def test_monitor_spec_not_a_dict_raises():
     with pytest.raises(R.RoutineError):
         R.make_trigger("monitor", "cat /tmp/x")

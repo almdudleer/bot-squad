@@ -212,6 +212,52 @@ _EXIT_CODE_FOOTGUN_RE = re.compile(
 #: a guard that makes the pipeline's own exit code always 0, so the numeric
 #: judge sees stdout instead of erroring on the footgun command's exit code.
 _EXIT_CODE_GUARD_RE = re.compile(r'(?:\|\||;)\s*(?:true\b|exit\s+0\b)')
+
+
+def _strip_shell_comments(cmd: str) -> str:
+    """Drop unquoted ``#`` shell comments so a comment can't decide the
+    footgun verdict either way (T-0989): the guard scans ``cmd`` as text,
+    but the shell (``_run_shell_probe`` runs it with ``shell=True``) never
+    executes a comment, so prose living in one is not code — neither a
+    footgun mentioned only in a comment, nor a ``|| true`` guard written
+    only in one, is real. ``#`` only starts a comment at the start of a
+    word (unquoted, not escaped) per POSIX shell — ``grep '#'`` or a
+    literal ``\\#`` stay untouched.
+    """
+    out: list[str] = []
+    quote: Optional[str] = None
+    at_word_start = True
+    i, n = 0, len(cmd)
+    while i < n:
+        ch = cmd[i]
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+            at_word_start = False
+        elif ch == '\\' and i + 1 < n:
+            out.append(ch)
+            out.append(cmd[i + 1])
+            i += 1
+            at_word_start = False
+        elif ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            at_word_start = False
+        elif ch == '#' and at_word_start:
+            nl = cmd.find('\n', i)
+            if nl == -1:
+                break
+            out.append('\n')
+            i = nl
+            at_word_start = True
+        else:
+            out.append(ch)
+            at_word_start = ch.isspace() or ch in ';|&()'
+        i += 1
+    return ''.join(out)
+
+
 _MONITOR_SPEC_KEYS = frozenset({
     "probe", "cmd", "interval_s", "timeout_s", "judge", "threshold",
     "persist_s", "cooldown_s", "on_breach", "on_recover",
@@ -323,9 +369,14 @@ class MonitorTrigger(Trigger):
             # that same error path (evaluate_probe's exit_code!=0 branch runs
             # before the regex_match branch) and was silently exempt from this
             # guard.
+            # T-0989: matched against the comment-stripped cmd, not the raw
+            # string — the shell never runs a comment, so a footgun named
+            # only in one is not code, and a guard written only in one is
+            # not a guard.
+            code_only_cmd = _strip_shell_comments(cmd)
             if (judge != "nonzero_exit"
-                    and _EXIT_CODE_FOOTGUN_RE.search(cmd)
-                    and not _EXIT_CODE_GUARD_RE.search(cmd)):
+                    and _EXIT_CODE_FOOTGUN_RE.search(code_only_cmd)
+                    and not _EXIT_CODE_GUARD_RE.search(code_only_cmd)):
                 raise RoutineError(
                     f"monitor spec: cmd looks like it uses grep -c/-q, diff, "
                     f"or cmp under judge {judge} — those commands exit "

@@ -139,3 +139,59 @@ jobs:
       - name: Run the web suite (vitest)
         working-directory: web
         run: npm test
+
+  # T-0991: the FOURTH surface. `scripts/cli` holds the tests for `bsq` itself
+  # — the CLI every session in the fleet drives all day — and until this job
+  # existed NOTHING collected them: not this workflow, not `lint` (which runs
+  # named lint-script unit tests out of `api/tests`), not the worker or api
+  # arms (`testpaths = ["tests"]` in both pyproject.toml files is the whole
+  # mechanism), not a `verify-isolated` extract. T-0982 found it while asking
+  # its scope-4 question — "which DECLARED entrypoints does any certification
+  # actually EXECUTE?" — and measured 486 tests sitting outside every answer.
+  #
+  # MEASURED before wiring (T-0991, 2026-09-07, at 197e0b8):
+  #   `bsq verify-isolated --with-git` clone : 596 passed, 0 skipped, 87.5s
+  #   frozen `git archive` extract           : 590 passed, 3 failed, 3 skipped
+  #
+  # ⚠ THE EXTRACT ARM CANNOT CERTIFY THIS SURFACE, and that is why this job
+  # uses a plain checkout. All six differences above have ONE cause: a
+  # `git archive` extract carries no `.git`, and `scripts/cli` is git-dependent
+  # (33 sites shell out to `git`). The 3 skips self-declare; the 3 failures in
+  # test_t1027_build_api_namespace.py do not — `bsq._repo_root()` dies "not
+  # inside a git repo" and they read as ordinary red. Neither is a defect in
+  # the code. A GitHub checkout is a real repo, so the surface runs whole here.
+  #
+  # DEPS ARE MEASURED, NOT ASSUMED: the imports are stdlib + pytest, which is
+  # what the files look like — but running them in a pytest-only venv gives
+  # 27 failed / 569 passed, every one a `ModuleNotFoundError: No module named
+  # 'yaml'` from a transitive read of the backlog frontmatter. pytest+pyyaml
+  # is 596/596. No editable install of worker/ or api/ is needed; nothing in
+  # scripts/cli imports `bot_squad_worker` or `app`.
+  #
+  # `git` is on the runner image. The 10 `docker` call sites are stubbed by
+  # fixtures and never reach a daemon.
+  #
+  # THE JOB NAME `scripts-cli` IS LOAD-BEARING:
+  # worker/tests/test_certification_surface_census.py asserts this job exists
+  # and that a step here still names `scripts/cli`. Renaming or deleting it
+  # turns that census RED rather than quietly un-certifying the surface again
+  # — which is the entire lesson of T-0764/T-0982, where a correct two-ended
+  # forcing function shipped a regression through both ends because nobody
+  # executed either one.
+  scripts-cli:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bot_squad/dev
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the measured deps
+        run: |
+          pip install --upgrade pip
+          pip install pytest "pyyaml>=6"
+      - name: Run the scripts/cli suite
+        run: |
+          pytest -q scripts/cli

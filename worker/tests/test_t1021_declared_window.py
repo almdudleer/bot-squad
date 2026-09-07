@@ -238,6 +238,27 @@ def test_a_container_run_is_also_refused_by_a_build_window(tmp_path):
 # 4. THE SPECIMEN, WITH ITS OWN POSITIVE CONTROL — both directions
 # ---------------------------------------------------------------------------
 
+def _lease_legitimately_lapsed(tmp_path: Path, tok: str) -> bool:
+    """Did the arbiter's OWN record say this token's lease expired?
+
+    T-1043: a peer admitted because ``reap_declarations`` reclaimed a lapsed
+    lease is the arbiter working correctly; a peer admitted while the
+    declaration was still live is the defect. Both look identical from the
+    bare fact of admission — ``LANDED-IN-THE-POOL`` either way — so the two
+    events are told apart the only way that does not depend on wall clock:
+    reading ``reclaims.log``, which ``reap_declarations`` writes at the
+    moment it drops a lapsed record (fleet_slot.py, ``_log_reclaim``).
+    """
+    log = tmp_path / "reclaims.log"
+    if not log.exists():
+        return False
+    for line in log.read_text().splitlines():
+        entry = json.loads(line)
+        if entry.get("token") == tok and "lease expired" in entry.get("why", ""):
+            return True
+    return False
+
+
 @pytest.mark.parametrize("declared", [True, False])
 def test_the_gap_is_reserved_only_because_of_the_declaration(tmp_path, declared):
     """The exact scenario that produced this ticket, run with and without.
@@ -248,6 +269,21 @@ def test_the_gap_is_reserved_only_because_of_the_declaration(tmp_path, declared)
     the gap on 2026-09-06) reproduced here as a live control rather than quoted
     from a note. Without this arm the passing arm proves only that something
     refused the peer, not that the declaration is what refused it.
+
+    T-1043: on a saturated host the ``for_s=60`` lease taken at the top of
+    this test can lapse for real before the peer ever asks — that is the
+    arbiter reclaiming a dead lease correctly, not a defect, and the original
+    version of this test could not tell the two apart (confirmed: forcing a
+    real lapse reproduces the exact observed symptom — peer admitted,
+    ``LANDED-IN-THE-POOL``, stderr with no reclaim line — while
+    ``reclaims.log`` carries a ``lease expired`` entry for the token the
+    whole time). Two independent defenses, so the ``declared=True`` arm stops
+    depending on how slow the host was between here and the peer's request:
+    the lease is RENEWED right before the gap, so it races the few seconds a
+    subprocess spawn takes rather than the whole scenario's wall time; and if
+    the peer is admitted anyway, ``reclaims.log`` — the arbiter's own record,
+    not an inference from timing — says whether that was a legitimate reclaim
+    or a live-window breach before this test calls it a defect.
     """
     tok = _declare(tmp_path, for_s=60, note="two builds and the gap") if declared else None
 
@@ -259,6 +295,13 @@ def test_the_gap_is_reserved_only_because_of_the_declaration(tmp_path, declared)
     first = _slot(tmp_path, *argv, lane="p_owner")
     assert _admitted(first), first.stderr
 
+    if tok:
+        # Renew now, immediately before the gap, so the peer's request races
+        # a fresh 60s window rather than for_s minus whatever BUILD 1 and
+        # this scenario already spent under load.
+        ext = _slot(tmp_path, "extend", tok, "--for", "60", lane="p_owner")
+        assert ext.returncode == 0, ext.stderr
+
     # THE GAP. The owner is reading build 1's result and deciding; nothing of
     # its work is running. Confirm that from /proc, not from an assumption.
     snap = _status(tmp_path)
@@ -267,8 +310,16 @@ def test_the_gap_is_reserved_only_because_of_the_declaration(tmp_path, declared)
     peer = _peer_asks_for_the_pool(tmp_path, kind="build",
                                    note="peer build landing in the gap")
     if declared:
+        if _admitted(peer) and _lease_legitimately_lapsed(tmp_path, tok):
+            pytest.skip(
+                "the host stretched this scenario past the renewed 60s "
+                "lease and the arbiter correctly reclaimed it (reclaims.log "
+                f"confirms token {tok}) before the peer's request — not a "
+                "defect, see T-1043")
         assert not _admitted(peer), (
-            "THE DEFECT: a peer landed in the middle of a declared occupation. "
+            "THE DEFECT: a peer landed in the middle of a declared occupation "
+            "and reclaims.log records no lease expiry for this token — the "
+            "declaration was still live. "
             f"stdout={peer.stdout!r} stderr={peer.stderr[-400:]!r}")
         assert snap["build_held"] is True
     else:

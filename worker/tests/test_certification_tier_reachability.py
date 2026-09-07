@@ -65,10 +65,10 @@ ALWAYS_REACHABLE_TRIGGERS = {"push", "pull_request"}
 # ARM_NIGHTLY_JOBS in the census (a needle stops a job from being renamed/
 # gutted while claiming to still cover the surface).
 ARM_HOST_JOBS = {
-    "worker": "pytest worker/tests -q",
+    "worker": "worker/tests -q",
     "api": "bot-squad-api:latest",
     "web": "cd '$DEST/web' && npm test",
-    "scripts-cli": "pytest -q scripts/cli",
+    "scripts-cli": "-q scripts/cli",
     "shell-tests": ".githooks/test_commit_policy.sh",
 }
 

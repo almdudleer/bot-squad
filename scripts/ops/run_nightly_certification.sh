@@ -53,9 +53,35 @@ TMPDIR="/home/www/bot-squad/data/bot-squad/_jobs/nightly-certification/scratch"
 mkdir -p "$TMPDIR"
 export TMPDIR
 
+# Measured (T-1046, second bug found by the ACTUAL routine): pointing pytest
+# itself at the long TMPDIR above breaks the worker suite's own socket-based
+# tests. pytest's `tmp_path` fixture nests under
+# "$TMPDIR/pytest-of-<user>/pytest-<N>/<test-name><idx>/...", and several
+# worker tests (test_worker_census.py, test_jobs.py's heartbeat test) bind a
+# REAL AF_UNIX socket under `tmp_path/data/_sock/worker.sock` — Linux caps a
+# unix socket path (`sun_path`) at 108 bytes, and the long TMPDIR above blew
+# through it, one 8-test batch of them failed with `OSError: AF_UNIX path
+# too long`, none of them touched by this ticket's own change.
+# `--basetemp=<PYTEST_TMP>` skips pytest's "pytest-of-<user>/pytest-<N>/"
+# wrapper (saves ~35 bytes) and PYTEST_TMP itself is kept short and
+# PID-unique — short because a long base is the whole problem, unique
+# because a SHARED short path across concurrent runs would just trade this
+# bug for T-1004's exact hazard (a race on a fixed path). Verified short
+# enough: with PYTEST_TMP this length, the worst offending test's full
+# socket path measured 75 bytes, 33 under the 108 cap.
+PYTEST_TMP="/tmp/tmux-1000/t1046-$$"
+mkdir -p "$PYTEST_TMP"
+
 exec > >(tee -a "$LOG") 2>&1
 echo "=== T-1046 host-side nightly certification — run $RUN_ID ($(date -u -Iseconds)) ==="
 
+# `--with-git` is LOAD-BEARING beyond the T-1010 reason (scripts-cli needs a
+# real .git): TMPDIR above sits under /home/www/bot-squad, which is itself
+# inside an ambient git repo. `--with-git` takes the "materialise as a real
+# clone, the tree IS its own repo" branch, so verify-isolated's own ambient-
+# repo guard does not fire on it. Drop `--with-git` and it WILL refuse with
+# "AMBIENT GIT REPO" (confirmed by the R-0010 handler, 2026-09-07) — do not
+# remove this flag as a supposed simplification.
 MATERIALIZE_LOG="$(mktemp)"
 "$BSQ" verify-isolated --with-git --ref bot_squad/dev --keep -- true >"$MATERIALIZE_LOG" 2>&1
 cat "$MATERIALIZE_LOG"
@@ -74,7 +100,7 @@ fi
 # then exits nonzero as this user, and the script reported exit 1 on a run
 # where every arm had actually passed. A cleanup step that can silently
 # invert a green result is worse than no cleanup step.
-trap 'rm -rf "$DEST" 2>/dev/null || true' EXIT
+trap 'rm -rf "$DEST" "$PYTEST_TMP" 2>/dev/null || true' EXIT
 
 FAIL=0
 declare -A RESULT
@@ -93,7 +119,8 @@ run_arm() {
 # worker — the shared worker/.venv already carries pytest + pyyaml
 # (worker/pyproject.toml declares pyyaml; scripts/cli also rides this venv
 # below rather than a second install).
-run_arm worker bash -c "cd '$DEST' && '$REPO/worker/.venv/bin/python' -m pytest worker/tests -q"
+rm -rf "${PYTEST_TMP:?}"/* 2>/dev/null || true
+run_arm worker bash -c "cd '$DEST' && TMPDIR='$PYTEST_TMP' '$REPO/worker/.venv/bin/python' -m pytest --basetemp='$PYTEST_TMP' worker/tests -q"
 
 # api — inside the EXISTING bot-squad-api:latest image. Never rebuilt here:
 # a build is an exclusive, announced event (T-0994) and out of scope for an
@@ -131,7 +158,8 @@ run_arm web bash -c "cd '$DEST/web' && npm test"
 
 # scripts-cli — same venv as worker; T-0991 measured pytest+pyyaml as the
 # whole dependency set, no editable install of worker/ or api/ needed.
-run_arm scripts-cli bash -c "cd '$DEST' && '$REPO/worker/.venv/bin/python' -m pytest -q scripts/cli"
+rm -rf "${PYTEST_TMP:?}"/* 2>/dev/null || true
+run_arm scripts-cli bash -c "cd '$DEST' && TMPDIR='$PYTEST_TMP' '$REPO/worker/.venv/bin/python' -m pytest --basetemp='$PYTEST_TMP' -q scripts/cli"
 
 # shell-tests — T-1039's six scripts, no installs, plain bash from the
 # isolated checkout.

@@ -4681,7 +4681,17 @@ _TASK_NEW_ALLOWED = _TASK_NEW_REQUIRED | {
     # text) — it is NOT stored on the ticket; the existing task_new body stays
     # the stub placeholder, unchanged. `force` bypasses the gate outright.
     "verbatim", "force",
+    # T-1052: the filing session's own SID, client-supplied (mirrors how
+    # `bind_task` takes its caller's `sid` as a param — this worker has no
+    # other way to know who's on the other end of a coordinator-only call).
+    # Stamped as a create-time-only `filed_by` scalar, distinct from
+    # `session_history` (which means "worked it", stamped on bind/resume —
+    # see `_append_task_session_history` in sessions.py). Not in
+    # `_ALLOWED_UPDATE_KEYS` (markdown_writer.py): immutable after creation,
+    # like `provenance`/`owner`.
+    "filed_by",
 }
+_FILED_BY_RE = re.compile(r"^S-[A-Za-z0-9_.-]+$")
 _TASK_NEW_TITLE_MAX = 240
 # T-0577: dedupe gate tuning. A query with fewer than this many distinct
 # meaningful tokens (task_search.tokenize) is never flagged — mirrors
@@ -4811,7 +4821,7 @@ def _action_task_new(params: dict[str, Any]) -> dict[str, Any]:
     """Atomically allocate the next T-NNNN id and write a stub task md.
 
     Required params: slug, title
-    Optional params: initiative, priority, owner, verbatim, force
+    Optional params: initiative, priority, owner, verbatim, force, filed_by
     Returns: {ok: true, id: "T-NNNN", file_path: "<abs path>"}
 
     Allocation goes through the shared ``idalloc`` allocator (T-0174), which
@@ -4881,6 +4891,19 @@ def _action_task_new(params: dict[str, Any]) -> dict[str, Any]:
             prio_norm = _priority.normalize_priority(prio_raw)
         except ValueError as e:
             raise ActionError(f"task_new: {e}") from e
+
+    # T-1052: the filer never gets written into `session_history` (that field
+    # means "worked it", stamped only at bind/resume — see
+    # `_append_task_session_history`), so a session that filed a ticket and
+    # did real measurement on it is invisible to expert discovery. `filed_by`
+    # is a distinct, weaker signal: a single SID, stamped once at creation,
+    # never widened into meaning "worked it". Best-effort — a malformed value
+    # is dropped rather than failing the mint (the mint itself is the
+    # load-bearing thing here, not the forensic breadcrumb).
+    filed_by_raw = params.get("filed_by")
+    filed_by = str(filed_by_raw).strip() if filed_by_raw else ""
+    if filed_by and not _FILED_BY_RE.match(filed_by):
+        filed_by = ""
 
     cfg = _get_config()
     if cfg.projects.get(slug) is None:
@@ -4955,6 +4978,8 @@ def _action_task_new(params: dict[str, Any]) -> dict[str, Any]:
                 # we re-add it: both 'ui-polish' and 'ui-polish.md' → 'ui-polish.md'.
                 sval = f"{normalize_id(sval.strip())}.md"
             fm_lines.append(f"{opt_key}: {_yaml_quote(sval)}")
+    if filed_by:
+        fm_lines.append(f"filed_by: {filed_by}")
 
     body = (
         "## Verbatim request\n\n"

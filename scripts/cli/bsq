@@ -1818,6 +1818,12 @@ _EXPERT_W_SHARED = 6        # candidate already worked one of the new tickets
 _EXPERT_W_XREF = 5          # explicit `[[T-x]]` ticket-graph link (high signal)
 _EXPERT_W_MENTION = 3       # plain `T-x` mentioned in the new ticket's scope (medium)
 _EXPERT_W_INITIATIVE = 3    # same initiative
+# T-1052: candidate FILED one of the related tickets (task_new's `filed_by`).
+# Deliberately its own tier, not folded into `_EXPERT_W_SHARED` ("worked it"):
+# filing isn't the same claim as having worked the ticket (an operator can
+# file on someone else's behalf), so it's scored medium, never auto-resumed
+# on its own — offered, not assumed.
+_EXPERT_W_FILED = 4
 _EXPERT_W_KEYWORD = 1       # per overlapping title keyword (capped)
 _EXPERT_W_TOUCHED = 2       # per overlapping touched-file basename (capped)
 _EXPERT_KEYWORD_CAP = 3
@@ -1871,6 +1877,21 @@ def _ticket_session_history(slug: str, tid: str) -> set[str]:
     if not md:
         return set()
     return set(re.findall(r"S-[A-Za-z0-9_.-]+", str(md[0].get("session_history", "") or "")))
+
+
+def _ticket_filed_by(slug: str, tid: str) -> str | None:
+    """The SID `task_new` stamped as this ticket's filer (T-1052), if any.
+
+    Distinct from `_ticket_session_history`: a single scalar, stamped once at
+    creation, and NOT a claim that the filer worked the ticket — see
+    `_EXPERT_W_FILED`.
+    """
+    md = _ticket_md(slug, tid)
+    if not md:
+        return None
+    v = md[0].get("filed_by")
+    v = str(v).strip() if v else ""
+    return v or None
 
 
 def _title_keywords(title: str) -> set[str]:
@@ -2009,9 +2030,11 @@ def _find_expert(slug: str, sessions: list[dict], tickets: list[str],
 
     Expert discovery is primarily via the ticket-graph ∩ each related ticket's
     `session_history` (a session's live binding is released on archive, but the
-    ticket remembers who worked it). Initiative / title-keyword / files-touched /
-    recency refine the ranking. Pure over `sessions` (no worker calls) so it's
-    unit-testable + dry-runnable.
+    ticket remembers who worked it), plus (T-1052) `filed_by` — the SID that
+    minted the ticket via `task_new`, a weaker/separate signal since filing
+    isn't the same claim as having worked it. Initiative / title-keyword /
+    files-touched / recency refine the ranking. Pure over `sessions` (no
+    worker calls) so it's unit-testable + dry-runnable.
     """
     own = set(tickets)
     new_bodies = [_body_after_frontmatter(paths[t]) for t in tickets]
@@ -2027,6 +2050,9 @@ def _find_expert(slug: str, sessions: list[dict], tickets: list[str],
     related = _related_tickets(slug, own, xrefs, new_bodies)
     # SIDs that worked each related ticket (forensic, survives binding release).
     sh_by_ticket = {t: _ticket_session_history(slug, t) for t in related}
+    # T-1052: the SID (if any) that FILED each related ticket — a separate,
+    # weaker signal from session_history (see `_EXPERT_W_FILED`).
+    filed_by_ticket = {t: _ticket_filed_by(slug, t) for t in related}
     # Titles of related tickets, for the keyword signal on sessions that worked them.
     title_cache: dict[str, str] = {}
 
@@ -2066,6 +2092,17 @@ def _find_expert(slug: str, sessions: list[dict], tickets: list[str],
                 medium = True
             reasons.append(rsn)
 
+        # T-1052: filing a related ticket, on its own, is weaker evidence than
+        # having worked it (`worked` above) — an operator can file on someone
+        # else's behalf — so it's additive, medium-confidence, and only
+        # counted where `worked` didn't already establish a relationship.
+        filed = sorted(t for t in related if t not in worked
+                       and filed_by_ticket.get(t) == sid)
+        for t in filed:
+            score += _EXPERT_W_FILED
+            medium = True
+            reasons.append(f"filed {t}")
+
         shared_init = _session_initiatives(s) & new_inits
         if shared_init:
             score += _EXPERT_W_INITIATIVE
@@ -2086,7 +2123,7 @@ def _find_expert(slug: str, sessions: list[dict], tickets: list[str],
         cands.append({
             "sid": sid, "uuid": uuid, "status": s.get("status", ""),
             "archived": bool(s.get("archived")), "window": s.get("window", ""),
-            "tickets": sorted(set(worked) | cand_tickets),
+            "tickets": sorted(set(worked) | set(filed) | cand_tickets),
             "worked": sorted(worked), "score": score, "reasons": reasons,
             "_high": high, "_medium": medium, "_recency": _recency_key(s),
         })
@@ -8178,6 +8215,21 @@ def _stamp_provenance(text: str, value: str) -> str:
     return head + "\n".join(fm_lines) + close + rest
 
 
+def _stamp_filed_by(text: str, value: str) -> str:
+    """Insert/replace ``filed_by: <value>`` in a ticket's YAML frontmatter.
+
+    Fallback stamp for a pre-T-1052 worker that doesn't yet accept the param
+    — mirrors ``_stamp_provenance``.
+    """
+    m = re.match(r"\A(---\n)(.*?)(\n---\n)(.*)\Z", text, re.DOTALL)
+    if not m:
+        return f"---\nfiled_by: {value}\n---\n\n{text}"
+    head, fm, close, rest = m.groups()
+    fm_lines = [ln for ln in fm.split("\n") if not re.match(r"\s*filed_by\s*:", ln)]
+    fm_lines.append(f"filed_by: {value}")
+    return head + "\n".join(fm_lines) + close + rest
+
+
 def cmd_task_new(args) -> None:
     slug = resolve_slug()
     prov = (getattr(args, "provenance", None) or "").strip()
@@ -8216,23 +8268,35 @@ def cmd_task_new(args) -> None:
     verbatim = getattr(args, "verbatim", None)
     if verbatim:
         params["verbatim"] = verbatim
+    # T-1052: stamp the FILING session's own SID so it's not invisible to
+    # expert discovery (which reads `filed_by` as a signal distinct from
+    # `session_history` — filing isn't the same claim as "worked it"). Kept
+    # out of the base `params` dict, like `provenance`, so the deploy-skew
+    # fallback below can drop it cleanly for an unpatched worker.
+    filer_sid = my_sid()
     # T-0519: pass the (client-validated) provenance INTO the action so the
     # worker requires+validates+stamps it at the gate. Fall back to the legacy
     # post-hoc stamp for a pre-T-0519 worker that doesn't yet accept the param
     # (deploy-ordering shim — bsq is instant-live, the worker gate rides a
     # deploy; this keeps `bsq task new` working against both. Remove the
     # fallback once the gate is everywhere).
+    optimistic = {**params, "provenance": prov}
+    if filer_sid:
+        optimistic["filed_by"] = filer_sid
     try:
-        res = post("task_new", {**params, "provenance": prov}, fatal=False)
+        res = post("task_new", optimistic, fatal=False)
     except WorkerError as e:
         if "unexpected params" not in str(e):
             die(str(e))
         res = post("task_new", params)
         path = Path(res["file_path"])
         try:
-            _write_atomic(path, _stamp_provenance(path.read_text(encoding="utf-8"), prov))
+            text = _stamp_provenance(path.read_text(encoding="utf-8"), prov)
+            if filer_sid:
+                text = _stamp_filed_by(text, filer_sid)
+            _write_atomic(path, text)
         except OSError as ex:
-            die(f"task new: created {res['id']} but failed to stamp provenance: {ex}")
+            die(f"task new: created {res['id']} but failed to stamp provenance/filed_by: {ex}")
     # Say what was STORED when it differs from what was typed — a normalisation
     # the caller cannot see is the same silence this ticket is about, pointed
     # the other way.

@@ -293,6 +293,53 @@ def test_commit_hunks_patch_rejects_undeclared_files(repo):
     assert "b.txt" in (cm.stderr + cm.stdout)
 
 
+def test_commit_hunks_patch_rejects_a_declared_file_the_patch_does_not_touch(repo):
+    """T-1051: the mirror of the stray-file check above. Declaring MORE files
+    than the patch touches used to be silently accepted — the commit landed
+    only the patch's files and exited 0, reporting success while the extra
+    declared files were dropped with no error. Must refuse, naming what was
+    declared but not covered, exactly like the stray-file refusal above."""
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "a.txt").write_text("a\n")
+    (r / "b.txt").write_text("b\n")
+    (r / "c.txt").write_text("c\n")
+    _git(r, "add", "a.txt", "b.txt", "c.txt")
+    _git(r, "commit", "-q", "-m", "base")
+    patch = r / "one.patch"
+    patch.write_text("--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+a2\n")
+    cm = _run_bsq(r, bs, "commit", "--hunks", "--patch", str(patch),
+                  "--sid", "S-me-dev-p1", "-m", "a, b, and c",
+                  "a.txt", "b.txt", "c.txt")
+    assert cm.returncode != 0
+    out = cm.stderr + cm.stdout
+    assert "b.txt" in out and "c.txt" in out
+    # nothing committed — the failure must be total, not a partial commit of a.txt
+    assert _git(r, "log", "--format=%s").strip() == "base"
+
+
+def test_commit_hunks_patch_with_matching_declared_files_commits_all(repo):
+    """Healthy case for the new guard: declaring exactly the files the patch
+    touches — multi-file, the caller's actual use case from the T-1051
+    incident — must still commit everything and say so."""
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "a.txt").write_text("a\n")
+    (r / "b.txt").write_text("b\n")
+    _git(r, "add", "a.txt", "b.txt")
+    _git(r, "commit", "-q", "-m", "base")
+    patch = r / "two.patch"
+    patch.write_text(
+        "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+a2\n"
+        "diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-b\n+b2\n"
+    )
+    cm = _run_bsq(r, bs, "commit", "--hunks", "--patch", str(patch),
+                  "--sid", "S-me-dev-p1", "-m", "both",
+                  "a.txt", "b.txt")
+    assert cm.returncode == 0, cm.stderr + cm.stdout
+    assert "committed 2 file(s)" in cm.stdout
+    assert _git(r, "show", "HEAD:a.txt").strip() == "a2"
+    assert _git(r, "show", "HEAD:b.txt").strip() == "b2"
+
+
 def test_commit_hunks_patch_needs_a_real_patch_file(repo):
     r, bs = repo["repo"], repo["bot_squad"]
     (r / "a.txt").write_text("a\n")

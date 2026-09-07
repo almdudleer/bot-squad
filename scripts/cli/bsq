@@ -5885,6 +5885,17 @@ def _commit_hunks_from_patch(args, repo_root: str) -> None:
             die("commit --hunks --patch: the patch touches files you did not "
                 f"declare: {', '.join(stray)}\nEither add them to the command or "
                 "trim those hunks out of the patch.")
+        # T-1051: the check above only asked "is the patch WIDER than what you
+        # declared". A file you declared that the patch does NOT touch used to
+        # fall out silently — the commit still exits 0, built from `rels` alone,
+        # reporting success while quietly dropping it. Refuse instead (DoD 1's
+        # safer answer, same posture as the stray check above).
+        missing = [f for f in args.files if _repo_relpath(repo_root, f) not in rels]
+        if missing:
+            die("commit --hunks --patch: you declared files the patch does not "
+                f"touch: {', '.join(missing)}\nThe patch only covers: "
+                f"{', '.join(rels)}\nEither drop the undeclared files from the "
+                "command or fold their hunks into the patch.")
     redo = (f"bsq commit --hunks --ack --patch {args.patch} "
             f"-m {json.dumps(args.message)}")
     # T-0752: no baseline exists on this path (that's the point of --patch), so

@@ -732,24 +732,85 @@ def test_check_and_claim_is_atomic_under_a_real_race(tmp_path):
     simultaneously; a held fd cannot be double-taken." Here the equivalent
     property is that the reap-count-and-claim happens inside ONE registry
     flock. This test launches six wrappers with no stagger at all and has each
-    child SAMPLE how many peers are live alongside it, so the ceiling is
-    checked under genuine contention rather than in the serialised order the
-    other tests arrange.
+    child OBSERVE its peers, so the ceiling is checked under genuine
+    contention rather than in the serialised order the other tests arrange.
+
+    ⚠ **WHAT THIS TEST DOES NOT ESTABLISH.** It proves the pool ceiling is not
+    exceeded and that the check-and-claim is atomic. It says NOTHING about
+    whether gating reduces contention for real work — that is a wall-to-CPU
+    measurement on a real suite, not a property of this file, and this result
+    must not be reported alongside one. A green here is a correctness result
+    about the arbiter, and nothing else.
+
+    ⚠⚠ **REPAIRED 2026-09-07, AND THE DEFECT IS WORTH KEEPING WRITTEN DOWN.**
+    The anti-tautology assertion below used to be driven by a FIXED ONE-SECOND
+    SAMPLING WINDOW: each child took 20 samples at 50ms and then exited, so
+    "no two runs ever overlapped" got concluded whenever the host was slow
+    enough that a peer had not started yet. Host-load-dependent BY
+    CONSTRUCTION — and it is the SAME DEFECT as the timestamp-derived overlap
+    detection replaced elsewhere in this file the day before, surviving in
+    sampling form. It matters because it is silent in the dangerous
+    direction: a fixed window can only ever UNDER-report overlap, so the
+    CEILING assertion stays green while the assertion that gives it meaning
+    goes red for reasons that have nothing to do with the code.
+
+    The repair is the same one: the child WAITS to be joined, up to a generous
+    deadline, and exits the moment it sees a peer.
+
+    ⚠ **THE GENEROSITY IS ONLY FREE FOR A RACER THAT GETS JOINED**, which is
+    not every racer and was measured rather than assumed: six racers over two
+    slots do not pair up evenly, one ends up running alone, and on the first
+    green run it paid 61s of a 62s test. So a racer also stops once ANY racer
+    has recorded an overlap — the question the window exists to answer is
+    already answered, and waiting longer cannot change the verdict. The full
+    window survives only for the case where nothing has overlapped yet, which
+    is the genuinely RED path and the one worth being patient about.
+
+    ⚠⚠ **AND THE SHORT-CIRCUIT NEEDED A FLOOR, WHICH THE FIRST VERSION OF IT
+    DID NOT HAVE.** Exiting the instant the verdict was settled took the test
+    from 62s to 11s and simultaneously gutted it: five of six racers then
+    exited at 0.0s, and the CEILING assertion can only witness a violation
+    while children are alive TOGETHER. A runtime optimisation had quietly made
+    the strongest assertion in this test sample almost nothing. Each racer now
+    dwells at least a second before leaving, which keeps the pool genuinely
+    occupied while still costing seconds rather than a minute.
     """
     state = tmp_path / "slots"
     live = tmp_path / "live"
     live.mkdir(parents=True)
+    # Announce, then WAIT to be joined -- do not sample a fixed window and walk
+    # away. saw_peer is reported as its own field rather than left for the
+    # caller to infer from peak == 2: a verdict that has to be derived from a
+    # number is a verdict that gets derived wrongly later.
     code = (
         "import json,os,sys,time\n"
-        "d,out = sys.argv[1],sys.argv[2]\n"
+        "d,out,w = sys.argv[1],sys.argv[2],float(sys.argv[3])\n"
         "me = os.path.join(d, str(os.getpid()))\n"
         "open(me,'w').write('1')\n"
-        "peak = 0\n"
-        "for _ in range(20):\n"
-        "    peak = max(peak, len(os.listdir(d)))\n"
+        "flag = os.path.join(os.path.dirname(out), 'SEEN')\n"
+        "peak = 0; saw = False; t0 = time.time(); end = t0+w\n"
+        "while time.time() < end:\n"
+        "    n = len(os.listdir(d))\n"
+        "    peak = max(peak, n)\n"
+        "    if n >= 2:\n"
+        "        saw = True; open(flag,'w').write('1')\n"
+        # DWELL. Do not leave the moment the verdict is settled: the CEILING
+        # assertion can only observe a violation while children are alive
+        # together, so a racer that exits instantly reduces the exposure of
+        # the safety property to nearly nothing. Cutting the 61s tail is worth
+        # doing; cutting it to 0.0s quietly turned the strongest assertion
+        # here into one that barely samples. Stay a beat, then go.
+        "    if (saw or os.path.exists(flag)) and time.time()-t0 >= 1.0:\n"
+        "        break\n"
         "    time.sleep(0.05)\n"
         "os.unlink(me)\n"
-        "json.dump({'peak':peak}, open(out,'w'))\n"
+        # waited_s is recorded but NOT asserted on. It is the evidence that the
+        # old fixed 1.0s window was too short on THIS host, and asserting a
+        # bound on it would reintroduce exactly the host-dependence being
+        # removed. Measure it, report it, never gate on it.
+        "json.dump({'peak':peak,'saw_peer':saw,\n"
+        "           'waited_s':round(time.time()-t0,2),\n"
+        "           'peer_seen_by_someone':os.path.exists(flag)}, open(out,'w'))\n"
     )
     procs, outs = [], []
     for i in range(6):
@@ -757,20 +818,27 @@ def test_check_and_claim_is_atomic_under_a_real_race(tmp_path):
         outs.append(o)
         procs.append(_spawn_run(
             state, "containerless",
-            [sys.executable, "-c", code, str(live), str(o)],
-            note=f"racer{i}", cl_slots="2"))
+            [sys.executable, "-c", code, str(live), str(o), "60.0"],
+            note=f"racer{i}", cl_slots="2", wait=300))
     for pr in procs:
-        assert pr.wait(timeout=120) == 0, pr.stderr.read()
+        assert pr.wait(timeout=600) == 0, pr.stderr.read()
 
-    peaks = [json.loads(o.read_text())["peak"] for o in outs]
+    recs = [json.loads(o.read_text()) for o in outs]
+    peaks = [r["peak"] for r in recs]
+    # THE CEILING. The safety property, and the one that must never be relaxed
+    # to make the suite green.
     assert max(peaks) <= 2, (
         f"the pool was exceeded under a real race: peak concurrency {max(peaks)} "
         f"with a ceiling of 2 (per-child peaks {peaks})")
-    # And it is not trivially green because nothing ever ran concurrently:
-    # with six racers and two slots, somebody must have shared.
-    assert max(peaks) == 2, (
-        f"no two runs ever overlapped, so this did not test the ceiling "
-        f"(per-child peaks {peaks})")
+    # THE ANTI-TAUTOLOGY. A ceiling assertion is trivially satisfied by a run
+    # in which nothing was ever concurrent, so at least one racer must have
+    # OBSERVED a peer rather than merely failed to see one inside a window.
+    assert any(r["saw_peer"] for r in recs), (
+        f"no racer ever observed a peer, so the ceiling was never under "
+        f"pressure and this proves nothing about atomicity (per-child peaks "
+        f"{peaks}). Each racer waited up to 60s to be joined, so this is a "
+        f"REAL absence of overlap rather than a sampling artefact: either the "
+        f"pool granted one slot at a time, or the wrappers never got that far")
 
 
 def test_containerless_run_also_holds_a_legacy_stopgap_fd(tmp_path):

@@ -144,6 +144,17 @@ DECLARED_UNCOVERED = {
         "green T-1039's own DoD warned against. Stays a by-hand ops smoke "
         "test against a target host."
     ),
+    "scripts/hooks/test_bsq_protect_exec.py": (
+        "T-1068 (landed 2026-09-07, same night as this file's own T-1046 "
+        "certification-tier work) — tests for the new bsq-pretooluse-"
+        "protect-exec.py hook. Not wired into any nightly arm yet, and "
+        "wiring it is T-1068's own job the way T-0991/T-1039 each wired "
+        "their own new surfaces, not T-1046's to invent — it's a pytest "
+        "file (not a .sh), so it doesn't fit the shell-tests arm's "
+        "bash-script pattern as-is. Flagged here rather than left silently "
+        "orphaned so the census stays green and the hole stays auditable "
+        "until T-1068 wires it."
+    ),
 }
 
 

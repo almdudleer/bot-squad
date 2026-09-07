@@ -5502,3 +5502,123 @@ def test_find_suspended_uc_skips_archived_uuidless_and_other_windows(tmp_path,
     _write_uc_md(cfg, window, "S-new-p6", suspended_at="2026-08-31T02:00:00Z")
     assert A._find_suspended_user_conversation(
         cfg, "test-project", window) == "S-new-p6"
+
+
+# --- T-1054: resume() carries the STORED window verbatim — a pre-T-0964 -----
+# attendant never spawns fresh again (only resumes), so it kept the scary
+# `<gid>-user-conversation` name forever. T-0964's "self-heals on next
+# recycle" assumed recycle meant a fresh spawn; for this lane recycle IS
+# suspend+resume, exactly the path that never renamed. Measured live: p727
+# (watchrobot) suspended 2026-09-06, resumed 2026-09-07, still
+# `gu_dc8262…-user-conversation`.
+
+def test_ensure_user_conversation_resume_renames_legacy_window(tmp_path, monkeypatch):
+    """A resumed attendant whose SUSPENDED md still carries the legacy window
+    gets renamed to the current user-facing name, and the CALLER sees the
+    renamed sid — `bsq start`'s "started <sid>" must never print the scary
+    name once this fix runs."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    cfg, _repo = _make_sessions_cfg(tmp_path, monkeypatch)
+    window = "gu_a1b2c3-user-conversation"
+    _write_uc_md(cfg, window, "S-u-gu_a1b2c3-user-conversation-p3")
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda c, s, g: None)
+    monkeypatch.setattr(S, "resume",
+                        lambda c, s, sid, initial_prompt=None, **kw:
+                        {"ok": True, "sid": "S-u-gu_a1b2c3-user-conversation-p9"})
+
+    def boom_spawn(*a, **k):
+        raise AssertionError("must not spawn — resume already succeeded")
+    monkeypatch.setattr(S, "spawn", boom_spawn)
+    monkeypatch.setattr(S, "user_facing_window",
+                        lambda c, s, g: "universal_bsq_session")
+
+    renamed = {}
+    def fake_sync(c, s, sid, name):
+        renamed.update(sid=sid, name=name)
+        return {"ok": True, "sid": sid,
+                "new_sid": "S-u-universal_bsq_session-p9", "name": name}
+    monkeypatch.setattr(S, "sync_session_name", fake_sync)
+
+    result = A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_a1b2c3",
+        "message_ref": "are you there?",
+    })
+    assert result["ok"] is True and result["resumed"] is True
+    assert renamed == {"sid": "S-u-gu_a1b2c3-user-conversation-p9",
+                       "name": "universal_bsq_session"}
+    assert result["sid"] == "S-u-universal_bsq_session-p9"
+    assert "gu_a1b2c3" not in result["sid"]
+
+
+def test_ensure_user_conversation_resume_already_named_skips_rename(tmp_path,
+                                                                     monkeypatch):
+    """An attendant already on the T-0964 scheme (spawned after the fix,
+    suspended, now resumed) must NOT be churned through a rename on every
+    single resume — that would rotate its SID needlessly forever. Matched via
+    the T-0964 `global_user_id` field, same as `_find_suspended_user_conversation`
+    itself, since a post-fix spawn's window is no longer the legacy shape."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    cfg, _repo = _make_sessions_cfg(tmp_path, monkeypatch)
+    d = cfg.data_dir / "test-project" / "sessions"
+    d.mkdir(parents=True, exist_ok=True)
+    S._write_session_metadata(d / "S-u-universal_bsq_session-p3.md", {
+        "sid": "S-u-universal_bsq_session-p3", "status": "suspended",
+        "window": "universal_bsq_session", "cwd": "/x", "claude_uuid": "u-77",
+        "suspended_at": "2026-09-06T09:00:00Z", "role": "user-conversation",
+        "global_user_id": "gu_a1b2c3",
+    })
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda c, s, g: None)
+    monkeypatch.setattr(S, "resume",
+                        lambda c, s, sid, initial_prompt=None, **kw:
+                        {"ok": True, "sid": "S-u-universal_bsq_session-p9"})
+
+    def boom_spawn(*a, **k):
+        raise AssertionError("must not spawn — resume already succeeded")
+    monkeypatch.setattr(S, "spawn", boom_spawn)
+
+    def boom_sync(*a, **k):
+        raise AssertionError("must not rename an already user-facing window")
+    monkeypatch.setattr(S, "sync_session_name", boom_sync)
+
+    result = A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_a1b2c3",
+        "message_ref": "are you there?",
+    })
+    assert result["ok"] is True and result["resumed"] is True
+    assert result["sid"] == "S-u-universal_bsq_session-p9"
+
+
+def test_ensure_user_conversation_resume_rename_failure_keeps_resume(tmp_path,
+                                                                     monkeypatch):
+    """A rename hiccup (e.g. the pane vanished between resume and rename)
+    must not turn a successful resume into a failure or a duplicate spawn —
+    the attendant is already up, just still legacy-named."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    cfg, _repo = _make_sessions_cfg(tmp_path, monkeypatch)
+    window = "gu_a1b2c3-user-conversation"
+    _write_uc_md(cfg, window, "S-u-gu_a1b2c3-user-conversation-p3")
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda c, s, g: None)
+    monkeypatch.setattr(S, "resume",
+                        lambda c, s, sid, initial_prompt=None, **kw:
+                        {"ok": True, "sid": "S-u-gu_a1b2c3-user-conversation-p9"})
+
+    def boom_spawn(*a, **k):
+        raise AssertionError("must not spawn — resume already succeeded")
+    monkeypatch.setattr(S, "spawn", boom_spawn)
+
+    def boom_sync(*a, **k):
+        raise RuntimeError("no live pane found")
+    monkeypatch.setattr(S, "sync_session_name", boom_sync)
+
+    result = A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_a1b2c3",
+        "message_ref": "are you there?",
+    })
+    assert result["ok"] is True and result["resumed"] is True
+    assert result["sid"] == "S-u-gu_a1b2c3-user-conversation-p9"

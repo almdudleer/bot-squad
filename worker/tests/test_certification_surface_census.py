@@ -106,6 +106,7 @@ ARMS = {
     "scripts/hooks/test_derive_role.sh": "shell-tests",
     "scripts/hooks/test_worktree_guard.sh": "shell-tests",
     "scripts/ops/test_smoke_with_backoff.sh": "shell-tests",
+    "scripts/ops/test_run_from_copy.sh": "shell-tests",  # T-1067
 }
 
 # The `jobs:` key each arm must occupy in .github/workflows/nightly-suites.yml,

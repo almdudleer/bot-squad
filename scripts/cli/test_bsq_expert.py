@@ -33,13 +33,15 @@ def _backlog(tmp_path: Path) -> Path:
 
 def _write_ticket(tmp_path: Path, tid: str, *, title: str = "", body: str = "",
                   session_history: list[str] | None = None,
-                  initiative: str = "") -> Path:
+                  initiative: str = "", filed_by: str = "") -> Path:
     d = _backlog(tmp_path)
     sh = "[" + ", ".join(session_history or []) + "]"
     fm = [f"id: {tid}", f"title: {title or tid}", "status: closed",
           f"session_history: {sh}"]
     if initiative:
         fm.append(f"initiative: {initiative}")
+    if filed_by:
+        fm.append(f"filed_by: {filed_by}")
     p = d / f"{tid}-{(title or tid).lower().replace(' ', '-')[:30]}.md"
     p.write_text("---\n" + "\n".join(fm) + "\n---\n\n" + body + "\n")
     return p
@@ -134,6 +136,54 @@ def test_higher_overlap_ranks_first(tmp_path):
     ])
     assert ranked[0]["sid"] == "S-A"
     assert ranked[0]["confidence"] == "high"
+
+
+# ---------------------------------------------------------------------------
+# T-1052 — `filed_by`: the filer is a distinct, separate signal from
+# `session_history` ("worked it"), not an overload of it.
+# ---------------------------------------------------------------------------
+def test_filer_is_refused_without_filed_by_stamp(tmp_path):
+    # Live specimen, "before": a session filed this ticket (even measured it)
+    # but the ticket carries no session_history and no filed_by stamp — the
+    # pre-T-1052 task_new shape. Expert discovery has no signal to go on.
+    _write_ticket(tmp_path, "T-1049", title="load-bearing trap")
+    ranked = _find(tmp_path, ["T-1049"], [_session("S-p714")])
+    assert ranked == []
+
+
+def test_filer_is_offered_via_filed_by_stamp(tmp_path):
+    # Live specimen, "after": task_new stamps `filed_by` on the ticket it
+    # mints. The filing session, though it never had session_history
+    # written, now clears the expert scan and is resumable.
+    _write_ticket(tmp_path, "T-1049", title="load-bearing trap", filed_by="S-p714")
+    ranked = _find(tmp_path, ["T-1049"], [_session("S-p714")])
+    assert [c["sid"] for c in ranked] == ["S-p714"]
+    assert "filed T-1049" in ranked[0]["reasons"]
+    # Filing alone is not the same claim as having worked it (DoD #1) —
+    # never auto-resume-eligible on this signal by itself.
+    assert ranked[0]["confidence"] == "medium"
+
+
+def test_healthy_case_unrelated_filer_still_refused(tmp_path):
+    # DoD #3: a session with no relationship to the ticket — including not
+    # having filed it — must still be refused. `filed_by` must not widen
+    # into "offer everyone".
+    _write_ticket(tmp_path, "T-1049", title="load-bearing trap",
+                  filed_by="S-someone-else")
+    ranked = _find(tmp_path, ["T-1049"], [_session("S-p714")])
+    assert ranked == []
+
+
+def test_filed_by_does_not_duplicate_a_worked_reason(tmp_path):
+    # A session that both worked (session_history) AND filed a ticket keeps
+    # the HIGH "worked" reason unchanged — filing the same ticket you already
+    # worked adds no second, weaker reason for it.
+    _write_ticket(tmp_path, "T-100", title="prior", session_history=["S-A"],
+                  filed_by="S-A")
+    _write_ticket(tmp_path, "T-200", body="Related: [[T-100]].")
+    ranked = _find(tmp_path, ["T-200"], [_session("S-A")])
+    assert ranked[0]["confidence"] == "high"
+    assert not any(r.startswith("filed ") for r in ranked[0]["reasons"])
 
 
 # ---------------------------------------------------------------------------

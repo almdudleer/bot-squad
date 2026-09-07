@@ -532,11 +532,18 @@ def test_poll_ok_probe_resets_consecutive_errors():
 
 
 def test_poll_monitor_broken_alerts_once_at_bound():
+    """T-0984 kept this test and CHANGED WHAT IT CLAIMS. It used to pin
+    "alert once, then never again", which was the defect: a dead instrument
+    said nothing after its single alert and read as healthy forever. What is
+    pinned now is only "not every tick" — the next alert is gated by
+    `repeat_s`, and its arrival is pinned by the sibling test below. A
+    still-green test whose comment argues for the replaced design is how a
+    fixed defect gets re-introduced."""
     trig = R.MonitorTrigger(_spec(threshold=10))
     st: dict = {"consecutive_errors": R.MONITOR_ERROR_BOUND - 1}
     ev = _poll(trig, T0, st, ok=False, error="timeout")
     assert ev is not None and ev.kind == "monitor_broken"
-    # past the bound: silent (alert once, not every 5s)
+    # 5s later is inside repeat_s (max(cooldown_s=0, BOUND * interval_s=5))
     ev2 = _poll(trig, T0 + timedelta(seconds=5), st, ok=False, error="timeout")
     assert ev2 is None
     assert st["consecutive_errors"] == R.MONITOR_ERROR_BOUND + 1
@@ -1439,7 +1446,13 @@ def test_monitor_broken_pages_once_urgent(mcfg, dm_capture):
     dm = dm_capture[0]
     assert dm["urgent"] is True
     assert "BROKEN" in dm["message"] and rid in dm["message"]
-    assert str(R.MONITOR_ERROR_BOUND) in dm["message"]
+    # T-0984: this used to assert only that the number 10 appeared, which the
+    # new wording still satisfies BY ACCIDENT (10 of the last 10). Pin the
+    # claim the message makes, not a substring that happens to survive: the
+    # count is over a WINDOW and the alert says it will repeat.
+    assert "of its last" in dm["message"] and "probes failed" in dm["message"]
+    assert "Repeating while it holds" in dm["message"]
+    assert "consecutive" not in dm["message"]
 
 
 def test_monitor_broken_alert_failure_never_kills_the_sweep(mcfg, tmp_path,
@@ -1665,13 +1678,23 @@ def test_list_routines_surfaces_error_state_T0899(mcfg, tmp_path):
     assert row["broken"] is True
     assert row["last_value"] == 5  # still preserved, still flagged stale
 
-    # recovers -> broken clears, error count resets, fresh value replaces it
+    # recovers -> error count resets and a fresh value replaces the stale one.
+    # T-0984 CHANGED THE THIRD CLAIM ON PURPOSE and it is the point of the
+    # ticket: `broken` does NOT clear on one good probe any more. Ten of the
+    # last twelve probes failed, and that is what a blind instrument looks
+    # like; letting a single success erase it is exactly how a routine blind 9
+    # ticks in 10 rendered a clean row on the tick that worked. It clears when
+    # good probes have DISPLACED the bad ones out of the window — pinned by
+    # test_broken_clears_once_good_probes_displace_the_bad_T0984 below, because
+    # a red state that can never reset gets muted, and a muted watchdog does
+    # not watch.
     metric.write_text("6")
     R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=5 * (R.MONITOR_ERROR_BOUND + 1)))
     row = {r["id"]: r for r in R.list_routines(cfg, slug)}[rid]["monitor"]
     assert row["consecutive_errors"] == 0
-    assert row["broken"] is False
     assert row["last_value"] == 6
+    assert row["broken"] is True
+    assert row["window_errors"] == R.MONITOR_ERROR_BOUND
 
 
 def test_list_routines_carries_the_error_REASON_from_the_first_error_T0999(
@@ -1757,3 +1780,285 @@ def test_list_routines_schedule_rows_unchanged(mcfg):
     row = {r["id"]: r for r in R.list_routines(cfg, slug)}[rid]
     assert "monitor" not in row and "muted_until" not in row
     assert row["schedule"] == "0 9 * * *"
+
+
+# --- T-0984: monitor_broken fires on an error RATE, not a consecutive run ----
+#
+# The defect these pin, measured before the fix over a 1000-tick sweep driving
+# this same state machine: a probe blind up to and INCLUDING 90% of ticks fired
+# monitor_broken ZERO times, forever, because any single success reset the
+# consecutive count and the fire condition needed a run of 10. A 90.9%-blind
+# one fired 91 times and a permanently dead one fired once and then went quiet.
+# Loudness was not monotonic in badness, and 90%-blind was byte-identical to
+# healthy on the notify channel.
+
+
+def _broken_fires(trig, st, blind_period, ticks, interval_s=5, start=T0):
+    """Poll `ticks` times with 1 success every `blind_period` (0 = never fail).
+
+    Returns the number of monitor_broken events. `blind_period` >= ticks means
+    the instrument is dead for the whole run.
+    """
+    n = 0
+    for i in range(ticks):
+        now = start + timedelta(seconds=interval_s * i)
+        if blind_period == 0:
+            ev = _poll(trig, now, st, output="5")
+        elif i % blind_period == blind_period - 1:
+            ev = _poll(trig, now, st, output="5")          # the one that works
+        else:
+            ev = _poll(trig, now, st, ok=False, error="timeout")
+        if ev is not None and ev.kind == "monitor_broken":
+            n += 1
+    return n
+
+
+def test_poll_monitor_broken_repeats_after_the_repeat_interval_T0984():
+    """A dead instrument must keep saying so. One alert that scrolls past
+    leaves a system dead for hours looking exactly like one that is fine."""
+    spec = _spec(threshold=10, interval_s=5, cooldown_s=0)
+    trig, st = R.MonitorTrigger(spec), {}
+    repeat_s = R.MONITOR_ERROR_BOUND * 5          # cooldown_s=0 -> the floor
+    fires = _broken_fires(trig, st, blind_period=10 ** 6, ticks=60)
+    # 60 ticks x 5s = 300s; first at the bound (t=45s), then every repeat_s
+    assert fires >= 5, f"a permanently dead probe alerted only {fires} times"
+    assert fires <= 60 // (repeat_s // 5) + 1, "alerting faster than the floor"
+
+
+def test_poll_monitor_broken_fires_when_blind_9_ticks_in_10_T0984():
+    """THE regression. Pre-fix this was 0 fires over any number of ticks."""
+    trig, st = R.MonitorTrigger(_spec(threshold=10, interval_s=5)), {}
+    fires = _broken_fires(trig, st, blind_period=10, ticks=200)
+    assert fires > 0, ("a routine blind 9 ticks in 10 never alerted — the "
+                       "consecutive-run bound is back")
+
+
+def test_poll_monitor_broken_stays_quiet_on_a_healthy_routine_T0984():
+    """The healthy control. A fix that alerts on a correct system is the
+    T-0708 shape: dropping an `|| echo 0` mask once parked a CORRECT system in
+    permanent error, and the healthy arm is what rejects that."""
+    trig, st = R.MonitorTrigger(_spec(threshold=10, interval_s=5)), {}
+    assert _broken_fires(trig, st, blind_period=0, ticks=200) == 0
+    assert st["consecutive_errors"] == 0
+    assert sum(st["probe_window"]) == 0
+
+
+def test_monitor_broken_loudness_is_monotonic_in_blindness_T0984():
+    """THE ACCEPTANCE PROPERTY: a worse routine is never quieter than a better
+    one. Pre-fix this failed hard — 90.0% blind gave 0 fires while 90.9% gave
+    91 and 99.9% gave 1, so the curve fell on both sides of a narrow band."""
+    curve = []
+    for period in (0, 2, 3, 5, 8, 10, 11, 12, 15, 20, 50, 10 ** 6):
+        trig, st = R.MonitorTrigger(_spec(threshold=10, interval_s=5)), {}
+        blind = 0.0 if period == 0 else (period - 1) / period
+        curve.append((blind, _broken_fires(trig, st, period, ticks=400)))
+    curve.sort()
+
+    # Asserted on ALARMS-AT-ALL and TIME-TO-FIRST-ALARM rather than on the raw
+    # fire count, deliberately: the repeat gate opens on a fixed clock but can
+    # only discharge on an ERROR tick, so at some duty cycles the gate opens on
+    # the one tick that succeeds and the alert slips by one. That jitter is a
+    # couple of counts either way and would make an exact-count assertion flaky
+    # for a reason that has nothing to do with the property. Silence-vs-noise
+    # and how long you wait are what "quieter" means to whoever is on the other
+    # end, and both are exactly monotone.
+    seen_loud = False
+    for blind, fires in curve:
+        if seen_loud:
+            assert fires > 0, (f"NOT MONOTONIC: {blind:.1%} blind fell back to "
+                               f"SILENT after a better routine had alarmed")
+        seen_loud = seen_loud or fires > 0
+    assert curve[0][1] == 0, "the healthy end must be silent"
+    assert curve[-1][1] > 0, "the dead end must not be"
+    # every blind routine here alarms; pre-fix, everything from 50% to 90.0%
+    # inclusive was silent forever and only 90.9% and worse ever alarmed
+    assert all(f > 0 for b, f in curve if b > 0), \
+        f"a blind routine never alarmed: {curve}"
+
+
+def test_corrupt_sidecar_reseeds_blind_but_an_absent_one_reseeds_healthy_T0984(
+        mcfg):
+    """`load_state` treated ABSENT and CORRUPT as one case and re-seeded both
+    to "no breach observed", justified as "worst case one extra persist window
+    — the safe direction". True for a routine that never ran; false for state
+    that was DESTROYED, where it restarts the whole error count. Measured
+    pre-fix: an instrument dead for all of 200 ticks alerted ONCE if its state
+    survived and NEVER if it was re-seeded every 3, 5 or 9 ticks."""
+    cfg, slug, _ = mcfg
+    rid = R.declare(cfg, slug, instruction="x", trigger="monitor",
+                    monitor=_spec(cmd="false", threshold=1), provenance="T-0984",
+                    now=T0)["id"]
+    p = R.state_path(cfg, slug, rid)
+    p.parent.mkdir(parents=True, exist_ok=True)   # declare need not have swept
+
+    p.unlink(missing_ok=True)                       # ABSENT: never ran
+    assert R.load_state(cfg, slug, rid)["probe_window"] == []
+
+    p.write_text("{ not json at all", encoding="utf-8")   # CORRUPT: destroyed
+    st = R.load_state(cfg, slug, rid)
+    assert sum(st["probe_window"]) == R.MONITOR_WINDOW, (
+        "a destroyed sidecar re-seeded HEALTHY — the direction that goes quiet")
+
+    p.write_text('["not", "a", "mapping"]', encoding="utf-8")  # parses, isn't state
+    assert sum(R.load_state(cfg, slug, rid)["probe_window"]) == R.MONITOR_WINDOW
+
+
+def test_nonzero_exit_carries_the_probes_own_reason_T0984():
+    """R-0005 is the routine T-0984 calls "the reference implementation" for
+    giving an unmeasurable value its own wire value: exit 2 = could not read,
+    exit 1 = read and it is bad. Both used to reach a human as
+    `value N vs threshold None` — the reason was computed and discarded, so
+    the distinction this whole cluster defends survived as an unlabelled
+    1 versus 2."""
+    spec = _spec(judge="nonzero_exit", threshold=None)
+    unreadable = R.ProbeResult(ok=True, exit_code=2, error="",
+                               output="unreachable: URLError: Connection refused")
+    measured_bad = R.ProbeResult(ok=True, exit_code=1, error="",
+                                 output="flags=sha_drift,worker_stale")
+    v1, val1 = R.evaluate_probe(spec, unreadable)
+    v2, val2 = R.evaluate_probe(spec, measured_bad)
+    assert v1 == v2 == "breach"
+    assert "unreachable" in str(val1) and "URLError" in str(val1)
+    assert "sha_drift" in str(val2)
+    assert str(val1) != str(val2)
+    # healthy is untouched: still the bare exit code, still `ok`
+    assert R.evaluate_probe(spec, R.ProbeResult(
+        ok=True, exit_code=0, output="flags=none", error="")) == ("ok", 0)
+
+
+def test_nonzero_exit_falls_back_to_stderr_when_stdout_is_silent_T0984():
+    """R-0010's collision: `run_from_copy` writes "no such file" to STDERR and
+    prints nothing on stdout, so a stdout-only reading of "could not run" is
+    empty and reads exactly like "ran and failed" — the two outcomes a release
+    TL must never confuse."""
+    spec = _spec(judge="nonzero_exit", threshold=None)
+    could_not_run = R.ProbeResult(
+        ok=True, exit_code=2, output="",
+        error="run_from_copy: no such file: run_nightly_certification.sh")
+    verdict, value = R.evaluate_probe(spec, could_not_run)
+    assert verdict == "breach"
+    assert "no such file" in str(value)
+
+
+def test_timeout_reaches_a_declared_unmeasurable_token_T0984():
+    """F3: `evaluate_probe`'s `not probe.ok` guard sits above every judge, so a
+    probe killed by its own timeout never reached `regex_match` and R-0008's
+    declared PROBE-BROKEN token went unread — and a timeout, not an absent
+    target, is what host contention actually produces."""
+    spec = _spec(judge="regex_match", threshold=r"^(PROBE-BROKEN|TMUXFAIL-[1-9])")
+    timed_out = R.ProbeResult(ok=False, exit_code=-1, output="",
+                              error="timeout after 15s")
+    verdict, value = R.evaluate_probe(spec, timed_out)
+    assert verdict == "breach", "a declared unmeasurable token stayed unread"
+    assert "PROBE-BROKEN" in str(value) and "timeout" in str(value)
+
+
+def test_timeout_never_downgrades_a_judge_to_ok_T0984():
+    """The other half, and the one that matters more: the token is OFFERED to
+    the judge, never imposed. Every numeric judge reads "PROBE-BROKEN" as
+    non-numeric, and a judge that cannot make sense of it must leave the probe
+    in `error` — never turn a probe that DID NOT RUN into a healthy reading.
+    A remedy failing in the opposite direction would be the whole ticket
+    re-committed by its own fix."""
+    timed_out = R.ProbeResult(ok=False, exit_code=-1, output="",
+                              error="timeout after 30s")
+    for judge, threshold in (("numeric_gt", 12), ("numeric_lt", 1),
+                             ("numeric_ne", 200), ("nonzero_exit", None),
+                             ("regex_match", "^TMUXFAIL-[1-9]")):
+        verdict, _ = R.evaluate_probe(
+            _spec(judge=judge, threshold=threshold), timed_out)
+        assert verdict == "error", f"{judge}: a timeout judged {verdict!r}"
+
+
+def test_list_routines_shows_blindness_on_a_tick_that_SUCCEEDED_T0984(mcfg):
+    """The reader inherited the alert's blindness. A routine blind 9 ticks in
+    10 rendered a FULLY CLEAN row on the tick that worked — `consecutive_errors`
+    had just reset to 0 and `last_value_at` was freshly stamped — so a human
+    checking the board by hand was confirmed in the wrong belief."""
+    cfg, slug, _ = mcfg
+    rid = R.declare(cfg, slug, instruction="x", trigger="monitor",
+                    monitor=_spec(cmd="false", threshold=10, interval_s=5),
+                    provenance="T-0984", now=T0)["id"]
+    st = R.load_state(cfg, slug, rid)
+    trig = R.MonitorTrigger(_spec(threshold=10, interval_s=5))
+    for i in range(19):                       # 18 blind, then one that works
+        # NB: the working tick must carry a NUMBER. `_pr()` defaults to an
+        # empty stdout, which a numeric judge reads as `error` — a "success"
+        # fixture that is silently another error would make this test pass
+        # for the wrong reason.
+        _poll(trig, T0 + timedelta(seconds=5 * i), st,
+              **({"output": "5"} if i == 18 else {"ok": False, "error": "timeout"}))
+    R.save_state(cfg, slug, rid, st)
+
+    row = [r for r in R.list_routines(cfg, slug) if r["id"] == rid][0]["monitor"]
+    assert row["consecutive_errors"] == 0, "fixture must land ON the good tick"
+    assert row["window_errors"] == 18
+    assert row["broken"] is True, ("18 of the last 19 probes failed and the row "
+                                   "still rendered healthy")
+
+
+def test_a_working_probe_clears_the_loss_seed_rather_than_arming_it_T0984(mcfg):
+    """The seed is "we do not know", not "it is broken". A probe that SUCCEEDS
+    after a state loss proves the instrument works, so the seeded entries must
+    be discarded — otherwise the very next single blip reads as a 20-probe
+    streak and pages BROKEN about a healthy routine. That is the same shape as
+    T-0708, where removing a mask parked a CORRECT system in permanent error:
+    a safe-direction default is only safe until it outlives its uncertainty."""
+    cfg, slug, _ = mcfg
+    rid = R.declare(cfg, slug, instruction="x", trigger="monitor",
+                    monitor=_spec(cmd="echo 5", threshold=10, interval_s=5),
+                    provenance="T-0984", now=T0)["id"]
+    sp = R.state_path(cfg, slug, rid)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text("{ destroyed", encoding="utf-8")
+
+    st = R.load_state(cfg, slug, rid)
+    assert sum(st["probe_window"]) == R.MONITOR_WINDOW      # blind, as designed
+    trig = R.MonitorTrigger(_spec(threshold=10, interval_s=5))
+
+    ev = _poll(trig, T0, st, output="5")                    # ...and it WORKS
+    assert ev is None
+    assert st["probe_window"] == [0], "the resolved unknown was left behind"
+
+    # the hair-trigger this guards: one error afterwards must NOT read as 20
+    ev = _poll(trig, T0 + timedelta(seconds=5), st, ok=False, error="blip")
+    assert ev is None, "a single blip after a state loss paged BROKEN"
+
+    # and the discrimination still holds: a probe that stays dead does alarm
+    st2 = R.load_state(cfg, slug, rid)
+    assert sum(st2["probe_window"]) == R.MONITOR_WINDOW
+    ev = _poll(trig, T0 + timedelta(seconds=10), st2, ok=False, error="timeout")
+    assert ev is not None and ev.kind == "monitor_broken"
+
+
+def test_broken_clears_once_good_probes_displace_the_bad_T0984(mcfg, tmp_path):
+    """The other half of making `broken` a RATE: it must still be able to go
+    back to False. `list_routines` already carries the rule in its own comment
+    — "a red state metric that never resets gets muted, and a muted watchdog
+    doesn't watch" — so a flag that latches forever is not a stricter fix, it
+    is a differently-broken one. Recovery is no longer instantaneous, which is
+    deliberate; what this pins is that it ARRIVES."""
+    cfg, slug, _ = mcfg
+    metric = tmp_path / "metric.txt"
+    metric.write_text("5")
+    rid = _declare_file_monitor(cfg, slug, metric, threshold=10)
+
+    metric.unlink()
+    for i in range(R.MONITOR_ERROR_BOUND):          # go blind
+        R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=5 * i))
+    row = {r["id"]: r for r in R.list_routines(cfg, slug)}[rid]["monitor"]
+    assert row["broken"] is True
+
+    metric.write_text("5")                          # and stay healthy
+    cleared_at = None
+    for i in range(R.MONITOR_ERROR_BOUND, R.MONITOR_ERROR_BOUND + 40):
+        R.monitor_sweep(cfg, slug, now=T0 + timedelta(seconds=5 * i))
+        row = {r["id"]: r for r in R.list_routines(cfg, slug)}[rid]["monitor"]
+        if not row["broken"]:
+            cleared_at = i
+            break
+    assert cleared_at is not None, "broken LATCHED — it never came back down"
+    # it must not clear on the FIRST good probe either; that is the defect
+    assert cleared_at > R.MONITOR_ERROR_BOUND, \
+        "one good probe erased a 10-error window"
+    assert row["window_errors"] < R.MONITOR_ERROR_BOUND

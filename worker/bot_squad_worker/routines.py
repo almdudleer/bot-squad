@@ -190,6 +190,28 @@ MONITOR_OUTPUT_CAP = 8192
 #: must not fire the AI process with garbage).
 MONITOR_ERROR_BOUND = 10
 
+#: T-0984: the WINDOW the bound above is counted over. It used to be counted
+#: over a CONSECUTIVE run, and that made the alarm an anti-alarm across most of
+#: its domain: any single success reset the run, so a probe blind up to and
+#: including 90% of ticks fired NOTHING, EVER (measured, 1000-tick sweep),
+#: while a 90.9%-blind one fired 91 times and a permanently dead one fired once
+#: and then went quiet. Loudness was not monotonic in badness. A run length is
+#: a correct instrument for "consecutive failures" and STRUCTURALLY CANNOT SEE
+#: "failure rate" — the reading was confident about a condition it could not
+#: observe. Counted over a fixed window instead, MONITOR_ERROR_BOUND of the
+#: last MONITOR_WINDOW probes, the alarm is monotone: quiet below the rate,
+#: and repeating on the routine's own cooldown above it.
+MONITOR_WINDOW = 2 * MONITOR_ERROR_BOUND
+
+#: T-0984: the token a probe that COULD NOT RUN AT ALL is offered to its own
+#: judge. `evaluate_probe`'s `not probe.ok` guard sits above every judge, so a
+#: probe killed by its own timeout_s never reached `regex_match` and its
+#: routine's declared unmeasurable token (T-0986's PROBE-BROKEN) went unread —
+#: and a timeout, not an absent target, is what host contention actually
+#: produces. Offered, never imposed: the judge's answer is taken only when it
+#: ESCALATES (see evaluate_probe).
+_UNMEASURABLE_TOKEN = "PROBE-BROKEN"
+
 #: monitor value stored in sidecar state / events is clipped to this length
 #: (only regex judges carry text values; numeric judges store the number).
 _MONITOR_VALUE_CLIP = 500
@@ -482,6 +504,25 @@ class MonitorTrigger(Trigger):
         st["last_probe_at"] = _iso(now)
 
         verdict, value = evaluate_probe(self.spec, probe)
+        # T-0984: appended for EVERY probe, ok or error, because the quantity
+        # that decides whether a monitor is blind is a RATE and a rate needs
+        # the successes too. Bounded to MONITOR_WINDOW, so the sidecar cannot
+        # grow without limit.
+        window = [int(bool(x)) for x in (st.get("probe_window") or [])]
+        if verdict != "error" and st.pop("probe_window_seeded", None):
+            # T-0984: `load_state` seeds a DESTROYED sidecar blind, because
+            # absent evidence must not read as healthy evidence. A probe that
+            # then SUCCEEDS resolves that unknown — the instrument
+            # demonstrably works — so the seeded entries are DISCARDED rather
+            # than left behind to make the next single blip look like a
+            # twenty-probe streak. Without this the safe-direction seed turns
+            # into a false BROKEN on the first error after a state loss: the
+            # remedy failing in the opposite direction, which on this exact
+            # file already cost us once (T-0708, a mask whose removal parked a
+            # CORRECT system in permanent error).
+            window = []
+        window.append(1 if verdict == "error" else 0)
+        st["probe_window"] = window[-MONITOR_WINDOW:]
         if verdict == "error":
             # Probe errors are NOT breaches — and not recoveries either: a
             # blind probe leaves the breach state exactly as it was.
@@ -496,11 +537,40 @@ class MonitorTrigger(Trigger):
             # the count T-0899 already renders. Cleared on the success path
             # below, so it never outlives the streak it describes.
             st["last_error"] = value
-            if errors == MONITOR_ERROR_BOUND:
-                return FireEvent(kind="monitor_broken", value=value,
-                                 threshold=self.spec.get("threshold"),
-                                 judge=self.spec["judge"],
-                                 breach_first_seen=st.get("breach_first_seen"))
+            # T-0984: was `errors == MONITOR_ERROR_BOUND` — fired at exactly
+            # the tenth CONSECUTIVE error and never again, so a dead instrument
+            # alerted once and then read as healthy forever, and one blind 9
+            # ticks in 10 never alerted at all. Now: MONITOR_ERROR_BOUND of the
+            # last MONITOR_WINDOW probes, repeating on the routine's own
+            # cooldown for as long as it holds. `==` is gone with the run: the
+            # comparison is `>=` and it is over a rate, so there is no exact
+            # value left to skip past.
+            # The consecutive count is kept as a second, LOUDER trigger for
+            # two reasons: a sidecar written before this change carries no
+            # window, so a routine already 50 errors deep would otherwise have
+            # to re-earn 10 of them after deploy; and it can only ever make the
+            # alarm fire EARLIER, never later, which is the direction a
+            # migration is allowed to be wrong in.
+            if (sum(st["probe_window"]) >= MONITOR_ERROR_BOUND
+                    or errors >= MONITOR_ERROR_BOUND):
+                # Repeat, but not per-tick. The floor is the routine's own
+                # cooldown, or the time its evidence takes to regenerate from
+                # nothing (MONITOR_ERROR_BOUND probes), whichever is longer —
+                # re-alerting faster than the evidence refreshes says nothing
+                # new. cooldown_s may legitimately be 0 (R-0010), which without
+                # the floor would page on every tick: the T-0708 shape of a
+                # remedy failing in the opposite direction.
+                repeat_s = max(int(self.spec["cooldown_s"]),
+                               MONITOR_ERROR_BOUND * int(self.spec["interval_s"]))
+                last_broken = _parse_iso(st.get("last_broken_at"))
+                if last_broken is None or \
+                        (now - last_broken).total_seconds() >= repeat_s:
+                    st["last_broken_at"] = _iso(now)
+                    return FireEvent(
+                        kind="monitor_broken", value=value,
+                        threshold=self.spec.get("threshold"),
+                        judge=self.spec["judge"],
+                        breach_first_seen=st.get("breach_first_seen"))
             return None
         st["consecutive_errors"] = 0
         st.pop("last_error", None)   # T-0999: dies with the streak
@@ -538,6 +608,21 @@ class MonitorTrigger(Trigger):
         return event
 
 
+def _probe_detail(probe: ProbeResult) -> str:
+    """The probe's own words about what it just did — stdout first.
+
+    T-0984: stderr is the fallback and not an afterthought. R-0010's wrapper
+    writes `run_from_copy: no such file: ...` to stderr and prints nothing at
+    all on stdout, so a stdout-only reading of "could not run" is empty and
+    reads exactly like "ran and failed".
+    """
+    out = probe.output.strip()
+    err = (probe.error or "").strip()
+    if out and err:
+        return f"{out[:_MONITOR_VALUE_CLIP // 2]} | stderr: {err[:200]}"
+    return (out or err)[:_MONITOR_VALUE_CLIP]
+
+
 def evaluate_probe(spec: dict, probe: ProbeResult) -> tuple[str, Any]:
     """Judge one probe result: ``("breach"|"ok"|"error", value)``.
 
@@ -548,7 +633,21 @@ def evaluate_probe(spec: dict, probe: ProbeResult) -> tuple[str, Any]:
     judge = spec["judge"]
     threshold = spec.get("threshold")
     if not probe.ok:
-        return ("error", (probe.error or "probe failed")[:_MONITOR_VALUE_CLIP])
+        reason = (probe.error or "probe failed")[:_MONITOR_VALUE_CLIP]
+        # T-0984: a probe that could not run is offered to its own judge as
+        # _UNMEASURABLE_TOKEN, so a routine that DECLARED a token for exactly
+        # this (R-0008's `^(PROBE-BROKEN|TMUXFAIL-[1-9])`) gets to use it on the
+        # timeout path too, not only when its target is absent. The answer is
+        # taken ONLY if it escalates to `breach`: a judge that reads the token
+        # as `ok` — every numeric judge does, it is not a number — must never
+        # be able to turn a probe that DID NOT RUN into a healthy reading. Same
+        # offer-and-only-escalate idiom as the T-0993 stdout hint below, and it
+        # cannot recurse: the synthetic result has ok=True.
+        would, _ = evaluate_probe(spec, replace(
+            probe, ok=True, exit_code=0, output=_UNMEASURABLE_TOKEN, error=""))
+        if would == "breach":
+            return ("breach", f"{_UNMEASURABLE_TOKEN}: {reason}")
+        return ("error", reason)
     if judge == "http":
         # http probes judge themselves (exit_code 0 = expectations met);
         # the value is the observation ("status=... latency_ms=..." or
@@ -556,7 +655,26 @@ def evaluate_probe(spec: dict, probe: ProbeResult) -> tuple[str, Any]:
         value = probe.output.strip()[:_MONITOR_VALUE_CLIP]
         return ("breach" if probe.exit_code != 0 else "ok", value)
     if judge == "nonzero_exit":
-        return ("breach" if probe.exit_code != 0 else "ok", probe.exit_code)
+        if probe.exit_code == 0:
+            return ("ok", probe.exit_code)
+        # T-0984: this branch returned the bare exit code and DISCARDED the
+        # probe's stdout, which is where every nonzero_exit probe in the fleet
+        # puts its reason. R-0005 — the routine T-0984 itself calls "the
+        # reference implementation" for giving an unmeasurable value its own
+        # wire value — prints `unreachable: URLError: ...` for exit 2 and
+        # `flags=sha_drift,...` for exit 1, and BOTH reached a human as
+        # `value N vs threshold None`. The unmeasurable-vs-measured-bad
+        # distinction survived as an unlabelled 1 versus 2. It also collapsed
+        # R-0010's two outcomes a release TL must never confuse: a
+        # certification that FAILED and one that COULD NOT RUN.
+        #
+        # T-0993 already solved "the rc is not the whole story" for the judges
+        # below, but its block sits UNDER this return, so the one judge that
+        # needed it was the one it could not reach. Fixed by extending the
+        # coverage to this branch rather than by adding a second path.
+        detail = _probe_detail(probe)
+        return ("breach",
+                f"exit={probe.exit_code}" + (f": {detail}" if detail else ""))
     if probe.exit_code != 0:
         detail = (probe.error or "").strip()[:200]
         # T-0993: the rc path discards stdout at exactly the moment stdout is
@@ -915,6 +1033,14 @@ def list_routines(cfg: Any, slug: str) -> list[dict]:
             # only an EVENT metric may be loud; a red state metric that never
             # resets gets muted, and a muted watchdog doesn't watch).
             consecutive_errors = int(st.get("consecutive_errors") or 0)
+            # T-0984: `broken` used to mean "10 in a row", so a routine that
+            # failed 18 of its last 20 probes but happened to succeed on THIS
+            # one rendered as a fully clean row with a fresh reading — the
+            # reader inheriting the same blindness as the alert. It is now the
+            # same rate the alert fires on, so the row cannot come up healthy
+            # on the one tick in ten that works.
+            probe_window = [int(bool(x)) for x in (st.get("probe_window") or [])]
+            window_errors = sum(probe_window)
             summary["monitor"] = {
                 "probe": spec.get("probe"),
                 "interval_s": spec.get("interval_s"),
@@ -926,7 +1052,11 @@ def list_routines(cfg: Any, slug: str) -> list[dict]:
                 "last_probe_at": st.get("last_probe_at"),
                 "last_error": st.get("last_error"),
                 "consecutive_errors": consecutive_errors,
-                "broken": consecutive_errors >= MONITOR_ERROR_BOUND,
+                "window_errors": window_errors,
+                "window_probes": len(probe_window),
+                "window_size": MONITOR_WINDOW,
+                "broken": (window_errors >= MONITOR_ERROR_BOUND
+                           or consecutive_errors >= MONITOR_ERROR_BOUND),
                 "breach": bool(st.get("breach_first_seen")),
                 "last_fired_at": st.get("last_fired_at"),
             }
@@ -1234,23 +1364,50 @@ def _default_state() -> dict:
         "fired": False,
         "last_fired_at": None,
         "consecutive_errors": 0,
+        # T-0984: the rolling probe outcomes MONITOR_ERROR_BOUND is now counted
+        # over, and the cooldown stamp for the repeating broken alert.
+        "probe_window": [],
+        "last_broken_at": None,
     }
 
 
 def load_state(cfg: Any, slug: str, rid: str) -> dict:
     """Load a monitor's sidecar runtime state (D-0048 §3.2).
 
-    State is DISPOSABLE: absent or corrupt state re-seeds as "no breach
-    observed" — worst case one extra persist window before a fire, the safe
-    direction.
+    State is DISPOSABLE, but T-0984 measured that "absent or corrupt re-seeds
+    as no-breach-observed — worst case one extra persist window before a fire,
+    the safe direction" was TWO claims wearing one sentence, and only the first
+    is true:
+
+    * **ABSENT** is a routine that has never run. Seeding it healthy is right,
+      and it does cost at most one window.
+    * **CORRUPT** is state that was DESTROYED. Seeding *that* healthy discards
+      an error history, and the cost is not one window — it is a full restart
+      of the count the broken-alert depends on, repeatable without limit.
+      Measured on the pre-T-0984 consecutive counter: an instrument dead for
+      the whole of 200 ticks alerted ONCE if state survived and **NEVER** if
+      state was re-seeded every 3, 5 or 9 ticks. A rationale argued about the
+      breach path had been inherited by the error path, where it does not hold.
+
+    So the two are separated here, and a destroyed sidecar re-seeds BLIND — a
+    full window of errors — which is the direction that alerts rather than the
+    direction that goes quiet. A routine whose state keeps being destroyed is
+    not a healthy routine.
     """
     st = _default_state()
     try:
         raw = json.loads(state_path(cfg, slug, rid).read_text(encoding="utf-8"))
-        if isinstance(raw, dict):
-            st.update(raw)
+    except FileNotFoundError:
+        return st                      # never ran: genuinely no observation yet
     except (OSError, ValueError):
-        pass
+        st["probe_window"] = [1] * MONITOR_WINDOW
+        st["probe_window_seeded"] = True
+        return st
+    if not isinstance(raw, dict):      # parsed, but not state — also destroyed
+        st["probe_window"] = [1] * MONITOR_WINDOW
+        st["probe_window_seeded"] = True
+        return st
+    st.update(raw)
     return st
 
 
@@ -1954,18 +2111,29 @@ def monitor_sweep(cfg: Any, slug: str, *, now: Optional[datetime] = None) -> dic
                                      kind="monitor_broken",
                                      threshold=ev.threshold,
                                      note=str(ev.value))
-                        # once, not per-tick: poll emits this event only at
-                        # exactly consecutive_errors == MONITOR_ERROR_BOUND
+                        # T-0984: this text used to say "N CONSECUTIVE probe
+                        # errors", and poll emitted the event once, at exactly
+                        # consecutive_errors == MONITOR_ERROR_BOUND. Both
+                        # halves were the defect and both are gone — the count
+                        # is over a window and the alert repeats while it holds
+                        # — so the sentence had to change with the mechanism it
+                        # describes. A message that still describes the
+                        # replaced design is how the reader is told the old
+                        # thing in the system's own voice.
+                        errs = sum(int(bool(x))
+                                   for x in (st.get("probe_window") or []))
+                        seen = len(st.get("probe_window") or [])
                         _monitor_notify(
                             cfg, slug, r.id,
                             f"⚠️ monitor {r.id} ({r.title}) is BROKEN: "
-                            f"{MONITOR_ERROR_BOUND} consecutive probe errors "
+                            f"{errs} of its last {seen} probes failed "
                             f"(last: {ev.value}). It cannot see its metric — "
-                            f"no breach/recovery alerts until the probe is fixed.")
+                            f"no breach/recovery alerts until the probe is "
+                            f"fixed. Repeating while it holds.")
                         log.warning(
-                            "monitor %s is BROKEN: %d consecutive probe "
-                            "errors (last: %s) [%s]", r.id,
-                            MONITOR_ERROR_BOUND, ev.value, slug)
+                            "monitor %s is BROKEN: %d of the last %d probes "
+                            "failed (last: %s) [%s]", r.id, errs, seen,
+                            ev.value, slug)
                 save_state(cfg, slug, r.id, st)
             except Exception:  # noqa: BLE001 — one bad monitor never kills the sweep
                 log.exception("monitor %s: sweep step failed [%s]", r.id, slug)

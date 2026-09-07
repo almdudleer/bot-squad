@@ -66,6 +66,12 @@ def _base(**monitor_overrides) -> dict:
             "last_value_at": "2026-08-31T10:00:00+00:00",
             "last_probe_at": "2026-08-31T10:00:00+00:00",
             "consecutive_errors": 0,
+            # T-0984: `broken` is now a RATE over the last `window_probes`
+            # probes, not a consecutive run, so a row can no longer come up
+            # clean on the one tick in ten that happened to succeed.
+            "window_errors": 0,
+            "window_probes": 0,
+            "window_size": 20,
             "broken": False,
             "breach": False,
             "last_fired_at": None,
@@ -99,10 +105,15 @@ def test_mid_error_streak_shows_count_and_staleness(bsq, capsys):
 
 def test_broken_past_bound_reads_broken_and_never_unmarked(bsq, capsys):
     out = _row(bsq, _base(consecutive_errors=10, broken=True,
+                          window_errors=10, window_probes=20,
                           last_value="OK", last_value_at="2026-08-31T09:00:00+00:00"),
                capsys)
     assert "BROKEN" in out
-    assert "10 consecutive probe errors" in out
+    # T-0984 changed this wording with the mechanism it describes: the bound is
+    # counted over a WINDOW now, so "10 consecutive probe errors" would be a
+    # sentence the code can no longer justify. The run is still shown, second.
+    assert "10 of the last 20 probes failed" in out
+    assert "10 in a row" in out
     assert "2026-08-31T09:00:00+00:00" in out
     # a healthy-looking row for the same last_value is impossible to confuse
     # with test_healthy_routine_renders_unmarked's output
@@ -111,12 +122,17 @@ def test_broken_past_bound_reads_broken_and_never_unmarked(bsq, capsys):
 
 
 def test_broken_stays_broken_regardless_of_error_count_growth(bsq, capsys):
-    """The alert fires once at exactly MONITOR_ERROR_BOUND, but the routine
-    keeps accumulating errors after that (T-0899 mechanism). The list marker
-    must not fade just because the count moved past the bound."""
-    out = _row(bsq, _base(consecutive_errors=47, broken=True), capsys)
+    """The list marker must not fade just because the count moved past the
+    bound. T-0984 changed only the WORDING here, with the mechanism: the count
+    is over a window now, and the consecutive run is reported second rather
+    than as the whole story. The claim this test exists for — a routine deep
+    into a streak still reads BROKEN and still shows its numbers — is
+    unchanged."""
+    out = _row(bsq, _base(consecutive_errors=47, broken=True,
+                          window_errors=20, window_probes=20), capsys)
     assert "BROKEN" in out
-    assert "47 consecutive probe errors" in out
+    assert "20 of the last 20 probes failed" in out
+    assert "47 in a row" in out
 
 
 def test_no_observation_yet_still_renders_pass_leg(bsq, capsys):
@@ -191,3 +207,43 @@ def test_schedule_row_under_paused_drive_gets_stood_down(bsq, capsys):
     out = capsys.readouterr().out
     assert "STOOD DOWN" in out
     assert "2026-07-05T09:00:00+00:00" in out
+
+
+# --- T-0984: the row must not come up clean on the tick that worked ---------
+
+def test_blind_routine_is_marked_on_the_tick_that_SUCCEEDED_T0984(bsq, capsys):
+    """The reader half of T-0984's F2. A routine blind 9 ticks in 10 rendered a
+    FULLY CLEAN row on the tick that worked: `consecutive_errors` had just
+    reset to 0 and `last_value_at` was freshly stamped, so a human checking the
+    board by hand at that moment was confirmed in the wrong belief. The row now
+    carries the window, which does not reset."""
+    out = _row(bsq, _base(consecutive_errors=0, broken=True,
+                          window_errors=18, window_probes=20,
+                          last_value="OK",
+                          last_value_at="2026-08-31T10:00:00+00:00"), capsys)
+    assert "BROKEN" in out
+    assert "18 of the last 20 probes failed" in out
+    assert out != _row(bsq, _base(), capsys), (
+        "a 90%-blind routine rendered identically to a healthy one")
+
+
+def test_sub_bound_blindness_shows_the_window_beside_the_streak_T0984(bsq, capsys):
+    """Below the bound the row is not BROKEN, but the blindness is still
+    visible — `error×1` alone understates a probe that failed 8 of its last 20
+    times, and understating it is how it stays unnoticed."""
+    out = _row(bsq, _base(consecutive_errors=1, broken=False,
+                          window_errors=8, window_probes=20,
+                          last_value="OK",
+                          last_value_at="2026-08-31T09:00:00+00:00"), capsys)
+    assert "error×1" in out
+    assert "blind 8/20" in out
+    assert "BROKEN" not in out
+
+
+def test_healthy_row_carries_no_window_noise_T0984(bsq, capsys):
+    """The healthy control for the render: a routine with a clean window is
+    marked exactly as it was before this ticket — no blindness clause at all."""
+    out = _row(bsq, _base(window_errors=0, window_probes=20), capsys)
+    assert "blind" not in out
+    assert "error" not in out
+    assert "BROKEN" not in out

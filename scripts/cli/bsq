@@ -4083,6 +4083,18 @@ def _routine_print_row(r: dict, automation_paused: bool = False) -> None:
         # stays shown for as long as it's true, unlike the one-time
         # alert message, so it can't go silently blind forever.
         errors = mon.get("consecutive_errors") or 0
+        # T-0984: `broken` is now a RATE — MONITOR_ERROR_BOUND of the last
+        # MONITOR_WINDOW probes — not a consecutive run, because a run length
+        # cannot see a failure rate. The row this fixes is the one that
+        # rendered FULLY CLEAN on the one tick in ten that succeeded while the
+        # routine was blind for the other nine: `errors` had just reset to 0,
+        # `last_value_at` was freshly stamped, and a human checking the board
+        # by hand was confirmed in the wrong belief. `blind N/M` is therefore
+        # shown whenever the window holds ANY error, including on a tick that
+        # worked, and it is the count the alert itself fires on.
+        w_err = mon.get("window_errors") or 0
+        w_n = mon.get("window_probes") or 0
+        blind = f", blind {w_err}/{w_n} of last probes" if w_err else ""
         # T-0999: the REASON, from the first error. The count told you a probe
         # was blind; it never told you why, and the value that says why was
         # discarded on every tick except the one-shot monitor_broken at the
@@ -4092,11 +4104,12 @@ def _routine_print_row(r: dict, automation_paused: bool = False) -> None:
         why = mon.get("last_error")
         why = f" — {str(why)[:120]}" if why else ""
         if mon.get("broken"):
-            health = (f"  BROKEN ({errors} consecutive probe errors, "
+            health = (f"  BROKEN ({w_err} of the last {w_n} probes failed"
+                      f"{f'; {errors} in a row' if errors else ''}, "
                       f"last ok value stale since "
                       f"{mon.get('last_value_at') or '—'}{why})")
-        elif errors:
-            health = (f"  error×{errors} (stale since "
+        elif errors or w_err:
+            health = (f"  error×{errors}{blind} (stale since "
                       f"{mon.get('last_value_at') or '—'}{why})")
         else:
             health = ""

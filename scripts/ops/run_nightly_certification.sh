@@ -41,6 +41,18 @@ mkdir -p "$LOG_DIR"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 LOG="$LOG_DIR/$RUN_ID.log"
 
+# Measured (T-1046): the bsq routine's monitor probe runs this in the WORKER
+# PROCESS's own environment, where /tmp is READ-ONLY (`mktemp: failed to
+# create file via template ... Read-only file system`) — unlike an
+# interactive session's shell, where /tmp is writable and this went
+# undetected until the routine's own first probe fired. `mktemp` below and
+# `bsq verify-isolated`'s internal `tempfile.mkdtemp()` (Python's tempfile
+# module honours $TMPDIR) both need a scratch dir this process can actually
+# write to; this data path already proved writable by LOG_DIR above.
+TMPDIR="/home/www/bot-squad/data/bot-squad/_jobs/nightly-certification/scratch"
+mkdir -p "$TMPDIR"
+export TMPDIR
+
 exec > >(tee -a "$LOG") 2>&1
 echo "=== T-1046 host-side nightly certification — run $RUN_ID ($(date -u -Iseconds)) ==="
 

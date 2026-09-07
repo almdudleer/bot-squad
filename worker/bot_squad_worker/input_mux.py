@@ -499,20 +499,21 @@ def deliver_direct(data_dir: Path | str, sid: str, pane_id: str, text: str, *,
         # against the tail of his sentence and the Enter submitted both as one
         # line. His fix, verbatim: «он должен слать check mail вперед моего
         # текста, а мой текст оставлять как есть в поле ввода».
-        draft = _live_draft(capture, pane_id) if _draft_swap_enabled() else ""
-        if draft and not _swap_is_safe(pane_id, draft):
-            # A draft we cannot read in FULL must not be swapped: the reader
-            # takes the last `❯` line, so a wrapped or multi-line message would
-            # be saved and restored truncated — silently losing the tail. The
-            # legacy path merges the nudge into his text, which is the very
-            # thing T-0954 set out to fix, but it loses nothing; that is the
-            # right way round.
-            log.info("input_mux: %s's draft may be wrapped (%d chars) — "
-                     "delivering the legacy way rather than risk a truncated "
-                     "restore", sid, len(draft))
-            draft = ""
-        if draft:
-            return _deliver_ahead_of_draft(data_dir, sid, pane_id, text, draft,
+        block = (_live_draft_block(capture, pane_id)
+                 if _draft_swap_enabled() else None)
+        if block is not None and not _swap_is_safe(block):
+            # A draft we cannot read in FULL must not be swapped: the swap
+            # DELETES what it read and types back what it captured, so a read
+            # that stopped short loses his tail in silence. The legacy path
+            # merges the nudge into his text, which is the very thing T-0954
+            # set out to fix, but it loses nothing; that is the right way round.
+            log.info("input_mux: %s's draft cannot be read whole (%d row(s), "
+                     "%d chars read) — %s. Delivering the legacy way rather "
+                     "than risk a truncated restore", sid, len(block.rows),
+                     len(block.text), block.reason or "unreadable")
+            block = None
+        if block is not None:
+            return _deliver_ahead_of_draft(data_dir, sid, pane_id, text, block,
                                            capture)
 
         return _type_lines(pane_id, text, capture=capture)
@@ -529,24 +530,36 @@ def _pane_width(pane_id: str) -> int:
         return 0
 
 
-#: Columns the composer's own chrome takes before his text starts (`❯ ` plus
-#: the box border). Deliberately generous — the cost of being wrong here is one
-#: legacy delivery, and the cost of being wrong the other way is his tail.
-_COMPOSER_CHROME_COLS = 6
+def _pane_height(pane_id: str) -> int:
+    """The pane's row count, or 0 when tmux will not say. The composer box
+    SCROLLS once it hits a height derived from this, and a scrolled box drops
+    rows off the top without saying so — see ``composer_watch.composer_max_rows``."""
+    from bot_squad_worker.sessions import _run
+    try:
+        out = _run(["tmux", "display-message", "-p", "-t", pane_id,
+                    "#{pane_height}"])
+        return int(str(getattr(out, "stdout", out) or "").strip() or 0)
+    except Exception:  # noqa: BLE001
+        return 0
 
 
-def _swap_is_safe(pane_id: str, draft: str) -> bool:
-    """True when the captured draft is certainly the WHOLE draft.
+def _swap_is_safe(block: Any) -> bool:
+    """True when the read is PROVABLY the whole draft (T-0978).
 
-    The reader takes the last ``❯`` line, so anything that wrapped onto a
-    following line, or was entered multi-line, is captured short. Swapping on a
-    short read would restore a truncated message — a silent edit of something he
-    wrote. So the swap is confined to a draft that provably fits one line.
+    This used to be ``len(draft) + 6 < pane_width``, and the defect it was
+    written to prevent is the one that made it pass: the reader handed it the
+    first visual row of a wrapped draft, so the value it measured had already
+    been cut to fit. Measured on his pane %638 (2026-09-06, 228 columns): a
+    220-character capture, 226 < 228, guard satisfied, and the draft it
+    described ran on for another two rows that the swap then deleted.
+
+    A width threshold cannot be repaired by widening it — the input is wrong,
+    not the bound. So there is no threshold now. The read either bounded the
+    composer box, classified every row break inside it and can name the draft
+    character for character, or it says it could not; only the first is safe,
+    and ``composer_watch.ComposerBlock.complete`` is that answer.
     """
-    width = _pane_width(pane_id)
-    if width <= 0:
-        return False        # cannot prove it fits → do not risk it
-    return len(draft) + _COMPOSER_CHROME_COLS < width
+    return bool(block is not None and block.complete and block.text.strip())
 
 
 def _draft_swap_enabled() -> bool:
@@ -666,8 +679,14 @@ def _type_lines(pane_id: str, text: str, *,
     return len(lines)
 
 
-def _live_draft(capture: Callable[[str], str], pane_id: str) -> str:
-    """His in-progress composer text, or "" when there is nothing to protect.
+def _live_draft_block(capture: Callable[[str], str], pane_id: str,
+                      capture_ansi: Callable[[str], str] | None = None) -> Any:
+    """The WHOLE composer box for ``pane_id``, or None when there is nothing
+    to protect (T-0978).
+
+    Returns a ``composer_watch.ComposerBlock``. Its ``complete`` flag — not its
+    text — is what a caller that is about to delete his text branches on; see
+    :func:`_swap_is_safe`.
 
     A permission/choice dialog is NOT a draft — its ``❯`` belongs to the prompt,
     and clearing it would answer it. That case falls through to the legacy
@@ -679,20 +698,35 @@ def _live_draft(capture: Callable[[str], str], pane_id: str) -> str:
     try:
         buf = capture(pane_id)
     except Exception:  # noqa: BLE001 — a capture hiccup must not drop delivery
-        return ""
+        return None
     if composer_watch.looks_like_dialog(buf):
-        return ""
-    live = composer_watch.composer_text(buf)
-    if (live or "").strip() and _composer_is_ghost(pane_id) is True:
+        return None
+    block = composer_watch.composer_block(buf, width=_pane_width(pane_id),
+                                          height=_pane_height(pane_id))
+    if block is None or not block.text.strip():
+        return None
+    if _composer_is_ghost(pane_id, capture_ansi) is True:
         # The renderer says this line is its own dim suggestion, not his text.
         # Protecting it is what parked `check mail` unsent in four panes at
         # once: the swap "restored" the ghost by TYPING it, which turned a hint
         # into real unsent content, and his next delivery read that back.
         log.info("input_mux: the composer for %s holds only Claude Code's own "
                  "faint suggestion (%d chars) — the box is empty (T-0962)",
-                 pane_id, len(live or ""))
-        return ""
-    return live if (live or "").strip() else ""
+                 pane_id, len(block.text))
+        return None
+    return block
+
+
+def _live_draft(capture: Callable[[str], str], pane_id: str) -> str:
+    """His in-progress composer text, or "" when there is nothing to protect.
+
+    A reading, not a proof — since T-0978 it is the whole box rather than the
+    box's first row, but a caller that DELETES his text must go through
+    :func:`_live_draft_block` and :func:`_swap_is_safe` instead, because a read
+    can be all of the text and still not be provably all of it.
+    """
+    block = _live_draft_block(capture, pane_id)
+    return block.text if block is not None else ""
 
 
 def drafts_dir(data_dir: Path | str) -> Path:
@@ -716,41 +750,106 @@ def _save_draft(data_dir: Path | str, sid: str, draft: str) -> Path | None:
 
 
 def _deliver_ahead_of_draft(data_dir: Path | str, sid: str, pane_id: str,
-                            text: str, draft: str,
+                            text: str, block: Any,
                             capture: Callable[[str], str]) -> int:
-    """Submit ``text`` as its OWN message, then put ``draft`` back untouched.
+    """Submit ``text`` as its OWN message, then put his draft back untouched.
 
     A pane's composer holds exactly one buffer, so "ahead of his text" is three
-    steps — save + clear (``C-u``), send, restore.
+    steps — save + clear, send, restore.
 
-    **Nothing here branches on a capture.** The obvious design was to verify the
-    clear before typing, and it is not implementable: measured on a live pane
-    2026-09-03, ``tmux capture-pane`` kept returning the PRE-clear frame for
-    more than 2.4 seconds while the composer was already empty (Claude Code
-    repaints its input box on its own schedule, and a busy session repaints it
-    late). A verification that reads a stale frame concludes "the clear failed",
-    takes the legacy path, and never restores — which is exactly how his
-    «file the mask-unclassified ticket too» left its pane while the log said the
-    delivery was fine.
+    **THE CLEAR IS N KEYSTROKES, NOT ONE (T-0978).** ``C-u`` kills to the start
+    of the current VISUAL ROW, not the composer: measured on a real Claude Code
+    composer 2026-09-07, a 577-character draft occupying three rows needed
+    three ``C-u`` presses, and after the first two of his rows were still
+    sitting in the box. One press was therefore never a clear for a wrapped
+    draft — the payload was typed after his surviving rows and the Enter under
+    it SUBMITTED them, which is his «мало того, что он его отсылает». So the
+    press count comes from the block we read, one per row it actually contains.
 
-    So the C-u is TRUSTED (it is what actually works; the same measurement shows
-    the composer really was cleared) and every capture below is for the LOG
-    only. The failure mode that trade buys is a duplicated draft if a C-u ever
-    silently fails — visible, his to fix in one keystroke — instead of a
-    silently vanished one. His text is also on disk before anything is touched.
+    **Almost nothing here branches on a capture.** The obvious design was to
+    verify the clear before typing, and it is not implementable: measured on a
+    live pane 2026-09-03, ``tmux capture-pane`` kept returning the PRE-clear
+    frame for more than 2.4 seconds while the composer was already empty
+    (Claude Code repaints its input box on its own schedule, and a busy session
+    repaints it late). A verification that reads a stale frame concludes "the
+    clear failed", takes the legacy path, and never restores — which is exactly
+    how his «file the mask-unclassified ticket too» left its pane while the log
+    said the delivery was fine.
+
+    The one capture that IS consulted below can only ADD ``C-u`` presses, never
+    skip the restore, so a stale frame costs at most a few no-op keystrokes
+    (measured: ``C-u`` on an empty composer does nothing). That is the safe
+    direction of the same trade, and it is what bounds the damage if the row
+    count is ever short.
+
+    So the clear is TRUSTED and every other capture is for the LOG only. The
+    failure mode that trade buys is a duplicated draft if a clear ever silently
+    fails — visible, his to fix in one keystroke — instead of a silently
+    vanished one. His text is also on disk before anything is touched.
     """
+    draft = block.text
     saved = _save_draft(data_dir, sid, draft)
 
-    raw_keys(pane_id, "C-u")
-    time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
+    for _ in range(max(1, len(block.rows))):
+        raw_keys(pane_id, "C-u")
+        time.sleep(_CLEAR_KEY_PAUSE_SEC)
+    _drain_leftover_rows(pane_id, capture)
 
     lines_sent = _type_lines(pane_id, text, capture=capture)
 
-    raw_keys(pane_id, "--", draft)
+    _restore_draft(pane_id, draft)
     time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
     log.info("input_mux: delivered %d line(s) to %s ahead of his draft "
-             "(%d chars, copy at %s)", lines_sent, sid, len(draft), saved)
+             "(%d chars over %d row(s), copy at %s)", lines_sent, sid,
+             len(draft), len(block.rows), saved)
     return lines_sent
+
+
+#: Pause between the ``C-u`` presses that clear the composer. Shorter than
+#: :data:`_DIRECT_INTERLINE_PAUSE_SEC` because no text is being typed between
+#: them — this is only to keep the repaint from coalescing the presses.
+_CLEAR_KEY_PAUSE_SEC = 0.15
+
+#: How many EXTRA ``C-u`` presses the drain below will spend when the composer
+#: still reads non-empty. Bounded because the frame it reads may simply be
+#: stale; the presses are no-ops on an already-empty composer.
+_CLEAR_DRAIN_MAX = 4
+
+
+def _drain_leftover_rows(pane_id: str, capture: Callable[[str], str]) -> None:
+    """Spend a few more ``C-u`` presses if the box still shows rows.
+
+    Belt for the row count: if the block we read ever under-counts, the rows it
+    missed would otherwise be submitted by the Enter that follows. Reading a
+    stale frame here is harmless — it only buys no-op keystrokes — because this
+    never decides whether to restore, which is the branch that cost his text in
+    T-0954.
+    """
+    from bot_squad_worker import composer_watch
+    for _ in range(_CLEAR_DRAIN_MAX):
+        try:
+            leftover = composer_watch.composer_text(capture(pane_id))
+        except Exception:  # noqa: BLE001
+            return
+        if not (leftover or "").strip():
+            return
+        raw_keys(pane_id, "C-u")
+        time.sleep(_CLEAR_KEY_PAUSE_SEC)
+
+
+def _restore_draft(pane_id: str, draft: str) -> None:
+    """Type his draft back, byte for byte.
+
+    A draft he broke with a newline cannot go back through ``send-keys``: the
+    newline would be an Enter and would SUBMIT it. It goes through the same
+    bracketed paste the multi-line payload path uses, which inserts newlines
+    instead of submitting (T-1038) — and with no Enter after it, because
+    restoring is putting it back in the box, not sending it.
+    """
+    if "\n" in draft:
+        _paste_block(pane_id, draft)
+        return
+    raw_keys(pane_id, "--", draft)
 
 
 def _default_pane_lookup(sid: str) -> str | None:

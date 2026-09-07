@@ -39,12 +39,20 @@ from tests.test_idle_timeout import _make_cfg, _row, seams  # noqa: F401
 
 # --- pane buffers, in the shapes a real Claude Code pane renders ------------
 
+#: The width these hand-built panes claim, in ONE place: the box rules and the
+#: `_pane_width` the fixture reports have to agree, or T-0978's reader calls the
+#: frame mid-resize and refuses to read it — which is the correct answer to a
+#: 41-column box drawn inside a 200-column pane.
+_FIXTURE_PANE_WIDTH = 200
+
+
 def _pane(composer: str = "") -> str:
     """An idle pane whose composer holds ``composer``."""
+    rule = "─" * _FIXTURE_PANE_WIDTH
     return ("● did some work\n"
-            "─────────────────────────────────────────\n"
+            f"{rule}\n"
             f"❯ {composer}\n"
-            "─────────────────────────────────────────\n"
+            f"{rule}\n"
             "  ⏵⏵ bypass permissions on · ← for agents\n")
 
 
@@ -340,7 +348,10 @@ def fake_pane(monkeypatch):
     monkeypatch.setattr(input_mux, "raw_keys", pane.keys)
     monkeypatch.setattr(input_mux, "_DIRECT_INTERLINE_PAUSE_SEC", 0)
     monkeypatch.setattr(input_mux, "_DIRECT_GATE_TIMEOUT_SEC", 0)
-    monkeypatch.setattr(input_mux, "_pane_width", lambda pane_id: 200)
+    monkeypatch.setattr(input_mux, "_CLEAR_KEY_PAUSE_SEC", 0)
+    monkeypatch.setattr(input_mux, "_pane_width",
+                        lambda pane_id: _FIXTURE_PANE_WIDTH)
+    monkeypatch.setattr(input_mux, "_pane_height", lambda pane_id: 40)
     return pane
 
 
@@ -757,30 +768,43 @@ def test_the_staleness_clock_ticks_every_tick_not_only_at_the_deepest_gate(
     assert json.loads(rec.read_text())["last_seen"] > first
 
 
-def test_a_wrapped_draft_is_never_swapped(tmp_path, monkeypatch):
-    """The reader takes the last `❯` line, so a draft that wrapped is captured
-    SHORT — swapping on that would restore a truncated version of something he
-    wrote. Confined to drafts that provably fit one line; everything else takes
-    the legacy path, which merges but never loses."""
+def test_a_draft_that_cannot_be_read_whole_is_never_swapped(tmp_path,
+                                                            monkeypatch):
+    """A read the swap cannot prove is complete takes the legacy path, which
+    merges the nudge into his text but never loses any of it.
+
+    T-0978 replaced the ``len(draft) + 6 < pane_width`` bound this test used to
+    pin — that bound could not fire for the case it existed for, because the
+    truncation it guarded against is what made its input short enough to pass.
+    The property survives the change and is what is asserted here; the arms are
+    the two ways a read still fails to prove itself. A wrapped draft that CAN
+    now be read whole is a different assertion and lives with its real capture
+    in ``test_t0978_composer_block.py``.
+    """
     from bot_squad_worker import input_mux
 
     keys: list = []
     monkeypatch.setattr(input_mux, "raw_keys", lambda p, *k: keys.append(k))
     monkeypatch.setattr(input_mux, "_DIRECT_INTERLINE_PAUSE_SEC", 0)
+    monkeypatch.setattr(input_mux, "_CLEAR_KEY_PAUSE_SEC", 0)
     monkeypatch.setattr(input_mux, "_DIRECT_GATE_TIMEOUT_SEC", 0)
-    monkeypatch.setattr(input_mux, "_pane_width", lambda pane_id: 40)
+    monkeypatch.setattr(input_mux, "_pane_height", lambda pane_id: 40)
 
-    long_draft = "x" * 60          # wider than the pane → certainly wrapped
+    # 1. tmux and the box disagree about the pane's width, so nothing measured
+    #    in columns can be trusted in this frame.
+    monkeypatch.setattr(input_mux, "_pane_width",
+                        lambda pane_id: _FIXTURE_PANE_WIDTH + 1)
     input_mux.deliver_direct(tmp_path, "S-x", "%1", "check mail",
-                             capture=lambda pane: _pane(long_draft))
+                             capture=lambda pane: _pane("x" * 60))
     assert ("C-u",) not in keys                  # his text was never touched
     assert ("--", "check mail") in keys          # ...and the nudge still went
 
-    # ...and an unknown pane width is treated as "cannot prove it fits"
+    # 2. the box has no closing rule, so where his text ends is unknowable.
     keys.clear()
     monkeypatch.setattr(input_mux, "_pane_width", lambda pane_id: 0)
+    unbounded = "● did some work\n❯ short\n  ⏵⏵ bypass permissions on\n"
     input_mux.deliver_direct(tmp_path, "S-x", "%1", "check mail",
-                             capture=lambda pane: _pane("short"))
+                             capture=lambda pane: unbounded)
     assert ("C-u",) not in keys
 
 

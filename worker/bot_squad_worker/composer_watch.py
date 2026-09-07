@@ -133,24 +133,110 @@ _PLACEHOLDER_RE = re.compile(
 _NBSP = "\u00a0"
 _COMPOSER_SEPARATORS = (" ", _NBSP)
 
+#: The two columns the composer inserts before his text. Row 1 spends them on
+#: the rune + :data:`_NBSP`; every following row on a literal two-space inset.
+#: They are the same two columns, which is why a wrapped row and a row he
+#: started himself are indistinguishable by indent alone (T-0978).
+_CONT_INDENT = "  "
 
-def composer_text(buf: str) -> str | None:
-    """The live composer's content, or None when the pane shows no composer.
+#: Columns the composer box spends on chrome, MEASURED rather than assumed.
+#: On a real Claude Code composer (v2.1.263) on 2026-09-07 a row the renderer
+#: had filled to the brim held ``pane_width - 4`` characters at three different
+#: pane widths — 96 at 100 columns, 133 at 137, 224 at 228. Two of the four are
+#: the left inset above; the other two are a right margin a capture can never
+#: show, because tmux strips trailing blanks off every row it hands back.
+COMPOSER_MARGIN_COLS = 4
+
+#: The rule that opens and closes the composer box: a run of U+2500 starting in
+#: column 1. The opening rule may carry a title (``──── operator ────``); the
+#: closing one is plain. His own rows can never be mistaken for it — row 1
+#: starts with the rune and every later row with :data:`_CONT_INDENT`.
+_BORDER_RE = re.compile("^\u2500{8,}")
+
+#: Claude Code collapses a large paste to this, instead of rendering it. The
+#: composer then holds a 18-character LABEL standing in for content the capture
+#: never shows. Measured 2026-09-07: a 3689-char payload rendered as
+#: ``❯ [Pasted text #1]`` with ``paste again to expand`` under the box. Reading
+#: it as a draft and typing it back would replace whatever he pasted with the
+#: literal string — so it is neither "empty" (that would let a delivery submit
+#: his paste) nor a readable draft. It is the canonical UNREADABLE composer.
+_PASTED_LABEL_RE = re.compile(r"^\[Pasted text #\d+\]$")
+
+#: Never swap a draft taller than this many visual rows, whatever the pane
+#: geometry says. The composer SCROLLS once it hits its height cap, and a
+#: scrolled box drops rows off the TOP with no marker of any kind — the rune
+#: simply sits on the first row that is still visible. Measured caps
+#: (v2.1.263, 2026-09-07): 5 content rows in a 20-row pane, 10 in 30, 18 in 47.
+#: :func:`composer_max_rows` models that cap and is the primary guard; this is
+#: the belt for the case where that fit is wrong LOW on a tall pane, which is
+#: the direction that would cost his text. Set above the tallest draft actually
+#: observed — his live pane %640 held a 537-character draft over 6 rows on
+#: 2026-09-07 — and well under the 18-row cap the production pane measures at,
+#: so the cost of the bound is a legacy delivery on a draft taller than any he
+#: has yet written.
+MAX_SWAPPABLE_ROWS = 8
+
+
+def composer_max_rows(pane_height: int) -> int:
+    """How tall the composer box can grow before it starts SCROLLING.
+
+    Fitted to the three measurements in :data:`MAX_SWAPPABLE_ROWS` and used
+    only as a REFUSAL threshold, never as a promise: a block that reaches it
+    may have older rows scrolled off the top, and is declared unreadable. If
+    the fit is wrong high, we refuse a readable draft (one legacy delivery); it
+    is paired with :data:`MAX_SWAPPABLE_ROWS` so that a fit that is wrong LOW
+    on a tall pane — the direction that would cost his text — is still bounded.
+    """
+    try:
+        return max(1, int(pane_height) // 2 - 5)
+    except Exception:  # noqa: BLE001
+        return 1
+
+
+class ComposerBlock:
+    """The WHOLE composer box, and whether the read can be trusted (T-0978).
+
+    ``rows``      the box's content rows, inset stripped, top to bottom.
+    ``text``      the draft, reconstructed. BEST-EFFORT unless ``complete``.
+    ``complete``  the whole box was read AND every row break was resolved, so
+                  ``text`` is what he actually typed, character for character.
+    ``reason``    why not, when ``complete`` is False — for the log.
+
+    ``complete`` is the only thing a caller that DELETES his text may branch
+    on. ``text`` on its own is a reading, not a proof: the reason this class
+    exists is that the previous reader returned the first visual row and the
+    guard above it then measured that row instead of the draft.
+    """
+
+    __slots__ = ("rows", "text", "complete", "reason")
+
+    def __init__(self, rows, text, complete, reason=""):
+        self.rows = tuple(rows)
+        self.text = text
+        self.complete = bool(complete)
+        self.reason = reason
+
+    def __repr__(self) -> str:  # pragma: no cover — debugging aid
+        return (f"ComposerBlock(rows={len(self.rows)}, chars={len(self.text)}, "
+                f"complete={self.complete}, reason={self.reason!r})")
+
+
+def _rune_row(buf: str) -> tuple[int, str] | None:
+    """(index, content) of the LIVE composer row, or None when there is none.
 
     The live composer is the LAST ``❯`` line; earlier runes are scrollback.
-    Returns the text with exactly one separating space removed, so the value
+    The content has exactly one separating space removed, so the value
     round-trips through :func:`input_mux` when a draft has to be restored —
     ``strip()`` would silently eat leading whitespace he typed.
     """
-    if not buf:
-        return None
-    live: str | None = None
-    for line in buf.splitlines():
+    found: tuple[int, str] | None = None
+    for i, line in enumerate(buf.splitlines()):
         stripped = line.lstrip()
         if stripped.startswith(PROMPT_RUNE):
-            live = stripped[len(PROMPT_RUNE):]
-    if live is None:
+            found = (i, stripped[len(PROMPT_RUNE):])
+    if found is None:
         return None
+    idx, live = found
     # T-0962: strip the ONE chrome separator, in either form. Matching only
     # the ASCII space meant the NBSP the live renderer actually emits was read
     # as the first character of his draft, typed back verbatim by the delivery
@@ -166,18 +252,176 @@ def composer_text(buf: str) -> str | None:
     # cost there is invisible leading padding); his leading ASCII spaces are
     # his and still survive intact.
     live = live.lstrip(_NBSP)
-    live = live.rstrip()
-    if _PLACEHOLDER_RE.match(live.strip()):
-        return ""          # the box is EMPTY; that is Claude Code's own hint
-    return live
+    return idx, live.rstrip()
+
+
+def composer_block(buf: str, width: int = 0,
+                   height: int = 0) -> ComposerBlock | None:
+    """Read the WHOLE composer box, not just the row carrying the rune.
+
+    This is the fix T-0978 names. The old reader took the rune row and stopped,
+    so a draft that wrapped onto following rows was captured as its first row —
+    and the guard above it then measured that already-truncated capture against
+    the pane width, which is a check the truncation itself makes pass. Measured
+    live on his own pane %638 (2026-09-06): two saved drafts of exactly 220
+    characters, both ending mid-word, on a 228-column pane.
+
+    ``width``/``height`` are the pane's, from tmux, and both are OPTIONAL.
+    ``width`` is cross-checked against the closing rule's own length — two
+    independent instruments on the same geometry — and a disagreement means the
+    frame was caught mid-resize, i.e. unreadable. Passing 0 asks the rule
+    alone, which is enough to bound the box and classify the row breaks; what
+    is then lost is only the cross-check. ``height`` has no substitute: without
+    it a box sitting at its scroll cap cannot be recognised, so a caller that
+    is about to DELETE his text must pass both.
+
+    Returns None only when the pane shows no composer at all.
+    """
+    if not buf:
+        return None
+    head = _rune_row(buf)
+    if head is None:
+        return None
+    idx, first = head
+    lines = buf.splitlines()
+
+    if _PASTED_LABEL_RE.match(first.strip()):
+        # Real content the renderer refuses to show. NOT empty — calling it
+        # empty tells a delivery there is nothing to protect, and its Enter
+        # would then submit his paste.
+        return ComposerBlock((first,), first, False,
+                             "the composer holds a collapsed paste label")
+
+    if _PLACEHOLDER_RE.match(first.strip()):
+        return ComposerBlock((), "", True, "")   # the box is EMPTY
+
+    # The closing rule bounds the box. Without it we cannot know where his text
+    # ends, so the read degrades to the pre-T-0978 first-row value and says so.
+    close = None
+    for j in range(idx + 1, len(lines)):
+        if _BORDER_RE.match(lines[j]):
+            close = j
+            break
+    if close is None:
+        return ComposerBlock((first,), first, False,
+                             "no closing rule under the composer")
+
+    rows = [first]
+    for line in lines[idx + 1:close]:
+        if not line.strip():
+            rows.append("")                      # a blank row he typed
+        elif line.startswith(_CONT_INDENT):
+            rows.append(line[len(_CONT_INDENT):].rstrip())
+        else:
+            return ComposerBlock(tuple(rows), "\n".join(rows), False,
+                                 "a row inside the box is not composer text")
+
+    def _unreadable(reason: str) -> ComposerBlock:
+        return ComposerBlock(tuple(rows), "\n".join(rows), False, reason)
+
+    if len(rows) > MAX_SWAPPABLE_ROWS:
+        return _unreadable(f"{len(rows)} rows is past the readable bound")
+    if height and len(rows) >= composer_max_rows(height):
+        return _unreadable("the box is at its height cap and may be scrolled")
+
+    # Two independent instruments on the same geometry: what tmux says the pane
+    # is, and how long the rule the renderer just drew actually is. They agree
+    # on a settled frame; a disagreement means the frame was captured mid-resize
+    # and nothing measured in columns can be trusted in it.
+    border_width = len(lines[close])
+    if width and width != border_width:
+        return _unreadable(f"pane width {width} disagrees with the rule's "
+                           f"{border_width} — a mid-resize frame")
+    content_width = (width or border_width) - COMPOSER_MARGIN_COLS
+    if content_width <= 0:
+        return _unreadable("the pane is too narrow to have a composer")
+    over = [len(r) for r in rows if len(r) > content_width]
+    if over:
+        # The renderer cannot put more than `content_width` characters on a
+        # row, so a longer one means the model of the box is wrong here — and a
+        # wrong model is exactly what read one row and called it the draft.
+        return _unreadable(f"a row is {max(over)} chars in a {content_width}-"
+                           f"char box — the geometry model is wrong here")
+
+    if len(rows) == 1:
+        # Provably the whole draft: the rune row is the only row in the box,
+        # and it fits inside it.
+        return ComposerBlock((first,), first, True, "")
+
+    joined, reason = _join_rows(rows, content_width)
+    if reason:
+        return _unreadable(reason)
+    return ComposerBlock(tuple(rows), joined, True, "")
+
+
+def _join_rows(rows: list[str], content_width: int) -> tuple[str, str]:
+    """Put the box's rows back together, or say why they cannot be.
+
+    Claude Code wraps greedily on spaces, and the space it breaks on is
+    CONSUMED — it appears on neither row. So a break is one of three things and
+    the geometry says which:
+
+    * the next row's first word could not have fitted    -> a wrap, join " "
+    * it could have                                      -> he pressed a
+                                                            newline, join "\n"
+    * the row is filled to the brim (``content_width``)  -> UNRESOLVABLE: a
+      word may have been cut in half (join "") or a space may have landed
+      exactly on the boundary (join " "), and nothing in the capture separates
+      those. Refuse rather than pick.
+
+    Verified against real captures: a 577-character draft over 3 rows and a
+    563-character one, both reproduced byte-for-byte by this rule.
+    """
+    out = [rows[0]]
+    for prev, nxt in zip(rows, rows[1:]):
+        if len(prev) > content_width:
+            return "", (f"a row is {len(prev)} chars in a {content_width}-char "
+                        f"box — the geometry model is wrong here")
+        if len(prev) == content_width:
+            return "", ("a row is filled to the brim — a wrap and a newline "
+                        "are indistinguishable there")
+        word = nxt.split(" ", 1)[0]
+        if nxt and len(prev) + 1 + len(word) > content_width:
+            out.append(" ")                      # the wrap ate exactly one
+        else:
+            out.append("\n")                     # it would have fitted
+        out.append(nxt)
+    return "".join(out), ""
+
+
+def composer_text(buf: str) -> str | None:
+    """The live composer's content, or None when the pane shows no composer.
+
+    BEST EFFORT, and deliberately so: it returns everything the box shows when
+    the box can be bounded, and falls back to the rune row alone when it cannot
+    (no closing rule — the pre-T-0978 value, so every reader that only asks "is
+    there anything in there" keeps reading exactly what it read before).
+
+    It is the right surface for "has this composer changed" and "did it clear".
+    It is the WRONG surface for anything that then DELETES his text: use
+    :func:`composer_block` and branch on ``complete``. That distinction is the
+    whole of T-0978 — the swap measured this value, and this value had already
+    been cut down to one visual row by the reader that produced it.
+    """
+    block = composer_block(buf)
+    if block is None:
+        return None
+    return block.text
 
 
 def looks_like_dialog(buf: str, live: str | None = None) -> bool:
-    """True when the ``❯`` belongs to a permission/choice prompt, not a composer."""
+    """True when the ``❯`` belongs to a permission/choice prompt, not a composer.
+
+    Asks about the RUNE ROW specifically (``1. Yes``), not the whole box: the
+    other rows of a choice prompt are its other options, and folding them into
+    one string would only make this harder to match. ``live`` is still honoured
+    for callers that already hold the row.
+    """
     if not buf:
         return False
     if live is None:
-        live = composer_text(buf)
+        head = _rune_row(buf)
+        live = head[1] if head else None
     if not live or not _DIALOG_OPTION_RE.match(live.strip()):
         return False
     return bool(_DIALOG_ASK_RE.search(buf))

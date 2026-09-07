@@ -1,0 +1,40 @@
+
+ ▐▛███▛█   Claude Code v2.1.263
+▝▜██████▀  Fable 5.1 · Claude Max
+  ▝▝ ▝▝    /tmp/claude-1000/-home-almdudleer-bot-squad-mgmt/290288e5-970e-4eed-8935-c42459afaa15/scratchpad/t0978/probe
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                              tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf and reattach for focus tracking
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ alpha0 bravo1 charlie2 delta3 echo4 foxtrot5 golf6 hotel7 india8 juliett9 kilo10 lima11 alpha12 bravo13 charlie14 delta15 echo16 foxtrot17 golf18 hotel19 india20 juliett21 kilo22 lima23 alpha24 bravo25 charlie26 delta27
+  echo28 foxtrot29 golf30 hotel31 india32 juliett33 kilo34 lima35 alpha36 bravo37 charlie38 delta39 echo40 foxtrot41 golf42 hotel43 india44 juliett45 kilo46 lima47 alpha48 bravo49 charlie50 delta51 echo52 foxtrot53 golf54
+  hotel55 india56 juliett57 kilo58 lima59 alpha60 bravo61 charlie62 delta63 echo64 foxtrot65 golf66 hotel67 india68 juliett69
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on                                                                                                                                                                                                             /rc

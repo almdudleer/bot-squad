@@ -1894,6 +1894,23 @@ def _cmd_run(args) -> int:
     inherited = os.environ.get(ENV_SLOT)
     inherited_kind = os.environ.get(ENV_SLOT_KIND)
     kind_now = normalise_kind(args.kind)
+    # An inherited token is a CLAIM, not a fact. Verify the slot is still held
+    # before honouring it: an exported token outlives the run that owned it —
+    # it survives in any environment that captured it — and an unverified
+    # exemption would then disarm the gate for that environment PERMANENTLY.
+    # A stale token must fail towards gating, never towards exemption.
+    if inherited:
+        try:
+            with _Registry(sd):
+                live_holders, _w = reap(sd)
+            if not any(h.get("token") == inherited for h in live_holders):
+                print(f"fleet-slot: inherited slot token {inherited} is NOT a "
+                      f"live holder — treating this as an ordinary run and "
+                      f"gating normally. A token that outlived its slot must "
+                      f"not exempt anything.", file=sys.stderr, flush=True)
+                inherited = None
+        except OSError:
+            inherited = None
     if inherited and covers(inherited_kind, kind_now):
         print(f"fleet-slot: already inside {inherited_kind} slot {inherited} — "
               f"NOT taking a second {kind_now} slot (it would queue behind its "

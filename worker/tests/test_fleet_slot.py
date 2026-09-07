@@ -92,6 +92,18 @@ def _env(state: Path, slots: int | None = None, dstate_max: str | None = "",
         env.pop("BOT_SQUAD_FLEET_PER_LANE", None)
     else:
         env["BOT_SQUAD_FLEET_PER_LANE"] = per_lane
+    # ⚠ CLEAR ANY INHERITED SLOT, ALWAYS. If this suite is itself run inside a
+    # fleet slot -- which is now exactly what the AGENT_INSTRUCTIONS recipes
+    # tell every lane to do -- the wrapper exports BOT_SQUAD_FLEET_SLOT into
+    # pytest, every test subprocess inherits it, and the nesting guard then
+    # correctly concludes that all of them are covered by the outer slot. The
+    # whole suite would take NO slots and the ceiling assertions would measure
+    # nothing: caught as peak concurrency 6 against a ceiling of 2, with the
+    # racers reporting they were "already inside containerless slot ...".
+    # These tests must look like INDEPENDENT LANES, so the marker is stripped
+    # here for the same reason the health ceilings are.
+    env.pop("BOT_SQUAD_FLEET_SLOT", None)
+    env.pop("BOT_SQUAD_FLEET_SLOT_KIND", None)
     return env
 
 
@@ -138,6 +150,15 @@ def _rendezvous_first(mine: Path, theirs: Path, window: float) -> list[str]:
         "while time.time()<end:\n"
         "    if os.path.exists(theirs+'.live'): seen=True; break\n"
         "    time.sleep(0.05)\n"
+        # LINGER BEFORE TEARING THE MARKER DOWN. Whoever arrives second sees
+        # the first marker on its very first poll and would otherwise unlink
+        # its own inside the peer's 50ms gap -- so in a SYMMETRIC rendezvous
+        # both sides can genuinely overlap and only one of them ever notices.
+        # Observed as a 63s failure against a gate that was granting both
+        # lanes in 1.3s. A marker has to outlive one poll interval of the
+        # process meant to see it; a second is 20x that and costs nothing,
+        # because it is only paid on the path where a peer was actually found.
+        "if seen: time.sleep(1.0)\n"
         "json.dump({'overlap':seen},open(mine,'w'))\n"
         "os.unlink(mine+'.live')\n"
     )
@@ -916,9 +937,17 @@ def test_the_cap_does_NOT_serialise_DIFFERENT_lanes(tmp_path):
     a, b = tmp_path / "a.json", tmp_path / "b.json"
 
     # Two slots, two DIFFERENT lanes, cap of 1 each: both must run together.
+    # SYMMETRIC rendezvous: BOTH sides wait to be joined, both exit on sight.
+    # The asymmetric form (one waiter, one peer that announces and lingers a
+    # fixed 1.0s) is startup-order dependent in the other direction -- if the
+    # waiter's wrapper is slow to spawn its child, the peer comes and goes
+    # inside that gap and a correct gate reads as a serialising one. Observed:
+    # this test passed in isolation and failed when run alongside another, on
+    # a gate that was working. A fixed lifetime is the same defect as a fixed
+    # sampling window, wearing the other hat.
     first = _spawn_run(state, "container", _rendezvous_first(a, b, 60.0),
                        note="lane-a", slots=2, per_lane="1", lane="LANE-A")
-    second = _spawn_run(state, "container", _rendezvous_second(b),
+    second = _spawn_run(state, "container", _rendezvous_first(b, a, 60.0),
                         note="lane-b", slots=2, per_lane="1", lane="LANE-B")
     try:
         assert first.wait(timeout=120) == 0
@@ -928,10 +957,15 @@ def test_the_cap_does_NOT_serialise_DIFFERENT_lanes(tmp_path):
             if p.poll() is None:
                 p.kill()
 
-    assert json.loads(a.read_text())["overlap"] is True, (
-        "two DIFFERENT lanes did not overlap under a per-lane cap of 1 — the "
-        "cap is keyed on something that is the same for both, which turns a "
-        "per-lane rule into a fleet-wide serialiser")
+    # Both sides, not just one: a symmetric rendezvous can report both, and an
+    # assertion that checks only one half would stay green if the other never
+    # ran at all.
+    for who, marker in (("LANE-A", a), ("LANE-B", b)):
+        assert json.loads(marker.read_text())["overlap"] is True, (
+            f"{who} never saw its peer, so two DIFFERENT lanes did not overlap "
+            f"under a per-lane cap of 1 — the cap is keyed on something that "
+            f"is the same for both, which turns a per-lane rule into a "
+            f"fleet-wide serialiser")
 
 
 def test_one_lane_cannot_take_two_slots_in_a_pool(tmp_path):
@@ -947,6 +981,20 @@ def test_one_lane_cannot_take_two_slots_in_a_pool(tmp_path):
 
     first = _spawn_run(state, "container", _rendezvous_first(a, b, 15.0),
                        note="suite-1", slots=2, per_lane="1", lane="LANE-A")
+    # ⚠ WAIT FOR THE FIRST TO ACTUALLY HOLD before launching the second.
+    # Spawning both at once assumes the first wins the slot, and it does not
+    # always: on the first real run of this test the SECOND was granted at
+    # 0.3s, ran, and released before the first ever acquired -- so nothing
+    # overlapped, nothing was refused, and the test failed against a gate that
+    # was working correctly. That is the same startup-order dependence this
+    # file has now been bitten by three times in two days, in a third form.
+    # The cap is about a lane's SECOND slot, so the first has to exist first.
+    held = _wait_until(
+        lambda: any(h["note"] == "suite-1"
+                    for h in _status(state, slots=2)["holders"]),
+        timeout=90.0)
+    assert held, "the first run never took its slot, so the cap was never tested"
+
     second = _spawn_run(state, "container", _rendezvous_second(b),
                         note="suite-2", slots=2, per_lane="1", lane="LANE-A")
     try:
@@ -1182,3 +1230,38 @@ def test_an_uncovered_but_legal_nesting_takes_a_second_slot_and_says_so(tmp_path
     assert "does NOT cover" in out.stderr, out.stderr
     assert "your lane will hold two" in out.stderr
     assert "DEADLOCK" not in out.stderr
+
+
+def test_a_STALE_inherited_slot_token_does_not_exempt_anything(tmp_path):
+    """An inherited token is a claim, not a fact — verify it is still held.
+
+    Found by dogfooding rather than by reading: running this very suite inside
+    a containerless slot (which is what the AGENT_INSTRUCTIONS recipes now tell
+    every lane to do) exported the wrapper's token into pytest, every test
+    subprocess inherited it, and the whole suite silently took NO slots. It
+    surfaced as peak concurrency 6 against a ceiling of 2.
+
+    The harness fix is to strip the marker (see ``_env``). THIS test covers the
+    sharper half: a token can outlive the run that owned it in any environment
+    that captured it, and an unverified exemption would then disarm the gate
+    for that environment permanently. A stale token must fail towards GATING.
+    """
+    state = tmp_path / "slots"
+    env = _env(state, slots=2)
+    env["BOT_SQUAD_FLEET_SLOT"] = "deadbeefdead"      # never held anything
+    env["BOT_SQUAD_FLEET_SLOT_KIND"] = "containerless"
+
+    out = subprocess.run(
+        [sys.executable, str(SLOT), "run", "--kind", "containerless",
+         "--note", "stale-token", "--wait", "60",
+         "--", sys.executable, "-c", "print('RAN')"],
+        env=env, capture_output=True, text=True, timeout=180)
+
+    assert out.returncode == 0, out.stderr
+    assert "RAN" in out.stdout
+    assert "is NOT a live holder" in out.stderr, out.stderr
+    # It really did gate: a granted slot is announced, and the exemption path
+    # never announces one. Asserting the grant rather than the absence of the
+    # exemption is what makes this test fail if the two paths are ever swapped.
+    assert "granted containerless slot" in out.stderr, out.stderr
+    assert "already inside" not in out.stderr

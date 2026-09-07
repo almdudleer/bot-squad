@@ -73,6 +73,37 @@ def test_deliverable_only_when_ready_and_not_typing():
     assert input_mux.deliverable(_BUF_BUSY) is False      # mid-generation
 
 
+# T-1040: KNOWN GAP, not fixed here (filed as a follow-up -- see the ticket's
+# Context). `agent_provider.CodexProvider.composer_markers` is `("›", "❯")` --
+# measured live 2026-09-07, current codex-cli (v0.153.4) renders `›`, not `❯`
+# -- but none of `user_is_typing`/`deliverable`/`composer_ready` consult that
+# per-provider table; all three are hardcoded to `❯` (autocompact.
+# composer_ready's own docstring: "rendered by Claude Code's input box").
+def _codex_buf(composer_text: str) -> str:
+    from bot_squad_worker import agent_provider
+    rune = agent_provider.get("codex").composer_markers[0]
+    assert rune == "›"  # "›" -- fails loudly if codex's rune ever moves
+    return f"  gpt-5.6-sol medium · /tmp/scratch\n\n{rune} {composer_text}\n"
+
+
+def test_composer_state_helpers_are_blind_to_a_non_claude_composer_rune():
+    """Two distinct misreadings, both from the same hardcoded `❯`:
+
+    1. A codex composer holding UNSENT text (the exact shape `user_is_typing`
+       exists to detect, so a nudge never clobbers it) reads as empty --
+       `user_is_typing` never finds a `❯` line to inspect at all.
+    2. `composer_ready` requires a literal `❯` in the buffer, so even a truly
+       READY, idle codex composer never satisfies it -- `deliverable()` (the
+       queued lane's `flush()` gate) is False for EVERY codex buffer, busy or
+       not, which would defer a codex pane's queue forever rather than only
+       while it is genuinely busy."""
+    busy = _codex_buf("half a thought the codex user is still wri")
+    assert input_mux.user_is_typing(busy) is False   # should be True
+
+    idle = _codex_buf("")
+    assert input_mux.deliverable(idle) is False       # should be True (ready)
+
+
 # ---------------------------------------------------------------------------
 # Caption formatting
 # ---------------------------------------------------------------------------
@@ -425,6 +456,39 @@ def test_type_lines_stops_retrying_into_a_permission_dialog(monkeypatch, caplog)
     assert "permission dialog" in caplog.text
 
 
+def test_codex_composer_rune_defeats_the_swallowed_enter_safety_net(monkeypatch):
+    """T-1040: the mirror image of `test_type_lines_gives_up_and_logs_after_
+    bound` above -- same never-submitted composer state (this is the T-0913
+    live failure: `inject_input` returned `lines_sent=1` for a payload the
+    Codex composer accepted and never submitted), except the pane is
+    codex-shaped (`_codex_buf`, rune `›`) instead of Claude-shaped
+    (`_BUF_PARKED`, rune `❯`).
+
+    The Claude-shaped case above correctly retries up to the bound, logs, and
+    reports unconfirmed. This one is read as an EMPTY (cleared) composer on
+    the very FIRST poll -- zero retries, no error log, reported delivered --
+    because `composer_watch.composer_text` cannot find `❯` in a `›` buffer and
+    an unrecognised composer looks identical to an empty one. The T-0957
+    safety net exists specifically to catch a silently-unsubmitted payload;
+    for a codex pane it cannot see one at all. Pinned rather than fixed here
+    -- the composer-state stack is cross-cutting (recycle gate, draft-swap,
+    the queued lane's `deliverable` gate) and out of this ticket's scope;
+    filed as a follow-up (see T-1040's Context for the ticket id)."""
+    _fast_confirm(monkeypatch)
+    monkeypatch.setattr(input_mux, "raw_keys", lambda *a, **k: None)
+    calls = {"n": 0}
+
+    def capture(pane_id):
+        calls["n"] += 1
+        return _codex_buf("check mail — this is bot-squad's peer message "
+                          "bus, not e-mail; run: bsq inbox check")
+
+    sent = input_mux._type_lines("%1", "check mail", capture=capture)
+
+    assert sent == 1          # reported delivered ...
+    assert calls["n"] == 1    # ... after a SINGLE poll, no retries attempted
+
+
 # ---------------------------------------------------------------------------
 # T-1038: an injected payload with a NEWLINE must arrive as ONE turn
 #
@@ -522,6 +586,29 @@ def test_type_lines_delivers_the_real_context_handoff_as_one_submission(monkeypa
     assert rec.pasted == [text]                  # verbatim, marker at the head
     assert rec.pasted[0].startswith(HARNESS_NUDGE_MARKER)
     assert lines == len(text.split("\n"))        # lines_sent still counts LINES
+
+
+def test_multiline_paste_routing_has_no_provider_branch(monkeypatch):
+    """T-1040 DoD 1+3. This is the exact 3-line marker-headed payload measured
+    LIVE 2026-09-07 against a fresh codex TUI (v0.153.4) and, as the healthy
+    control, a fresh Claude Code pane in the same run: each receiver's own
+    transcript held exactly ONE record for it, marker-first, all three lines
+    inside that one record -- codex did not split or swallow the paste.
+    `_type_lines` never inspects the pane's provider or rune before choosing
+    the paste-vs-typed path (`if len(lines) > 1`), so codex inherits the
+    T-1038 fix automatically and there is no per-provider transport decision
+    to make."""
+    rec = _Submissions().install(monkeypatch)
+    text = ("[T-1040-PROBE] marker line — multi-line bracketed-paste "
+            "measurement\nbody line 2 of 3\nbody line 3 of 3, end of payload")
+
+    lines = input_mux._type_lines("%1", text, capture=lambda p: _BUF_EMPTY)
+
+    assert rec.submissions == 1
+    assert rec.pastes == 1
+    assert rec.pasted == [text]
+    assert rec.pasted[0].startswith("[T-1040-PROBE]")
+    assert lines == 3
 
 
 def test_type_lines_delivers_the_real_artifact_handoff_as_one_submission(monkeypatch):

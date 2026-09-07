@@ -670,3 +670,248 @@ def test_queued_lane_delivers_a_multi_line_batch_as_one_submission(monkeypatch):
 
     assert rec.submissions == 1
     assert rec.pastes == 1
+
+
+# ---------------------------------------------------------------------------
+# T-1082 — a worker restart between the drain and the composer
+#
+# The question the ticket asks is whether our restart window drops peer/TG
+# messages the way watchrobot's startup 404 did. For the INGEST the answer is
+# no: nothing pushes into bot-squad, and both inbound lanes are durable before
+# anything acts on them. The one hop where it was true is here — `_drain`
+# truncated the queue and the batch lived only in a local variable until
+# `_deliver_to_pane` returned, and `flush` requeues on an EXCEPTION, which a
+# SIGKILL is not.
+#
+# A restart cannot be staged inside a unit test, so these pin the property that
+# makes it survivable instead: at no instant is the claimed batch only in RAM,
+# and a claim left behind by a process that is gone is put back.
+# ---------------------------------------------------------------------------
+
+class _NoSleep:
+    """`input_mux.time` with the pauses removed and monotonic left real."""
+    sleep = staticmethod(lambda *_a, **_k: None)
+    monotonic = staticmethod(time.monotonic)
+    time = staticmethod(time.time)
+
+
+def _queued(tmp_path, sid, *texts):
+    for t in texts:
+        input_mux.enqueue(tmp_path, sid, t, "tg-answer-owed")
+
+
+def test_drain_writes_the_claim_before_it_empties_the_queue(tmp_path):
+    """The invariant a kill cannot violate: after `_drain`, the batch is on
+    disk under the claim even though the queue is empty. This is the ordering,
+    not a nicety — the reverse order leaves the same RAM-only window."""
+    sid = "S-almdudleer-dev-p1"
+    _queued(tmp_path, sid, "его слова из телеграма")
+
+    batch = input_mux._drain(tmp_path, sid)
+
+    assert [m["text"] for m in batch] == ["его слова из телеграма"]
+    assert input_mux.read_queue(tmp_path, sid) == []          # queue emptied
+    claim = input_mux._read_inflight(tmp_path, sid)           # but not lost
+    assert [m["text"] for m in claim] == ["его слова из телеграма"]
+
+
+def test_flush_pending_recovers_a_batch_orphaned_by_a_restart(tmp_path):
+    """The state a SIGKILLed worker leaves behind — an empty queue and a claim
+    nobody holds a lock on — comes back as a queued message, not as nothing."""
+    sid = "S-almdudleer-dev-p2"
+    _queued(tmp_path, sid, "check mail")
+    input_mux._drain(tmp_path, sid)          # claimed, then (pretend) killed
+    assert input_mux.read_queue(tmp_path, sid) == []
+
+    res = input_mux.flush_pending(tmp_path)
+
+    assert res["recovered"] == 1
+    assert [m["text"] for m in input_mux.read_queue(tmp_path, sid)] == ["check mail"]
+    assert not input_mux._inflight_path(tmp_path, sid).exists()
+
+
+def test_recovered_batch_goes_to_the_FRONT_of_anything_queued_since(tmp_path):
+    """Order is part of the recovery: the orphan was written first and must be
+    read first, otherwise a recovered nudge answers a later message."""
+    sid = "S-almdudleer-dev-p3"
+    _queued(tmp_path, sid, "first")
+    input_mux._drain(tmp_path, sid)
+    _queued(tmp_path, sid, "second")
+
+    input_mux.recover_inflight(tmp_path, sid)
+
+    assert [m["text"] for m in input_mux.read_queue(tmp_path, sid)] == ["first", "second"]
+
+
+def test_a_confirmed_delivery_leaves_no_claim_to_replay(tmp_path):
+    """The other direction of the same guard: recovery must not resurrect a
+    message that WAS delivered. Without the clear this test sees a duplicate."""
+    sid = "S-almdudleer-dev-p4"
+    _queued(tmp_path, sid, "delivered once")
+
+    res = input_mux.flush(tmp_path, sid,
+                          pane_lookup=lambda s: "%1",
+                          capture=lambda p: _BUF_EMPTY,
+                          deliver=lambda pane, text: None)
+
+    assert res["delivered"] == 1
+    assert not input_mux._inflight_path(tmp_path, sid).exists()
+    assert input_mux.recover_inflight(tmp_path, sid) == 0
+    assert input_mux.read_queue(tmp_path, sid) == []
+
+
+def test_recovery_leaves_a_LIVE_delivery_alone(tmp_path):
+    """A claim is not evidence of an orphan — a flush running right now has one
+    too. The discriminator is the delivery flock, which a dead process cannot
+    hold and a live one does. Without this, a slow-but-alive delivery gets its
+    batch requeued underneath it and the session is nudged twice."""
+    sid = "S-almdudleer-dev-p5"
+    _queued(tmp_path, sid, "mid-delivery")
+    input_mux._drain(tmp_path, sid)
+
+    entered, release = threading.Event(), threading.Event()
+
+    def _holder():
+        with input_mux.delivery_lock(tmp_path, sid):
+            entered.set()
+            release.wait(5)
+
+    t = threading.Thread(target=_holder, daemon=True)
+    t.start()
+    assert entered.wait(5)
+    try:
+        assert input_mux.recover_inflight(tmp_path, sid) == 0
+        assert input_mux._inflight_path(tmp_path, sid).exists()
+        assert input_mux.read_queue(tmp_path, sid) == []
+    finally:
+        release.set()
+        t.join(5)
+
+    # ...and once that delivery is gone, the same claim IS recoverable — so the
+    # green above is the lock talking, not the recovery being inert.
+    assert input_mux.recover_inflight(tmp_path, sid) == 1
+
+
+def test_a_failed_delivery_requeues_without_leaving_a_duplicate_claim(tmp_path):
+    """T-0957's requeue-on-DeliveryNotConfirmed and T-1082's claim must not
+    both put the message back — that would deliver it twice."""
+    sid = "S-almdudleer-dev-p6"
+    _queued(tmp_path, sid, "swallowed Enter")
+
+    def _boom(pane, text):
+        raise input_mux.DeliveryNotConfirmed("composer never cleared")
+
+    with pytest.raises(input_mux.DeliveryNotConfirmed):
+        input_mux.flush(tmp_path, sid, pane_lookup=lambda s: "%1",
+                        capture=lambda p: _BUF_EMPTY, deliver=_boom)
+
+    assert [m["text"] for m in input_mux.read_queue(tmp_path, sid)] == ["swallowed Enter"]
+    assert input_mux.flush_pending(tmp_path)["recovered"] == 0
+
+
+def test_claim_files_are_not_mistaken_for_queues_by_the_sweep(tmp_path):
+    """`flush_pending` globs `*.jsonl` and the claim file ends in `.jsonl` too.
+    A claim read as a queue would be flushed to a pane that has no such sid."""
+    sid = "S-almdudleer-dev-p7"
+    _queued(tmp_path, sid, "only one real queue")
+    input_mux._drain(tmp_path, sid)
+
+    res = input_mux.flush_pending(tmp_path)
+
+    assert res["recovered"] == 1
+    # exactly one queue was considered — the sid's, not its claim. A claim read
+    # as a queue would show 2 here and try to deliver to a pane for the
+    # "<sid>.inflight" session, which does not exist.
+    assert res["queues"] == 1
+
+
+# ---------------------------------------------------------------------------
+# T-0913 — inject_input reported ok/lines_sent=1 for a nudge that was never
+# submitted. T-0957 gave the direct lane the confirmation; the RETURN VALUE
+# still threw it away, so the report stayed exactly as wrong as before. These
+# pin the report, not the retry.
+# ---------------------------------------------------------------------------
+
+def test_type_lines_reports_unconfirmed_when_the_composer_never_clears(monkeypatch):
+    """The measured T-0904 case: the payload lands in the composer, the Enter
+    goes nowhere, no turn starts. The count must still be 1 — it IS one line —
+    and the outcome must say it never submitted."""
+    _fast_confirm(monkeypatch)
+    monkeypatch.setattr(input_mux, "raw_keys", lambda *a, **k: None)
+
+    sent = input_mux._type_lines("%1", "check mail",
+                                 capture=lambda p: _BUF_PARKED)
+
+    assert sent.lines == 1 and sent == 1     # the number nobody's code may lose
+    assert sent.outcome == "unconfirmed"
+    assert sent.submitted is False
+
+
+def test_type_lines_reports_cleared_when_the_composer_empties(monkeypatch):
+    """The positive control for the assertion above — same call, same shape,
+    only the pane differs. Without it, `submitted is False` could just be what
+    this function always says."""
+    _fast_confirm(monkeypatch)
+    monkeypatch.setattr(input_mux, "raw_keys", lambda *a, **k: None)
+
+    sent = input_mux._type_lines("%1", "check mail",
+                                 capture=lambda p: _BUF_EMPTY)
+
+    assert sent.lines == 1
+    assert sent.outcome == "cleared"
+    assert sent.submitted is True
+
+
+def test_type_lines_reports_dialog_rather_than_calling_it_delivered(monkeypatch):
+    """A permission prompt holding the composer is its own outcome — the retry
+    stops there (T-0957), and stopping must not read as success."""
+    _fast_confirm(monkeypatch)
+    monkeypatch.setattr(input_mux, "raw_keys", lambda *a, **k: None)
+
+    sent = input_mux._type_lines("%1", "check mail",
+                                 capture=lambda p: _BUF_DIALOG)
+
+    assert sent.outcome == "dialog"
+    assert sent.submitted is False
+
+
+def test_the_worst_line_decides_a_multi_submission_payload(monkeypatch):
+    """Under the pre-T-1038 kill switch a payload is N submissions. Reporting
+    the LAST line's outcome would call a run delivered because its final line
+    happened to go through."""
+    monkeypatch.setenv("BOT_SQUAD_DIRECT_PASTE", "0")
+    monkeypatch.setattr(input_mux, "raw_keys", lambda *a, **k: None)
+    monkeypatch.setattr(input_mux, "time", _NoSleep())
+    outcomes = iter(["unconfirmed", "cleared"])   # line 1 parks, line 2 goes
+    monkeypatch.setattr(input_mux, "_submit_confirmed",
+                        lambda pane, what, capture: next(outcomes))
+
+    sent = input_mux._type_lines("%1", "one\ntwo", capture=lambda p: _BUF_EMPTY)
+
+    assert sent.lines == 2
+    assert sent.outcome == "unconfirmed"   # not "cleared" from the last line
+
+
+def test_inject_input_does_not_report_a_parked_nudge_as_delivered(tmp_path, monkeypatch):
+    """The ticket's own sentence, at the action: `{ok: true, lines_sent: 1}`
+    for a payload the composer never submitted. `ok` still means the transport
+    ran; `submitted` is the separate fact that was missing entirely."""
+    from bot_squad_worker import actions as A
+    from bot_squad_worker import sessions as S
+
+    cfg = type("C", (), {"data_dir": tmp_path})()
+    pane = S.PaneInfo(pane_id="%6", window="w", pid="123",
+                      cwd=str(tmp_path), command="claude")
+    sid = S.compute_sid("u", pane.window, pane.pane_id)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "list_panes", lambda: [pane])
+    monkeypatch.setattr(
+        input_mux, "deliver_direct",
+        lambda *a, **k: input_mux.DirectDelivery(1, "unconfirmed"))
+
+    res = A._action_inject_input({"sid": sid, "text": "hello"})
+
+    assert res["lines_sent"] == 1        # unchanged: it WAS one line
+    assert res["submitted"] is False     # ...that never became a turn
+    assert res["outcome"] == "unconfirmed"

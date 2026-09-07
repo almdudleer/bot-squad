@@ -2926,7 +2926,13 @@ def _action_inject_input(params: dict[str, Any]) -> dict[str, Any]:
     """Send text to the tmux pane for a SID.
 
     Required params: sid, text
-    Returns: {ok: true, pane_id, lines_sent: int}
+    Returns: {ok: true, pane_id, lines_sent: int, submitted: bool, outcome: str}
+
+    T-0913: ``submitted``/``outcome`` are the half that was missing. ``ok``
+    stays True for a transport that RAN — the pane existed, the keystrokes
+    went out — and ``submitted`` is the separate question of whether the
+    composer then cleared. Folding the second into the first would make every
+    caller that only ever wanted "did the socket work" start seeing failures.
 
     T-0578: the transport is ``input_mux.deliver_direct`` — content lands
     byte-identical (verbatim, uncaptioned: "check mail" stays "check mail",
@@ -2976,10 +2982,23 @@ def _action_inject_input(params: dict[str, Any]) -> dict[str, Any]:
     if text == _boot.MAIL_SIGNAL:
         text = _boot.mail_nudge(_provider_for_pane(cfg, sid, pane))
 
-    lines_sent = input_mux.deliver_direct(
+    sent = input_mux.deliver_direct(
         cfg.data_dir, sid, pane.pane_id, text,
     )
-    return {"ok": True, "pane_id": pane.pane_id, "lines_sent": lines_sent}
+    if not sent.submitted:
+        # T-0913: this used to return {ok: true, lines_sent: 1} for a payload
+        # the composer accepted and never submitted — no turn started, nothing
+        # anywhere reported a failure, and the caller could not tell that case
+        # from a delivered one. The direct lane has no queue to requeue into,
+        # so the honest thing is to say so rather than to retry behind the
+        # caller's back; `outcome` says WHICH ("dialog" = a permission prompt
+        # is holding the composer, "unconfirmed" = the Enter went nowhere).
+        log.warning(
+            "inject_input: %s took %d line(s) into its composer but never "
+            "submitted them (outcome=%s) — reporting NOT delivered",
+            sid, sent.lines, sent.outcome)
+    return {"ok": True, "pane_id": pane.pane_id, "lines_sent": sent.lines,
+            "submitted": sent.submitted, "outcome": sent.outcome}
 
 
 # ---------------------------------------------------------------------------

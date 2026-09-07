@@ -105,6 +105,21 @@ def _delivery_lock_path(data_dir: Path | str, sid: str) -> Path:
     return queue_dir(data_dir) / f"{_safe(sid)}.delivery.lock"
 
 
+def _inflight_path(data_dir: Path | str, sid: str) -> Path:
+    """Where a CLAIMED-but-not-yet-delivered batch lives (T-1082).
+
+    :func:`_drain` used to be the only step between "durable in the queue" and
+    "typed into the composer": it truncated the queue file, and from that
+    instant until :func:`_deliver_to_pane` returned, the batch existed ONLY in
+    a local variable. ``flush`` requeues on an *exception*, but a process death
+    is not an exception — a worker restart inside that window destroyed the
+    payload with nothing on disk left to say it ever existed, and no sweep
+    could find it because there was nothing to find. That is the shape the
+    T-1082 question is about, and this file is what makes it recoverable.
+    """
+    return queue_dir(data_dir) / f"{_safe(sid)}.inflight.jsonl"
+
+
 @contextlib.contextmanager
 def delivery_lock(data_dir: Path | str, sid: str) -> Iterator[None]:
     """Hold ``sid``'s exclusive delivery lock — the anti-interleave gate.
@@ -240,16 +255,60 @@ def _drain(data_dir: Path | str, sid: str) -> list[dict[str, Any]]:
     fully before the read or fully after the truncate — never a half line, and
     never a message silently dropped (an append after the truncate stays
     queued for the next flush).
+
+    T-1082: the batch is written to :func:`_inflight_path` BEFORE the queue is
+    truncated, and the order is the whole point — there is no instant at which
+    the only copy is the return value of this function. A worker restart
+    between here and delivery therefore leaves a claim on disk that
+    :func:`recover_inflight` puts back, instead of a message that never existed.
     """
     lock_fd = open(_append_lock_path(data_dir, sid), "w")
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         msgs = read_queue(data_dir, sid)
         if msgs:
+            _write_inflight(data_dir, sid, msgs)
             queue_path(data_dir, sid).write_text("", encoding="utf-8")
         return msgs
     finally:
         lock_fd.close()
+
+
+def _write_inflight(data_dir: Path | str, sid: str,
+                    msgs: list[dict[str, Any]]) -> None:
+    """Persist a claimed batch, atomically, before the queue is emptied."""
+    path = _inflight_path(data_dir, sid)
+    body = "".join(json.dumps(m, ensure_ascii=False) + "\n" for m in msgs)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(body, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _read_inflight(data_dir: Path | str, sid: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    try:
+        with open(_inflight_path(data_dir, sid), encoding="utf-8") as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if ln:
+                    out.append(json.loads(ln))
+    except FileNotFoundError:
+        return []
+    except (OSError, json.JSONDecodeError):
+        log.exception("input_mux: %s's in-flight claim is unreadable", sid)
+        return []
+    return out
+
+
+def _clear_inflight(data_dir: Path | str, sid: str) -> None:
+    """Drop the claim — the batch is accounted for (delivered or requeued)."""
+    try:
+        _inflight_path(data_dir, sid).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        log.warning("input_mux: could not clear %s's in-flight claim", sid,
+                    exc_info=True)
 
 
 def _requeue_front(data_dir: Path | str, sid: str,
@@ -368,6 +427,43 @@ def raw_keys(pane_id: str, *keys: str) -> None:
     _run(["tmux", "send-keys", "-t", pane_id, *keys])
 
 
+class DirectDelivery(int):
+    """What the direct lane actually achieved (T-0913).
+
+    IS the line count — the number ``inject_input`` has always returned as
+    ``lines_sent`` — carrying the half that was missing: whether the payload
+    was SUBMITTED, or merely typed into a composer that never cleared. The two
+    were conflated, and the conflation IS the ticket: a nudge that reached the
+    composer and stopped there returned ``{ok: true, lines_sent: 1}``,
+    indistinguishable from one that started a turn, with nothing anywhere
+    reporting a failure.
+
+    An ``int`` subclass rather than a tuple, deliberately, and the reason is
+    not brevity. This is the return value of a shared hot path with callers and
+    tests in five files and two projects; a type that no longer compares equal
+    to its own count would have turned "say one more true thing" into an API
+    break, and the pressure would then be to skip saying it. ``bool`` is an
+    ``int`` for the same reason. ``json.dumps`` still emits the number.
+    """
+    outcome: str
+
+    def __new__(cls, lines: int, outcome: str) -> "DirectDelivery":
+        self = super().__new__(cls, lines)
+        self.outcome = outcome
+        return self
+
+    @property
+    def lines(self) -> int:
+        return int(self)
+
+    @property
+    def submitted(self) -> bool:
+        return self.outcome == "cleared"
+
+    def __repr__(self) -> str:
+        return f"DirectDelivery(lines={int(self)}, outcome={self.outcome!r})"
+
+
 class DeliveryNotConfirmed(RuntimeError):
     """Raised when a payload was sent but the composer never showed it clear.
 
@@ -470,7 +566,7 @@ _DIRECT_INTERLINE_PAUSE_SEC = 0.4
 
 
 def deliver_direct(data_dir: Path | str, sid: str, pane_id: str, text: str, *,
-                   capture: Callable[[str], str] | None = None) -> int:
+                   capture: Callable[[str], str] | None = None) -> DirectDelivery:
     """Verbatim direct-lane transport (the old raw ``inject_input`` loop).
 
     Sends ``text`` verbatim — no caption, no batching — with byte-identical
@@ -478,8 +574,12 @@ def deliver_direct(data_dir: Path | str, sid: str, pane_id: str, text: str, *,
     lane exists for; a multi-line payload lands as ONE composer message rather
     than one per line (T-1038, see :func:`_type_lines`). Serialised under the
     per-sid :func:`delivery_lock` so it cannot interleave with a queued-lane flush
-    or teardown keys, and gated (bounded) on live user typing. Returns the
-    number of lines sent.
+    or teardown keys, and gated (bounded) on live user typing.
+
+    Returns :class:`DirectDelivery` — the line count this has always returned,
+    plus whether the payload was actually SUBMITTED (T-0913). The direct lane
+    has no queue to requeue into, so an unsubmitted payload cannot be retried
+    later; the only thing that helps is that the caller is TOLD.
     """
     capture = capture or _capture_pane
     with delivery_lock(data_dir, sid):
@@ -634,8 +734,8 @@ def _direct_paste_enabled() -> bool:
 
 
 def _type_lines(pane_id: str, text: str, *,
-                capture: Callable[[str], str] | None = None) -> int:
-    """The verbatim lane's keystrokes. Returns the number of LINES delivered.
+                capture: Callable[[str], str] | None = None) -> DirectDelivery:
+    """The verbatim lane's keystrokes. Returns :class:`DirectDelivery`.
 
     A SINGLE-LINE payload — every nudge this lane was written for ("check
     mail", "/compact", the marker-prefixed idle/keepalive/dev nudges) — is
@@ -660,8 +760,10 @@ def _type_lines(pane_id: str, text: str, *,
     line 1 while the rest is still landing — which is the same defect T-0773
     fixed on the TG reply path, wearing a marker.
 
-    The number of lines, not submissions, stays the return value: it is what
-    ``inject_input`` has always reported as ``lines_sent``.
+    The number of lines, not submissions, stays the ``lines`` field: it is what
+    ``inject_input`` has always reported as ``lines_sent``. T-0913 adds the
+    ``outcome`` beside that count rather than changing it, so no caller's
+    number moves and the one fact that was missing becomes available.
     """
     capture = capture or _capture_pane
     lines = text.split("\n")
@@ -669,14 +771,20 @@ def _type_lines(pane_id: str, text: str, *,
     if len(lines) > 1 and _direct_paste_enabled():
         _paste_block(pane_id, text)
         time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
-        _submit_confirmed(pane_id, text, capture)
-        return len(lines)
+        outcome = _submit_confirmed(pane_id, text, capture)
+        return DirectDelivery(len(lines), outcome)
 
+    # T-0913: the WORST outcome wins. Under the pre-T-1038 kill switch a payload
+    # is N submissions, and reporting the last line's success for a run where
+    # line 3 stuck in the composer is the same lie one level down.
+    worst = "cleared"
     for line in lines:
         raw_keys(pane_id, "--", line)
         time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
-        _submit_confirmed(pane_id, line, capture)
-    return len(lines)
+        outcome = _submit_confirmed(pane_id, line, capture)
+        if outcome != "cleared" and worst == "cleared":
+            worst = outcome
+    return DirectDelivery(len(lines), worst)
 
 
 def _live_draft_block(capture: Callable[[str], str], pane_id: str,
@@ -795,14 +903,14 @@ def _deliver_ahead_of_draft(data_dir: Path | str, sid: str, pane_id: str,
         time.sleep(_CLEAR_KEY_PAUSE_SEC)
     _drain_leftover_rows(pane_id, capture)
 
-    lines_sent = _type_lines(pane_id, text, capture=capture)
+    sent = _type_lines(pane_id, text, capture=capture)
 
     _restore_draft(pane_id, draft)
     time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
     log.info("input_mux: delivered %d line(s) to %s ahead of his draft "
-             "(%d chars over %d row(s), copy at %s)", lines_sent, sid,
-             len(draft), len(block.rows), saved)
-    return lines_sent
+             "(%d chars over %d row(s), submitted=%s, copy at %s)", sent.lines,
+             sid, len(draft), len(block.rows), sent.submitted, saved)
+    return sent
 
 
 #: Pause between the ``C-u`` presses that clear the composer. Shorter than
@@ -905,9 +1013,80 @@ def flush(data_dir: Path | str, sid: str, *,
             deliver(pane, format_batch(batch))
         except Exception:
             _requeue_front(data_dir, sid, batch)
+            _clear_inflight(data_dir, sid)
             raise
+        _clear_inflight(data_dir, sid)
         return {"delivered": len(batch), "deferred": False,
                 "reason": "delivered", "pane": pane}
+
+
+def recover_inflight(data_dir: Path | str, sid: str) -> int:
+    """Put a batch orphaned by a worker restart back at the FRONT of the queue.
+
+    T-1082. A claim file outlives the process that made it, so its mere
+    presence is not proof of an orphan — a flush running RIGHT NOW has one too.
+    What distinguishes them is the delivery flock: a live flush holds it for
+    the whole of :func:`_deliver_to_pane`, and a dead one cannot hold anything,
+    because the kernel drops a dead process's flocks. So the test for "orphaned"
+    is "can I take this sid's delivery lock without waiting", and it is exact
+    rather than a timeout guess — no age threshold to tune, and no window in
+    which a slow-but-alive delivery gets its batch requeued underneath it and
+    delivered twice.
+
+    Returns the number of messages recovered (0 when there is nothing to do or
+    a delivery is live).
+
+    The requeue happens BEFORE the claim is cleared, deliberately: a death in
+    the millisecond between them costs a DUPLICATE nudge on the next sweep,
+    and the other order costs the message. This whole function exists because
+    losing it is the worse failure.
+    """
+    path = _inflight_path(data_dir, sid)
+    if not path.exists():
+        return 0
+    queue_dir(data_dir).mkdir(parents=True, exist_ok=True)
+    lock_fd = open(_delivery_lock_path(data_dir, sid), "w")
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return 0  # a flush is mid-delivery; its own handlers own this claim
+        msgs = _read_inflight(data_dir, sid)
+        if not msgs:
+            _clear_inflight(data_dir, sid)
+            return 0
+        _requeue_front(data_dir, sid, msgs)
+        _clear_inflight(data_dir, sid)
+        log.warning(
+            "input_mux: recovered %d message(s) for %s that were claimed for "
+            "delivery but never confirmed — a worker restart landed between "
+            "the drain and the composer. Requeued at the front; NOT counted "
+            "as delivered.", len(msgs), sid)
+        return len(msgs)
+    finally:
+        lock_fd.close()
+
+
+def recover_pending(data_dir: Path | str) -> dict[str, Any]:
+    """Sweep every orphaned claim. Runs before the flush pass on each tick."""
+    qdir = queue_dir(data_dir)
+    try:
+        claims = list(qdir.glob("*.inflight.jsonl"))
+    except FileNotFoundError:
+        return {"sids": 0, "recovered": 0}
+    sids = 0
+    recovered = 0
+    for cf in claims:
+        sid = cf.name[: -len(".inflight.jsonl")]
+        try:
+            got = recover_inflight(data_dir, sid)
+        except Exception:  # noqa: BLE001 — one bad claim never kills the sweep
+            log.exception("input_mux: recover_inflight failed for %s", sid)
+            continue
+        if got:
+            sids += 1
+            recovered += got
+    return {"sids": sids, "recovered": recovered}
 
 
 def flush_pending(data_dir: Path | str) -> dict[str, Any]:
@@ -931,10 +1110,15 @@ def flush_pending(data_dir: Path | str) -> dict[str, Any]:
     delivered = 0
     flushed = 0
     deferred = 0
+    # T-1082: reclaim anything a restart orphaned BEFORE this pass reads the
+    # queues, so a recovered batch is delivered by this same tick rather than
+    # waiting another 15s.
+    recovered = recover_pending(data_dir).get("recovered", 0)
     try:
         files = list(qdir.glob("*.jsonl"))
     except FileNotFoundError:
         files = []
+    files = [f for f in files if not f.name.endswith(".inflight.jsonl")]
     for qf in files:
         sid = qf.stem
         try:
@@ -954,4 +1138,5 @@ def flush_pending(data_dir: Path | str) -> dict[str, Any]:
         delivered += res.get("delivered", 0)
         if res.get("deferred"):
             deferred += 1
-    return {"queues": flushed, "delivered": delivered, "deferred": deferred}
+    return {"queues": flushed, "delivered": delivered, "deferred": deferred,
+            "recovered": recovered}

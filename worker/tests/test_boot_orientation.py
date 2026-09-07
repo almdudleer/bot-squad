@@ -421,7 +421,12 @@ def _inject(tmp_path, monkeypatch, pane_cmd: str, text: str,
     sent: list[str] = []
     monkeypatch.setattr(
         input_mux, "deliver_direct",
-        lambda data_dir, sid_, pane_id, text_, **kw: (sent.append(text_), 1)[1])
+        # T-0913: the real transport returns DirectDelivery (an int carrying
+        # whether the composer actually submitted), and `_action_inject_input`
+        # now reads that. A double returning a bare 1 would make this file green
+        # while the action it exercises raises in production.
+        lambda data_dir, sid_, pane_id, text_, **kw: (
+            sent.append(text_), input_mux.DirectDelivery(1, "cleared"))[1])
 
     A._action_inject_input({"sid": sid, "text": text})
     assert len(sent) == 1

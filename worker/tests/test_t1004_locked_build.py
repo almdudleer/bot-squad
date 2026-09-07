@@ -209,6 +209,15 @@ def _exec_guard(tmp_path, locked: str, installed: str) -> int:
     env = dict(os.environ)
     env["PATH"] = f"{bin_dir}:{os.environ['PATH']}"
     env["FAKE_INSTALLED"] = str(fake)
+    # R-0010: the guard's scratch paths are ${TMPDIR:-/tmp}/*.txt — pin TMPDIR to
+    # a subdirectory of this test's own tmp_path (NOT tmp_path itself: the guard
+    # writes its own "installed.txt" there, which would collide with and
+    # truncate the FAKE_INSTALLED fixture file of the same name before the pip
+    # stub gets to read it) so concurrent runs of this file don't race on a
+    # shared /tmp/installed.txt and /tmp/locked.txt.
+    guard_tmp = tmp_path / "guard-tmp"
+    guard_tmp.mkdir(exist_ok=True)
+    env["TMPDIR"] = str(guard_tmp)
     script = tmp_path / "run.sh"
     script.write_text("set -e\n" + _run_block())
     return subprocess.run(["bash", str(script)], cwd=str(tmp_path),

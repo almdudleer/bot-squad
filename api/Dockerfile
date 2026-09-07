@@ -64,17 +64,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # lowercased and underscores normalised because pip freeze and PyPI disagree on
 # both (pydantic_core vs pydantic-core, PyYAML vs pyyaml).
 COPY api/pyproject.toml api/requirements.lock ./
+# T-1004/R-0010: scratch paths honour TMPDIR (unset -> /tmp, unchanged image
+# behaviour) so this SAME body can be executed on the host by the test suite
+# without two concurrent executions overwriting each other's scratch files.
+# `RUN` is not Dockerfile-substituted — the build shell expands ${TMPDIR:-/tmp}.
 RUN pip install --no-cache-dir -r requirements.lock \
  && pip install --no-cache-dir --no-deps -e . \
  && pip freeze --exclude-editable | grep -E '^[A-Za-z0-9_.-]+==' \
-      | tr 'A-Z_' 'a-z-' | sort > /tmp/installed.txt \
+      | tr 'A-Z_' 'a-z-' | sort > "${TMPDIR:-/tmp}/installed.txt" \
  && grep -E '^[A-Za-z0-9_.-]+==' requirements.lock \
-      | tr 'A-Z_' 'a-z-' | sort > /tmp/locked.txt \
- && { diff -u /tmp/locked.txt /tmp/installed.txt \
+      | tr 'A-Z_' 'a-z-' | sort > "${TMPDIR:-/tmp}/locked.txt" \
+ && { diff -u "${TMPDIR:-/tmp}/locked.txt" "${TMPDIR:-/tmp}/installed.txt" \
       || { echo "T-1004: LOCK DRIFT — the installed set is not the locked set."; \
            echo "The image would not be a function of the ref. Refusing."; \
            exit 1; }; } \
- && rm -f /tmp/installed.txt /tmp/locked.txt
+ && rm -f "${TMPDIR:-/tmp}/installed.txt" "${TMPDIR:-/tmp}/locked.txt"
 
 COPY api/app /app/app
 COPY --from=web-builder /web/dist /app/web/dist

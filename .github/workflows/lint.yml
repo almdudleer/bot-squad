@@ -64,6 +64,18 @@ jobs:
         # that never installed core.hooksPath).
         run: |
           python3 scripts/lint/duplicate_def_census.py -v scripts/cli/bsq
+      - name: Cross-tree importorskip census stays enumerated (T-1036)
+        # Stdlib-only AST census (worker/tests <-> api/tests importorskip
+        # sites that reach into the OTHER tree). T-1036 found ONE such site
+        # (below) covered by NO gate arm — the worker arm's own venv lacks
+        # `app`, so it always skipped, and the api arm never collects
+        # worker/tests at all, so the skip read as harmless. This step fails
+        # if a new cross-tree site appears (or a pinned one vanishes) without
+        # updating scripts/lint/cross_tree_skip_census.py's ALLOWLIST — the
+        # step below reads this script's `--list`, not a hand-typed nodeid,
+        # so a newly-added site is picked up by BOTH steps together, not one.
+        run: |
+          python3 scripts/lint/cross_tree_skip_census.py
       - name: Install api test deps
         run: |
           pip install --upgrade pip
@@ -179,9 +191,20 @@ jobs:
         # here, so this step cannot go quietly uncovered the way the test did:
         # if `app` ever stops being importable in this job the step goes RED
         # rather than green-with-a-skip. `-rs` prints the reason for any skip.
+        #
+        # T-1036: the nodeid list comes from cross_tree_skip_census.py --list,
+        # the same SSOT the step above checks against ALLOWLIST — a second
+        # worker-side cross-tree site added there is run here automatically,
+        # not only censused. (A future api-side site, `api/tests` reaching
+        # into `bot_squad_worker`, needs its own step with an api-shaped
+        # environment — the `grep` below deliberately runs only the
+        # worker/tests half of the census so this step never receives a path
+        # it can't execute; the census step above still catches that new site
+        # going unhandled.)
         run: |
-          cd worker && PYTHONPATH=. BOT_SQUAD_REQUIRE_CROSS_TREE=1 pytest \
-            "tests/test_sessions.py::test_session_history_ts_preserved_on_api_patch_roundtrip" -x -q -rs
+          cd worker && PYTHONPATH=.:../api BOT_SQUAD_REQUIRE_CROSS_TREE=1 pytest \
+            $(cd .. && python3 scripts/lint/cross_tree_skip_census.py --list | grep '^worker/tests/' | sed 's#^worker/tests/#tests/#') \
+            -x -q -rs
       - name: The priority WRITER and the priority READER share one vocabulary (T-0877)
         # The defect this pins was not in either half. `bsq task new --priority`
         # stored any string ("priority value, verbatim"); pickup's ranking read

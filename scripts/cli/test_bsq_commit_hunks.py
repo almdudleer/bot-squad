@@ -340,6 +340,172 @@ def test_commit_hunks_patch_with_matching_declared_files_commits_all(repo):
     assert _git(r, "show", "HEAD:b.txt").strip() == "b2"
 
 
+def _peer_commit_shim(shim_dir, repo, trigger, binary="flock"):
+    """A PATH shim that lands a PEER commit exactly once, immediately before the
+    real `<binary> <trigger>` runs — i.e. inside the window this ticket is about.
+
+    `flock` puts the peer commit just before we acquire the commit lock (the
+    realistic case: safe-commit has not locked yet). `git commit` puts it at the
+    last possible instant, after any in-lock check, which is what a peer
+    committing OUTSIDE safe-commit's lock looks like.
+    """
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    real = subprocess.run(["bash", "-lc", f"command -v {binary}"],
+                          capture_output=True, text=True).stdout.strip()
+    guard = ('[ "$1" = "%s" ] && ' % trigger) if trigger else ""
+    (shim_dir / binary).write_text(f"""#!/bin/bash
+if {guard}[ ! -f "{repo}/.git/PEER_FIRED" ]; then
+  touch "{repo}/.git/PEER_FIRED"
+  ( cd "{repo}"
+    BR=$(git rev-parse --abbrev-ref HEAD); ti=$(mktemp)
+    GIT_INDEX_FILE=$ti git read-tree HEAD
+    b=$(printf 'peer1\\npeer2\\nPEER-NEW\\n' | git hash-object -w --stdin)
+    GIT_INDEX_FILE=$ti git update-index --add --cacheinfo 100644,$b,peer.txt
+    t=$(GIT_INDEX_FILE=$ti git write-tree)
+    c=$(GIT_INDEX_FILE=$ti git commit-tree $t -p $(git rev-parse HEAD) -m "peer commit in the window")
+    git update-ref refs/heads/$BR $c
+    printf 'peer1\\npeer2\\nPEER-NEW\\n' > peer.txt
+    rm -f $ti ) < /dev/null > /dev/null 2>&1
+fi
+exec {real} "$@"
+""")
+    (shim_dir / binary).chmod(0o755)
+    return shim_dir
+
+
+def _repo_with_my_patch(repo):
+    """Base commit + my one-file patch, ready to commit. Returns (r, bs, patch)."""
+    r, bs = repo["repo"], repo["bot_squad"]
+    (r / "mine.txt").write_text("mine1\nmine2\nmine3\n")
+    (r / "peer.txt").write_text("peer1\npeer2\n")
+    _git(r, "add", "mine.txt", "peer.txt")
+    _git(r, "commit", "-q", "-m", "base")
+    (r / "mine.txt").write_text("mine1\nmine2-MINE\nmine3\n")
+    patch = r / "mine.patch"
+    patch.write_text(_git(r, "diff", "--", "mine.txt"))
+    return r, bs, patch
+
+
+def test_a_peer_commit_before_the_lock_cannot_be_reverted(repo, tmp_path):
+    """T-0970, the incident: a peer commit landing between our index seeding and
+    our commit used to produce a CORRECT parent pointer over a tree that
+    predates it — silently reverting everything they landed, at exit 0.
+
+    The commit must be REFUSED, and nothing of the peer's may move.
+    """
+    r, bs, patch = _repo_with_my_patch(repo)
+    peer_head_before = _git(r, "rev-parse", "HEAD").strip()
+    shim = _peer_commit_shim(tmp_path / "shim", r, trigger=None, binary="flock")
+    env = dict(os.environ)
+    env["BOT_SQUAD"] = bs
+    env["PATH"] = f"{shim}:{env['PATH']}"
+    cm = subprocess.run(
+        ["python3", str(_BSQ_PATH), "commit", "--hunks", "--ack", "--patch",
+         str(patch), "--sid", "S-me-dev-p1", "-m", "mine only", "mine.txt"],
+        cwd=r, capture_output=True, text=True, env=env, timeout=180,
+    )
+    assert cm.returncode != 0, "a stale-base commit must be refused, not reported as success"
+    out = cm.stdout + cm.stderr
+    assert "T-0970" in out
+    # The peer's commit is HEAD and its content is intact.
+    assert "PEER-NEW" in _git(r, "show", "HEAD:peer.txt")
+    # Ours never landed: HEAD is the peer's commit, whose parent is the base.
+    assert _git(r, "rev-parse", "HEAD^").strip() == peer_head_before
+    assert "mine only" not in _git(r, "log", "--format=%s")
+
+
+def test_the_refusal_names_both_shas_so_the_retry_is_mechanical(repo, tmp_path):
+    """The refusal has to say what to re-extract against, or the reader guesses."""
+    r, bs, patch = _repo_with_my_patch(repo)
+    base = _git(r, "rev-parse", "HEAD").strip()
+    shim = _peer_commit_shim(tmp_path / "shim", r, trigger=None, binary="flock")
+    env = dict(os.environ)
+    env["BOT_SQUAD"] = bs
+    env["PATH"] = f"{shim}:{env['PATH']}"
+    cm = subprocess.run(
+        ["python3", str(_BSQ_PATH), "commit", "--hunks", "--ack", "--patch",
+         str(patch), "--sid", "S-me-dev-p1", "-m", "mine only", "mine.txt"],
+        cwd=r, capture_output=True, text=True, env=env, timeout=180,
+    )
+    out = cm.stdout + cm.stderr
+    assert base in out, "the refusal must name the base the index was seeded from"
+    assert _git(r, "rev-parse", "HEAD").strip() in out, "and the head to rebase onto"
+
+
+def test_a_peer_outside_the_commit_lock_is_caught_after_the_fact(repo, tmp_path):
+    """A peer that does NOT take safe-commit's lock can still land inside the
+    last instant. Prevention is impossible there, so the commit happens — but it
+    must exit non-zero and say the tree is stale, never report success."""
+    r, bs, patch = _repo_with_my_patch(repo)
+    shim = _peer_commit_shim(tmp_path / "shim", r, trigger="commit", binary="git")
+    env = dict(os.environ)
+    env["BOT_SQUAD"] = bs
+    env["PATH"] = f"{shim}:{env['PATH']}"
+    cm = subprocess.run(
+        ["python3", str(_BSQ_PATH), "commit", "--hunks", "--ack", "--patch",
+         str(patch), "--sid", "S-me-dev-p1", "-m", "mine only", "mine.txt"],
+        cwd=r, capture_output=True, text=True, env=env, timeout=180,
+    )
+    assert cm.returncode != 0, "a landed stale-base commit must not exit 0"
+    out = cm.stdout + cm.stderr
+    assert "STALE BASE" in out
+    assert "peer.txt" in out, "the address list must name what was reverted"
+
+
+def test_a_peer_committing_AFTER_us_is_not_reported_as_a_stale_base(repo, tmp_path):
+    """The remedy must not fail in the opposite direction.
+
+    Layer 2 used to read HEAD^ to find our commit's parent. A peer landing in
+    the milliseconds AFTER ours moves HEAD, so HEAD^ became OUR commit and a
+    perfectly good commit was accused of reverting work — which would send the
+    author into a "recovery" that reverts real work. Our commit is identified by
+    the TREE we built, which no later commit can move.
+    """
+    r, bs, patch = _repo_with_my_patch(repo)
+    base = _git(r, "rev-parse", "HEAD").strip()
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    real = subprocess.run(["bash", "-lc", "command -v git"],
+                          capture_output=True, text=True).stdout.strip()
+    # run the real commit FIRST, then land a peer commit in the gap before the
+    # post-commit assertion reads the repo.
+    (shim / "git").write_text(f"""#!/bin/bash
+if [ "$1" = "commit" ] && [ ! -f "{r}/.git/PEER_FIRED" ]; then
+  touch "{r}/.git/PEER_FIRED"
+  {real} "$@"; rc=$?
+  ( cd "{r}"
+    BR=$({real} rev-parse --abbrev-ref HEAD); ti=$(mktemp)
+    GIT_INDEX_FILE=$ti {real} read-tree HEAD
+    b=$(printf 'peer1\\npeer2\\nLATER\\n' | {real} hash-object -w --stdin)
+    GIT_INDEX_FILE=$ti {real} update-index --add --cacheinfo 100644,$b,peer.txt
+    t=$(GIT_INDEX_FILE=$ti {real} write-tree)
+    c=$(GIT_INDEX_FILE=$ti {real} commit-tree $t -p $({real} rev-parse HEAD) -m "peer commit AFTER ours")
+    {real} update-ref refs/heads/$BR $c
+    rm -f $ti ) < /dev/null > /dev/null 2>&1
+  exit $rc
+fi
+exec {real} "$@"
+""")
+    (shim / "git").chmod(0o755)
+    env = dict(os.environ)
+    env["BOT_SQUAD"] = bs
+    env["PATH"] = f"{shim}:{env['PATH']}"
+    cm = subprocess.run(
+        ["python3", str(_BSQ_PATH), "commit", "--hunks", "--ack", "--patch",
+         str(patch), "--sid", "S-me-dev-p1", "-m", "mine only", "mine.txt"],
+        cwd=r, capture_output=True, text=True, env=env, timeout=180,
+    )
+    out = cm.stdout + cm.stderr
+    assert "STALE BASE" not in out, \
+        "our commit sat directly on its base; accusing it would send the author to revert good work"
+    assert cm.returncode == 0, out
+    # both commits are present and neither reverted the other
+    assert "LATER" in _git(r, "show", "HEAD:peer.txt")
+    ours = _git(r, "rev-parse", "HEAD^").strip()
+    assert _git(r, "rev-parse", f"{ours}^").strip() == base
+    assert "mine2-MINE" in _git(r, "show", f"{ours}:mine.txt")
+
+
 def test_commit_hunks_patch_needs_a_real_patch_file(repo):
     r, bs = repo["repo"], repo["bot_squad"]
     (r / "a.txt").write_text("a\n")

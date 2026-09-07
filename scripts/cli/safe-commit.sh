@@ -299,6 +299,45 @@ if [ -n "${BOT_SQUAD_STAGE_PATHS_FILE:-}" ]; then
     fi
 fi
 
+# ---------------------------------------------------------------------------
+# Base compare-and-swap (T-0970) — refuse a commit whose index was seeded from a
+# HEAD that has since moved.
+#
+# An isolated-index caller seeds `git read-tree <base>` and only reaches here
+# some seconds later, after its own audit and this script's peer-activity
+# report. A peer commit landing in that gap is NOT caught by git: `git commit`
+# CAS-checks HEAD only from its own start, so it happily records the new HEAD as
+# parent while writing the tree we seeded from the old one — a well-formed
+# commit that silently reverts everything the peer landed (15 files / 1453
+# deletions on 2026-09-06, again on 2026-09-07).
+#
+# Checked HERE, inside the flock, because that is the only race-free place: every
+# lane that commits through safe-commit is serialized on this lock, so a peer's
+# commit either precedes our lock (we refuse, having committed nothing) or
+# queues behind it. Opt-in via the env var, so no other caller changes.
+# ---------------------------------------------------------------------------
+if [ -n "${BOT_SQUAD_EXPECT_HEAD:-}" ]; then
+    head_now="$(git rev-parse HEAD 2>/dev/null || echo '')"
+    if [ "$head_now" != "$BOT_SQUAD_EXPECT_HEAD" ]; then
+        cat >&2 <<EOF
+safe-commit: REFUSED (T-0970) — HEAD moved while your commit was being prepared.
+
+  your index was seeded from: ${BOT_SQUAD_EXPECT_HEAD}
+  HEAD is now:                ${head_now:-<unborn>}
+
+Committing now would record the NEW head as this commit's parent while writing a
+tree built from the OLD one — which silently reverts everything that landed in
+between. The parent pointer would look correct and the commit would succeed;
+only the tree would be wrong. NOTHING HAS BEEN COMMITTED.
+
+Re-extract your hunks against the current HEAD and retry:
+  git diff ${head_now} -- <your files>   # rebuild the patch on the new base
+EOF
+        exec 9>&-
+        exit 4
+    fi
+fi
+
 git commit "$@"
 rc=$?
 

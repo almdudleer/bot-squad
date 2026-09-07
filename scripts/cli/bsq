@@ -5535,7 +5535,10 @@ def _pace_print_automation(snap: dict, slug: str, *, verbose: bool = False) -> N
 # the WHOLE file from the worktree — so a peer's dirty hunks in <f> ride along.
 # Approach A (T-0215): `bsq edit-begin <f>` snapshots this session's baseline;
 # `bsq commit --hunks -- <f>` commits only the (baseline → current) diff, applied
-# onto a TEMP index seeded from HEAD. The shared index and the peer's worktree
+# onto a TEMP index seeded from a base sha PINNED once at the start of the commit
+# (T-0970 — `read-tree HEAD` re-resolves a ref a peer can move between the seed
+# and the commit, producing a correct parent over a tree that predates their
+# work, i.e. a silent revert). The shared index and the peer's worktree
 # hunks are never touched, so a co-edited file can't sweep a peer's work.
 # Limitation: if a peer edits the SAME region AFTER your edit-begin, the apply
 # fails loud (never corrupts) and you resolve manually. A peer editing the same
@@ -6187,6 +6190,75 @@ def _warn_clone_drift(repo_root: str) -> None:
         print(msg, file=sys.stderr)
 
 
+def _find_our_commit(repo_root: str, base_sha: str, expected_tree: str) -> str:
+    """The commit whose tree is the one we built, at or after `base_sha`.
+
+    Identity by CONTENT, not by position: HEAD moves. Returns "" when it cannot
+    be established, and every caller treats that as "do not claim anything"
+    rather than falling back to HEAD — an unidentified commit is exactly the
+    case where a guess produces a confident wrong accusation.
+    """
+    if not expected_tree:
+        return ""
+    rng = subprocess.run(
+        ["git", "rev-list", "--max-count=50", f"{base_sha}..HEAD"],
+        cwd=repo_root, capture_output=True, text=True)
+    if rng.returncode != 0:
+        return ""
+    # oldest first: ours is the earliest commit carrying our tree
+    for sha in reversed(rng.stdout.split()):
+        t = subprocess.run(["git", "rev-parse", f"{sha}^{{tree}}"], cwd=repo_root,
+                           capture_output=True, text=True).stdout.strip()
+        if t == expected_tree:
+            return sha
+    return ""
+
+
+def _assert_base_still_parent(repo_root: str, base_sha: str, expected_tree: str,
+                              expected: list[str]) -> None:
+    """T-0970: the commit we just made MUST sit directly on the base we seeded.
+
+    safe-commit refuses this case inside its lock, so reaching here means the
+    peer commit came from something that does not take that lock (a raw
+    `git commit`). The damage is already on the branch at this point, which is
+    exactly why it is shouted rather than logged: the failure is well-formed —
+    correct parent pointer, successful exit, a tree that silently reverts
+    whatever landed in between — and the one thing that makes it survivable is
+    that the author learns about it in the same second rather than four minutes
+    later.
+    """
+    if not base_sha:
+        return
+    ours = _find_our_commit(repo_root, base_sha, expected_tree)
+    if not ours:
+        return
+    parent = subprocess.run(["git", "rev-parse", "--verify", "-q", f"{ours}^"],
+                            cwd=repo_root, capture_output=True, text=True).stdout.strip()
+    if parent == base_sha or not parent:
+        return
+    lost = subprocess.run(
+        ["git", "diff", "--name-only", f"{base_sha}..{parent}"],
+        cwd=repo_root, capture_output=True, text=True).stdout.split()
+    reverted = [f for f in lost if f not in set(expected)]
+    print(
+        "\n*** STALE BASE — THIS COMMIT REVERTED LANDED WORK (T-0970) ***\n"
+        f"Your index was seeded from {base_sha[:9]}, but the commit that just landed\n"
+        f"records {parent[:9]} as its parent. Everything committed in between is in\n"
+        "the parent and NOT in your tree, so this commit silently undid it.\n"
+        f"Files that moved between the two and are not yours: {len(reverted)}\n"
+        + "".join(f"  {f}\n" for f in reverted[:20])
+        + ("  ...\n" if len(reverted) > 20 else "")
+        + "\nRecover WITHOUT rewriting shared history, and announce the address list:\n"
+          f"  git diff {parent} HEAD --stat        # confirm what this commit undid\n"
+          f"  git show {parent}:<path> > <path>    # for every file above, NOT yours\n"
+          "  bsq commit -m 'chore: restore work reverted by a stale-base commit' <paths>\n"
+          "  # then tell the peer WHICH files you touched — anyone holding\n"
+          "  # uncommitted work in them has lost it, invisibly.\n",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def _verify_commit_scope(repo_root: str, expected: list[str]) -> None:
     """T-0732: print what actually landed, and SHOUT if it isn't what we meant.
 
@@ -6241,10 +6313,10 @@ def _commit_patch_via_temp_index(
     ack: bool,
     redo_hint: str,
 ) -> None:
-    """Commit `patch_text` applied onto a TEMP index seeded from HEAD.
+    """Commit `patch_text` applied onto a TEMP index seeded from a PINNED base.
 
     The temp index is the whole point (T-0215, hardened by T-0732): the commit
-    is built from HEAD + exactly these hunks, in an index no peer can reach, so
+    is built from that base + exactly these hunks, in an index no peer can reach, so
     neither a peer's staged files nor their dirty hunks in a co-edited file can
     ride along. Never stage into `.git/index` and commit that with no pathspec —
     safe-commit refuses it precisely because that index is shared.
@@ -6257,11 +6329,24 @@ def _commit_patch_via_temp_index(
     tmp_index = pf.name + ".index"
     env = dict(os.environ)
     env["GIT_INDEX_FILE"] = tmp_index
+    # T-0970: PIN the base. `read-tree HEAD` re-resolves the symbolic ref, so the
+    # tree we are about to write is anchored to whatever HEAD happened to be at
+    # that instant, and nothing downstream remembers which sha that was. The
+    # window that matters is not inside `git commit` (git's own ref CAS refuses
+    # a HEAD that moves under it) but BEFORE it: a peer commit landing between
+    # this seed and the commit gives a CORRECT parent pointer over a tree that
+    # predates it, which is a silent revert of everything they landed. Reading
+    # the sha once, seeding from it explicitly, and handing it to safe-commit to
+    # re-check inside the commit lock is what closes that window.
+    base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_root,
+                          capture_output=True, text=True)
+    base_sha = base.stdout.strip() if base.returncode == 0 else ""
+    seed = base_sha or "HEAD"   # an unborn HEAD keeps exactly today's behaviour
     try:
-        rt = subprocess.run(["git", "read-tree", "HEAD"], cwd=repo_root, env=env,
+        rt = subprocess.run(["git", "read-tree", seed], cwd=repo_root, env=env,
                             capture_output=True, text=True)
         if rt.returncode != 0:
-            die(f"commit --hunks: git read-tree HEAD failed: {rt.stderr.strip()}")
+            die(f"commit --hunks: git read-tree {seed} failed: {rt.stderr.strip()}")
         ap = subprocess.run(
             ["git", "apply", "--cached", "--recount", "--whitespace=nowarn", pf.name],
             cwd=repo_root, env=env, capture_output=True, text=True,
@@ -6270,11 +6355,27 @@ def _commit_patch_via_temp_index(
             die("commit --hunks: could not apply your hunks onto HEAD — your edit "
                 "likely overlaps a peer's concurrent change in the same region; "
                 f"resolve manually.\n{ap.stderr.strip()}")
+        # T-0970: the exact tree we are about to commit. `git commit` records the
+        # tree of this index, so this value IDENTIFIES our commit afterwards —
+        # which matters because HEAD is not a reliable handle on it: a peer
+        # landing in the milliseconds after ours moves HEAD, and a check that
+        # reads HEAD^ would then be measuring THEIR commit's parent and calling
+        # our perfectly good commit a stale-base revert.
+        wt = subprocess.run(["git", "write-tree"], cwd=repo_root, env=env,
+                            capture_output=True, text=True)
+        expected_tree = wt.stdout.strip() if wt.returncode == 0 else ""
         safe_commit = f"{BOT_SQUAD}/scripts/cli/safe-commit.sh"
         if not os.path.exists(safe_commit):
             safe_commit = str(Path(repo_root) / "ops" / "bot-squad-bin" / "safe-commit")
         if ack:
             env["BOT_SQUAD_ACK_PEERS"] = "1"
+        # T-0970: safe-commit re-checks this INSIDE its flock, immediately before
+        # `git commit`. That is the only place the check is race-free: every
+        # flock-respecting lane is serialized there, so a peer's commit either
+        # lands before we take the lock (we refuse, having committed nothing) or
+        # waits behind it.
+        if base_sha:
+            env["BOT_SQUAD_EXPECT_HEAD"] = base_sha
         # No pathspec — safe here, and ONLY here, because GIT_INDEX_FILE points
         # at our private index holding EXACTLY HEAD + our hunks.
         rc = subprocess.run([safe_commit, "-m", message], cwd=repo_root, env=env).returncode
@@ -6293,6 +6394,7 @@ def _commit_patch_via_temp_index(
                 os.unlink(p)
             except OSError:
                 pass
+    _assert_base_still_parent(repo_root, base_sha, expected_tree, expected_rels)
     _verify_commit_scope(repo_root, expected_rels)
     _warn_clone_drift(repo_root)
 
@@ -10266,7 +10368,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--patch", metavar="FILE",
         help="T-0732: post-hoc --hunks — you forgot `bsq edit-begin`, so hand it a "
              "patch of just YOUR hunks; it is applied onto a temp index seeded from "
-             "HEAD (never the shared index)")
+             "a base sha pinned at that instant, re-checked inside the commit lock "
+             "(T-0970), never the shared index")
     cm.add_argument("files", nargs="*", help="explicit file paths to stage + commit")
     cm.set_defaults(func=cmd_commit)
 

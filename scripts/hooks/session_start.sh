@@ -700,13 +700,16 @@ print_section() {
 # shellcheck source=scripts/hooks/derive_role.sh
 . "$BOT_SQUAD/scripts/hooks/derive_role.sh"
 ROLE="$(bsq_derive_role "$src_window")"
+# T-0943: the contract a session READS can be wider than its role enum — a
+# solo universal session holds all three roles and reads `bot-squad.md`.
+CONTRACT_ROLE="$(bsq_contract_role "$src_window")"
 
 # T-0203: resume / compact already carry the orientation (or, for compact, its
 # summary). Emit only a tiny re-anchor + active sessions, and explicitly
 # suppress the reflexive AGENT_INSTRUCTIONS.md re-read that dominated
 # post-compact token cost. The lifecycle bookkeeping above already ran.
 if [ "$HOOK_SOURCE" = "resume" ] || [ "$HOOK_SOURCE" = "compact" ]; then
-    ROLE_UC="$(printf '%s' "$ROLE" | tr '[:lower:]' '[:upper:]')"
+    ROLE_UC="$(printf '%s' "$CONTRACT_ROLE" | tr '[:lower:]' '[:upper:]')"
     print_section "BOT-SQUAD — ${HOOK_SOURCE} (orientation unchanged)"
     echo "You are ${sid:-this session} — role: ${ROLE_UC}${task_id:+, task ${task_id}}."
     # T-0507 anti-drift: a compact/resume fires precisely when context has
@@ -766,7 +769,10 @@ print_section "ORIENTATION — read on demand (not piped in every turn, to keep 
 # T-0713: FIRST line of the section on purpose — this is the one path rule a
 # session needs BEFORE its first Edit call, not on demand.
 print_edit_surface
-echo "- Your role contract : $BOT_SQUAD/api/app/resources/roles/$ROLE.md  (git-tracked SSOT — what your spawn brief uses; T-0198)"
+echo "- Your role contract : $BOT_SQUAD/api/app/resources/roles/$CONTRACT_ROLE.md  (git-tracked SSOT — what your spawn brief uses; T-0198)"
+if [ "$CONTRACT_ROLE" != "$ROLE" ]; then
+    echo "  (you hold user-conversation + operator + dev AT ONCE — this project runs only you. There is nobody to hand work to; \`bsq team status\` says who is live.)"
+fi
 echo "  (your rules — read on your FIRST action if this session wasn't spawned with a brief)"
 echo "- AGENT_INSTRUCTIONS  : $DATA/AGENT_INSTRUCTIONS.md  (recipes/paths — open on the specific need)"
 if [ -n "$active_init" ] && [ -f "$DATA/vision/initiatives/$active_init" ]; then

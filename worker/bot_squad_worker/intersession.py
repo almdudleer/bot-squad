@@ -38,6 +38,26 @@ _MAX_TEXT_LEN = 4000
 # whether a target needs cross-project SID resolution (T-0624). ``operator``
 # joined in T-0790 — see ``_resolve_recipients``.
 _ROLE_KEYWORDS = frozenset({"teamlead", "dev", "all", "operator"})
+
+#: T-0943: role keywords that mean "hand this UP to somebody". A send to one of
+#: these that reaches NOBODY is refused rather than reported as sent — see the
+#: refusal in :func:`send`.
+#:
+#: Two sets, because "is this an escalation" is not answerable from the keyword
+#: alone. ``operator`` always is: all three of its internal callers are "needs a
+#: human look" alerts, and the ONE thing an agent addresses to it is work it
+#: cannot do itself. ``teamlead`` is a fan-out that is ALSO the dev contract's
+#: first escalation hop, so it qualifies only when the sender declared the block
+#: (``--blocked``, T-0977) — which is precisely the sender saying "I am STOPPED
+#: until this is answered". Widening it unconditionally would break the T-0790
+#: decision that an empty teamlead/dev/all fan-out stays quiet
+#: (``test_empty_dev_fanout_is_not_warned``), which is a real prior ruling about
+#: log noise, not an oversight.
+#:
+#: ``dev``/``all`` are never here: they are broadcasts, addressed to no one in
+#: particular, and an empty one is an ordinary frequent state.
+_ESCALATION_ROLES = frozenset({"operator"})
+_BLOCKED_ESCALATION_ROLES = frozenset({"operator", "teamlead"})
 # T-0091: cap raised 1800→7200 (2h). A long-blocking inbox_wait costs the
 # worker nothing (a single condition-variable wait per SID), but every clean
 # timeout fires a harness <task-notification> in the operator's pane and burns
@@ -329,8 +349,14 @@ def _resolve_recipients(
     ``S-<user>-…`` SID is already an explicit choice.
     """
     if to == "operator":
-        from bot_squad_worker.dispatch import live_operator_sids
-        return live_operator_sids(cfg, slug)
+        # T-0943: the ROUTING resolver, not the singleton guard. A solo session
+        # holds the operator role among others (``sessions.roles_of``), so an
+        # escalation addressed to ``operator`` reaches the session that is
+        # actually driving the board instead of resolving to nothing. A
+        # DEDICATED operator still wins whenever one is live — see
+        # :func:`dispatch.operator_role_holders`.
+        from bot_squad_worker.dispatch import operator_role_holders
+        return operator_role_holders(cfg, slug)
     # NB: ``operator`` returned above — it is a role fan-out but resolves via the
     # identity SSOT, not this task_id-shaped walk. Keep this set literal so
     # reordering the branches can't silently route ``operator`` through here.
@@ -485,6 +511,7 @@ def send(
     to: str,
     text: str,
     user: str | None = None,
+    blocked: bool = False,
 ) -> dict:
     """Append a message line to recipient inboxes.
 
@@ -502,6 +529,14 @@ def send(
     T-0157: ``user`` overrides the linux-user scope for role-keyword fan-out
     (``teamlead``/``dev``/``all``); without it the scope is the sender's own
     linux user parsed from ``from_sid``. See ``_resolve_recipients``.
+
+    T-0943: an ESCALATION role keyword (``operator``/``teamlead``) that has NO
+    live holder is likewise REFUSED — ``{"ok": False, "reason": "role-unfilled",
+    "error": <what to do>, "delivered_to": []}``. Handing work to a role nobody
+    holds is a no-op that reads to the sender exactly like a delivery, and a
+    solo session obeying that clause spent a whole session producing nothing
+    and reported it as compliance (the T-0943 incident). ``dev``/``all`` stay
+    silent on an empty fan-out — they are broadcasts, not escalations.
 
     T-0827: over-cap text is REFUSED — ``{"ok": False, "reason":
     "text-over-cap", "error": <what to do>, "delivered_to": []}``, and NOTHING
@@ -542,12 +577,49 @@ def send(
     # this keyword are all "needs a human look" escalations, and an escalation
     # that reached nobody must not be silent. Deliberately NOT warned for
     # teamlead/dev/all — an empty dev fan-out is an ordinary, frequent state.
-    if to == "operator" and not delivered:
+    escalation_roles = (_BLOCKED_ESCALATION_ROLES if blocked
+                        else _ESCALATION_ROLES)
+    if to in escalation_roles and not delivered:
+        # T-0943 — ESCALATION IS CONDITIONED ON A RECIPIENT EXISTING.
+        #
+        # The stakeholder raised a project's only session and asked what it had
+        # produced. Its answer: "None. My role is user-conversation only —
+        # attend the thread, file asks, and ESCALATE TO THE OPERATOR/DEV
+        # SESSIONS." There was no operator and no dev; it had handed the work
+        # to nobody and reported that as compliance. An escalation to an
+        # unfilled role is a no-op that renders identically to a delivered one,
+        # which is what let a whole session go by producing nothing.
+        #
+        # So it is now a REFUSAL the sender sees, not a log line in a file
+        # nobody reads (the live install had 27 undrained escalations spanning
+        # three weeks — the same silence, one layer down). ``ok: False`` is what
+        # ``_action_peer_send`` turns into an error for the agent; the ~12
+        # internal best-effort notifiers read ``delivered_to``, which is empty
+        # either way, so none of them change behaviour.
+        #
+        # ``dev`` and ``all`` are deliberately NOT here: an empty dev fan-out is
+        # an ordinary, frequent state and not an escalation to anyone in
+        # particular.
         log.warning(
-            "intersession: peer_send to role 'operator' reached NOBODY — no live "
-            "operator session for %s; escalation from %s was not delivered: %.200s",
-            slug, from_sid, sanitized,
+            "intersession: peer_send to role %r reached NOBODY — no live "
+            "holder for %s; escalation from %s was not delivered: %.200s",
+            to, slug, from_sid, sanitized,
         )
+        return {
+            "ok": False,
+            "delivered_to": [],
+            "reason": "role-unfilled",
+            "error": (
+                f"no live session holds the {to!r} role on {slug!r} — NOTHING "
+                f"was delivered. This is not a queue: an unfilled role has no "
+                f"inbox that will ever be drained. If you hold that role "
+                f"yourself, do the work here rather than hand it off (`bsq "
+                f"brief` names every role you hold; a project's only session "
+                f"holds user-conversation + operator + dev at once). Otherwise "
+                f"bud one off (`bsq bud operator`) or page the stakeholder "
+                f"(`bsq tg ping`)."
+            ),
+        }
     out: dict = {"ok": True, "delivered_to": delivered}
     if to not in _ROLE_KEYWORDS and delivered and delivered != [to]:
         out["redirected"] = {"from": to, "to": delivered[0], "reason": "recycled"}
@@ -604,7 +676,12 @@ def send_notice(
     to ``send``" edit, since that is what a deletion actually looks like.
 
     Returns ``{"ok": True, "delivered_to": [...], "parts": n}``. ``ok`` is False
-    only when a part was itself undeliverable, which cannot happen by length.
+    when a part was itself undeliverable — never by length, but since T-0943
+    also when the target role keyword has NO live holder, in which case nothing
+    was written for any part. That is not a split failure and this function
+    does not soften it: a notice addressed to a role nobody holds has the same
+    "believed sent, received by nobody" shape the whole split exists to avoid,
+    and the tick callers here already log their own miss off ``delivered_to``.
 
     Known bound, stated rather than discovered later: each part resolves its
     recipients independently, so a role fan-out whose roster changes mid-split

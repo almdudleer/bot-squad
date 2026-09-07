@@ -2818,7 +2818,19 @@ def test_inject_input_happy_path(tmp_path, monkeypatch):
 
 
 def test_inject_input_multiline(tmp_path, monkeypatch):
-    """Multi-line text sends one send-keys per line."""
+    """T-1038: multi-line text is ONE composer message, not one per line.
+
+    This test pinned the opposite until 2026-09-07 — "one send-keys per line",
+    3 lines -> 6 send-keys -> 3 submissions — and that pin was load-bearing for
+    the defect: T-1032's harness marker, joined to the autocompact prompts with
+    a newline, was submitted ALONE as turn 1 while the body it was minted to
+    label arrived as 20 unmarked turns behind it (measured: 21 submissions for
+    `context_handoff_prompt`, 18 for `handoff_prompt`).
+
+    The relay guarantee is unchanged and stated deliberately: the payload is
+    still delivered byte-identical — no caption, no envelope, no reordering,
+    no truncation. What changed is the SUBMISSION COUNT. `lines_sent` still
+    counts LINES, so it stays 3 here for a single submission."""
     import bot_squad_worker.actions as A
     import bot_squad_worker.sessions as S
     from bot_squad_worker.sessions import PaneInfo
@@ -2831,11 +2843,15 @@ def test_inject_input_multiline(tmp_path, monkeypatch):
     run_calls = _patch_inject_transport(monkeypatch, tmp_path)
 
     result = A.dispatch("inject_input", {"sid": "S-testuser-win-p7", "text": "line1\nline2\nline3"})
-    assert result["lines_sent"] == 3
-    # 2 send-keys calls per line (text + Enter sent separately so Enter submits
-    # outside tmux's bracketed-paste — see input_mux.deliver_direct)
-    send_keys = [c for c in run_calls if "send-keys" in c]
-    assert len(send_keys) == 6
+    assert result["lines_sent"] == 3          # LINES, not submissions
+    # ONE Enter — one composer message for the whole payload.
+    assert [c for c in run_calls if "send-keys" in c] == [
+        ["tmux", "send-keys", "-t", "%7", "Enter"],
+    ]
+    # …and the body went in as a bracketed PASTE, so its newlines stayed
+    # newlines in the composer instead of submitting each line.
+    assert any(c[:2] == ["tmux", "load-buffer"] for c in run_calls)
+    assert any("paste-buffer" in c for c in run_calls)
 
 
 def test_inject_input_unknown_sid(tmp_path, monkeypatch):
@@ -2888,12 +2904,18 @@ def test_inject_input_missing_params(tmp_path, monkeypatch):
 # inject_prompt (T-0770) — the BLOCK sibling of inject_input
 # ---------------------------------------------------------------------------
 #
-# The measurement that made this action necessary is the pair of tests above:
-# `test_inject_input_multiline` PINS one Enter per line, which is three
+# The measurement that made this action necessary was the pair of tests above:
+# `test_inject_input_multiline` PINNED one Enter per line, which is three
 # composer submissions for a three-line payload. The stakeholder's own messages
-# on the direct-mode topic path already arrive that way, and a multi-line
-# provenance envelope on that transport would have been worse than the bare
-# text it replaces. These tests are that comparison, made explicit.
+# on the direct-mode topic path arrived that way, and a multi-line provenance
+# envelope on that transport would have been worse than the bare text it
+# replaces.
+#
+# T-1038 (2026-09-07) closed that split in `inject_input`'s own transport, so
+# the two verbs no longer differ in submission count — the test above now pins
+# ONE Enter as well. This action remains the EXPLICIT block verb: a caller
+# that means "this is a block" says so, and its contract (raises rather than
+# queues) is what tg_listener's T-0746 fallback is built on.
 
 
 def _patch_prompt_transport(monkeypatch):

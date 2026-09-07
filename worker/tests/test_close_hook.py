@@ -107,3 +107,52 @@ def test_harness_nudge_marker_excluded_from_harvest(tmp_path, monkeypatch):
     res = close_hook.harvest_tick(cfg, slug)
     assert res["harvested"] == []
     assert "FINALIZE" not in ticket.read_text()
+
+
+def _real_finalize_prompt(task_id: str = "T-0149") -> str:
+    """The REAL composed FINALIZE prompt. A hand-typed stand-in would pin my
+    model of it, and the question here is what the actual prompt does to the
+    harvest filter."""
+    from bot_squad_worker import autocompact
+    return autocompact.context_handoff_prompt(task_id, relaunch=True)
+
+
+def test_a_detached_marker_lets_the_finalize_prompt_be_harvested_as_guidance(
+        tmp_path, monkeypatch):
+    """T-1038 DoD 3, open question 2 — the value beside the verdict.
+
+    `_NON_STAKEHOLDER_PREFIXES` matching is a PREFIX check, so it only ever
+    protected the turn the marker is actually on. Under the pre-T-1038
+    transport the prompt arrived as one turn PER LINE, so the marker sat alone
+    on turn 1 and the other 20 turns matched nothing: measured 2026-09-07, 9 of
+    the 21 fragments passed the filter and were harvested onto the ticket as
+    "stakeholder guidance" (the append then caps at _MAX_COMMENTS=6). This test
+    documents the gap that produced that population — it is the reason the fix
+    had to go in the TRANSPORT, since no prefix filter can protect a body its
+    marker has been detached from."""
+    prompt = _real_finalize_prompt()
+    detached = [_human(line) for line in prompt.split("\n")]
+    cfg, slug, ticket, md = _setup(tmp_path, monkeypatch, messages=detached)
+
+    kept = close_hook._stakeholder_comments(
+        Path(close_hook.os.path.expanduser("~")) / ".claude" / "projects"
+        / "-home-tester-repo" / "uuid-xyz.jsonl")
+
+    assert len(kept) >= 5, kept          # measured 9; not 0, which is the point
+    assert not any(k.startswith(HARNESS_NUDGE_MARKER) for k in kept)
+    res = close_hook.harvest_tick(cfg, slug)
+    assert res["harvested"], "the detached shape reaches the ticket"
+    assert "FINALIZE" in ticket.read_text() or "forward-state" in ticket.read_text()
+
+
+def test_the_whole_finalize_prompt_as_one_turn_is_filtered_out(tmp_path, monkeypatch):
+    """The same prompt as the T-1038 transport now delivers it — ONE turn,
+    marker at the head. Nothing is harvested: 0 comments, ticket untouched."""
+    prompt = _real_finalize_prompt()
+    cfg, slug, ticket, md = _setup(tmp_path, monkeypatch, messages=[_human(prompt)])
+    before = ticket.read_text()
+
+    res = close_hook.harvest_tick(cfg, slug)
+
+    assert res["harvested"] == []
+    assert ticket.read_text() == before

@@ -32,11 +32,14 @@ else in the worker/CLI:
   use it only under :func:`delivery_lock` (or during pre-mux bootstrap, e.g.
   install.sh before any worker exists).
 * :func:`deliver_direct` is the verbatim direct lane — the transport that
-  used to live inline in the ``inject_input`` action (one send-keys + Enter
-  per line, byte-identical content, no caption/batch — a solo "check mail"
-  stays "check mail" and "/compact" stays a bare slash command). It holds the
-  per-sid delivery lock so it can never interleave keystrokes with a queued-
-  lane flush, and briefly gates on live user typing (bounded wait, then
+  used to live inline in the ``inject_input`` action (byte-identical content,
+  no caption/batch — a solo "check mail" stays "check mail" and "/compact"
+  stays a bare slash command). One send-keys + Enter per line for a
+  single-line payload; a payload WITH a newline goes as one bracketed paste
+  and one Enter, i.e. ONE composer message, since T-1038 — before that it
+  split into N submissions and detached T-1032's marker from its own body.
+  It holds the per-sid delivery lock so it can never interleave keystrokes
+  with a queued-lane flush, and briefly gates on live user typing (bounded wait, then
   delivers anyway — the direct lane is synchronous and guaranteed, never
   queued/dropped).
 * Teardown/control keys (``C-c``, ``/exit``) go through
@@ -382,6 +385,28 @@ _DELIVER_CONFIRM_TIMEOUT_SEC = 2.0
 _DELIVER_CONFIRM_POLL_INTERVAL_SEC = 0.3
 
 
+def _paste_block(pane_id: str, text: str) -> None:
+    """Put ``text`` into ``pane_id``'s composer as ONE multi-line message.
+
+    Load the payload into a named tmux buffer over STDIN, then bracketed-paste
+    it. Two details are load-bearing and neither is stylistic:
+
+    * ``-p`` (bracketed) is what makes an embedded newline INSERT a newline in
+      the composer instead of submitting the line — without it a multi-line
+      payload becomes N separate messages (T-1038).
+    * ``load-buffer -``, NOT ``set-buffer -- <arg>``: tmux's command parser
+      rejects a large argument with "command too long" (T-0201, verified live
+      on ~140-line briefs), so a big payload would silently never paste.
+
+    Submitting is the caller's job — :func:`_submit_confirmed` — because the
+    Enter can land inside the paste wrap and has to be confirmed, not assumed.
+    """
+    from bot_squad_worker.sessions import _run
+    buf_name = f"bsq-input-{pane_id.lstrip('%')}"
+    _run(["tmux", "load-buffer", "-b", buf_name, "-"], input=text)
+    _run(["tmux", "paste-buffer", "-t", pane_id, "-b", buf_name, "-p", "-d"])
+
+
 def _deliver_to_pane(pane_id: str, text: str) -> None:
     """Deliver a (possibly multi-line) payload as ONE composer message.
 
@@ -404,14 +429,7 @@ def _deliver_to_pane(pane_id: str, text: str) -> None:
     delivered.
     """
     from bot_squad_worker import composer_watch
-    from bot_squad_worker.sessions import _run
-    buf_name = f"bsq-input-{pane_id.lstrip('%')}"
-    # Load the payload into a named tmux buffer over STDIN, then bracketed-
-    # paste it. `load-buffer -`, NOT `set-buffer -- <arg>`: tmux's command
-    # parser rejects a large argument with "command too long" (T-0201, verified
-    # live on ~140-line briefs), so a big batch would silently never paste.
-    _run(["tmux", "load-buffer", "-b", buf_name, "-"], input=text)
-    _run(["tmux", "paste-buffer", "-t", pane_id, "-b", buf_name, "-p", "-d"])
+    _paste_block(pane_id, text)
     time.sleep(0.4)
 
     for attempt in range(_DELIVER_CONFIRM_MAX_RETRIES):
@@ -455,10 +473,11 @@ def deliver_direct(data_dir: Path | str, sid: str, pane_id: str, text: str, *,
                    capture: Callable[[str], str] | None = None) -> int:
     """Verbatim direct-lane transport (the old raw ``inject_input`` loop).
 
-    Sends ``text`` one send-keys per line with a separate Enter each —
-    byte-identical keystrokes to the pre-T-0578 inline loop (no caption, no
-    batching, one submission per line), but serialised under the per-sid
-    :func:`delivery_lock` so it can never interleave with a queued-lane flush
+    Sends ``text`` verbatim — no caption, no batching — with byte-identical
+    keystrokes to the pre-T-0578 inline loop for the single-line nudges this
+    lane exists for; a multi-line payload lands as ONE composer message rather
+    than one per line (T-1038, see :func:`_type_lines`). Serialised under the
+    per-sid :func:`delivery_lock` so it cannot interleave with a queued-lane flush
     or teardown keys, and gated (bounded) on live user typing. Returns the
     number of lines sent.
     """
@@ -537,61 +556,114 @@ def _draft_swap_enabled() -> bool:
     return os.environ.get("BOT_SQUAD_DRAFT_SWAP", "1") != "0"
 
 
-def _type_lines(pane_id: str, text: str, *,
-                capture: Callable[[str], str] | None = None) -> int:
-    """The verbatim lane's keystrokes: one send-keys per line, one Enter each.
+def _preview(text: str, limit: int = 60) -> str:
+    """A one-line, bounded rendering of a payload for the log — a 20-line
+    handoff prompt must not be echoed whole into every retry line."""
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[:limit] + "…"
 
-    T-0957 DoD 2: confirms each line's Enter actually submitted (the composer
-    cleared) before moving to the next, re-sending Enter up to a bound when it
-    did not — the direct lane has no queue to fall back on, so a payload that
-    "reaches the composer and stops there" can only be RE-SUBMITTED, never
-    requeued, and that still has to be logged rather than silently assumed
-    (the pre-fix behaviour: one blind Enter, whatever happened next was
-    reported as sent). A permission dialog sharing the composer's rune is its
-    own outcome (DoD 3's pane-state table) — the retry stops rather than
-    blasting Enter into a prompt that is not this session's to answer.
+
+def _submit_confirmed(pane_id: str, what: str,
+                      capture: Callable[[str], str]) -> str:
+    """Press Enter until the composer confirms it cleared. Returns the outcome.
+
+    T-0957 DoD 2: an Enter can be swallowed (it lands inside tmux's
+    bracketed-paste wrap and never submits), and the direct lane has no queue
+    to fall back on — a payload that "reaches the composer and stops there" can
+    only be RE-SUBMITTED, never requeued, and that still has to be logged
+    rather than silently assumed. A permission dialog sharing the composer's
+    rune is its own outcome: the retry stops rather than blasting Enter into a
+    prompt that is not this session's to answer.
+
+    ``"cleared"`` | ``"dialog"`` | ``"unconfirmed"``.
     """
     from bot_squad_worker import composer_watch
+    for attempt in range(_DELIVER_CONFIRM_MAX_RETRIES):
+        raw_keys(pane_id, "Enter")
+        deadline = time.monotonic() + _DELIVER_CONFIRM_TIMEOUT_SEC
+        outcome = None
+        while time.monotonic() < deadline:
+            time.sleep(_DELIVER_CONFIRM_POLL_INTERVAL_SEC)
+            try:
+                buf = capture(pane_id)
+            except Exception:  # noqa: BLE001 — a capture hiccup, not proof of anything
+                continue
+            if composer_watch.looks_like_dialog(buf):
+                outcome = "dialog"
+                break
+            if not (composer_watch.composer_text(buf) or "").strip():
+                outcome = "cleared"
+                break
+        if outcome == "cleared":
+            if attempt:
+                log.info("input_mux: %s's %r submitted after %d retry "
+                         "Enter(s) — the first was swallowed", pane_id,
+                         _preview(what), attempt)
+            return "cleared"
+        if outcome == "dialog":
+            log.warning("input_mux: %s shows a permission dialog after "
+                        "sending %r — not this session's to answer, "
+                        "stopping retries (payload may be unsubmitted)",
+                        pane_id, _preview(what))
+            return "dialog"
+    log.error("input_mux: %s's %r never confirmed submitted after %d "
+              "Enter attempts — it may still be sitting in the composer "
+              "(direct lane has no queue to requeue into)", pane_id,
+              _preview(what), _DELIVER_CONFIRM_MAX_RETRIES)
+    return "unconfirmed"
+
+
+def _direct_paste_enabled() -> bool:
+    """T-1038 kill switch. ``BOT_SQUAD_DIRECT_PASTE=0`` restores the pre-T-1038
+    direct lane exactly: one send-keys + Enter per line, so a payload with a
+    newline in it arrives as N separate composer submissions."""
+    return os.environ.get("BOT_SQUAD_DIRECT_PASTE", "1") != "0"
+
+
+def _type_lines(pane_id: str, text: str, *,
+                capture: Callable[[str], str] | None = None) -> int:
+    """The verbatim lane's keystrokes. Returns the number of LINES delivered.
+
+    A SINGLE-LINE payload — every nudge this lane was written for ("check
+    mail", "/compact", the marker-prefixed idle/keepalive/dev nudges) — is
+    typed with ``send-keys`` and submitted with its own confirmed Enter, which
+    is byte-identical to the pre-T-0578 inline loop.
+
+    A MULTI-LINE payload goes as ONE bracketed paste and ONE confirmed Enter
+    (T-1038). It used to take the same per-line loop, and the docstring said so
+    approvingly — "one submission per line" — which meant an injected payload
+    containing a newline did not arrive as one message, it arrived as N
+    messages. Measured on the real composed autocompact prompts before the fix:
+    ``context_handoff_prompt`` produced **21** submissions and
+    ``handoff_prompt`` **18**, the first of each being T-1032's marker ALONE on
+    line 1. So the marker did not mark the message it was minted to mark — it
+    became a separate, contentless turn, and the payload it was supposed to
+    label arrived looking exactly like stakeholder input (9 of those 21
+    fragments passed ``close_hook``'s stakeholder-harvest filter, which is
+    prefix-matched on the marker and therefore blind to a detached one).
+
+    Marking every line instead was the other candidate and is worse: it leaves
+    a checkpoint ORDER fragmented across N turns — the session starts answering
+    line 1 while the rest is still landing — which is the same defect T-0773
+    fixed on the TG reply path, wearing a marker.
+
+    The number of lines, not submissions, stays the return value: it is what
+    ``inject_input`` has always reported as ``lines_sent``.
+    """
     capture = capture or _capture_pane
-    lines_sent = 0
-    for line in text.split("\n"):
+    lines = text.split("\n")
+
+    if len(lines) > 1 and _direct_paste_enabled():
+        _paste_block(pane_id, text)
+        time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
+        _submit_confirmed(pane_id, text, capture)
+        return len(lines)
+
+    for line in lines:
         raw_keys(pane_id, "--", line)
         time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
-        for attempt in range(_DELIVER_CONFIRM_MAX_RETRIES):
-            raw_keys(pane_id, "Enter")
-            deadline = time.monotonic() + _DELIVER_CONFIRM_TIMEOUT_SEC
-            outcome = None
-            while time.monotonic() < deadline:
-                time.sleep(_DELIVER_CONFIRM_POLL_INTERVAL_SEC)
-                try:
-                    buf = capture(pane_id)
-                except Exception:  # noqa: BLE001 — a capture hiccup, not proof of anything
-                    continue
-                if composer_watch.looks_like_dialog(buf):
-                    outcome = "dialog"
-                    break
-                if not (composer_watch.composer_text(buf) or "").strip():
-                    outcome = "cleared"
-                    break
-            if outcome == "cleared":
-                if attempt:
-                    log.info("input_mux: %s's %r submitted after %d retry "
-                             "Enter(s) — the first was swallowed", pane_id,
-                             line, attempt)
-                break
-            if outcome == "dialog":
-                log.warning("input_mux: %s shows a permission dialog after "
-                            "sending %r — not this session's to answer, "
-                            "stopping retries (line may be unsubmitted)",
-                            pane_id, line)
-                break
-        else:
-            log.error("input_mux: %s's %r never confirmed submitted after %d "
-                      "Enter attempts — it may still be sitting in the "
-                      "composer (direct lane has no queue to requeue into)",
-                      pane_id, line, _DELIVER_CONFIRM_MAX_RETRIES)
-        lines_sent += 1
-    return lines_sent
+        _submit_confirmed(pane_id, line, capture)
+    return len(lines)
 
 
 def _live_draft(capture: Callable[[str], str], pane_id: str) -> str:

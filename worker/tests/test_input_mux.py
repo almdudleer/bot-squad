@@ -423,3 +423,163 @@ def test_type_lines_stops_retrying_into_a_permission_dialog(monkeypatch, caplog)
                                      capture=lambda p: _BUF_DIALOG)
     assert sent == 1
     assert "permission dialog" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# T-1038: an injected payload with a NEWLINE must arrive as ONE turn
+#
+# The instrument below counts COMPOSER SUBMISSIONS, not text. That distinction
+# is the whole ticket: `test_compact_handoff.py`'s marker tests assert
+# `startswith(MARKER)` on the composer's RETURN VALUE and were green while the
+# marker was arriving detached from its own body, because the split happens in
+# the transport, two layers below where they look.
+# ---------------------------------------------------------------------------
+
+class _Submissions:
+    """Counts what the pane actually receives.
+
+    ``submissions`` — Enter keystrokes, i.e. composer messages. The capture
+    always reports an EMPTY composer, so every Enter confirms on its first
+    attempt and no retry inflates the count (`_fast_confirm` keeps that fast).
+    ``pastes`` — ``tmux paste-buffer`` calls (the block transport).
+    ``typed`` — literal ``send-keys`` payloads (the per-line transport).
+    """
+
+    def __init__(self):
+        self.submissions = 0
+        self.pastes = 0
+        self.typed: list[str] = []
+        self.pasted: list[str] = []
+
+    def install(self, monkeypatch):
+        import bot_squad_worker.sessions as S
+        _fast_confirm(monkeypatch)
+        monkeypatch.setattr(input_mux, "raw_keys", self._raw_keys)
+        monkeypatch.setattr(S, "_run", self._run)
+        monkeypatch.setattr(input_mux, "_capture_pane", lambda pane_id: _BUF_EMPTY)
+        return self
+
+    def _raw_keys(self, pane_id, *keys):
+        if keys and keys[0] == "--":
+            self.typed.append(keys[1] if len(keys) > 1 else "")
+        elif "Enter" in keys:
+            self.submissions += 1
+
+    def _run(self, argv, **kw):
+        if len(argv) > 1 and argv[1] == "paste-buffer":
+            self.pastes += 1
+        if len(argv) > 1 and argv[1] == "load-buffer":
+            self.pasted.append(kw.get("input", ""))
+        return None
+
+
+def _real_context_handoff() -> str:
+    """The REAL composed text, not a stand-in — a hand-typed literal would pin
+    my model of the prompt instead of the prompt (T-1038 DoD 2)."""
+    from bot_squad_worker import autocompact
+    return autocompact.context_handoff_prompt("T-1038", relaunch=True)
+
+
+def _real_artifact_handoff() -> str:
+    from bot_squad_worker import autocompact
+    return autocompact.handoff_prompt("/art/operator-state.md", "operator")
+
+
+# --- the HEALTHY case first, so a green below is not the instrument saying
+#     "1" to everything (T-1038 DoD 4) ------------------------------------
+
+def test_type_lines_single_line_nudge_is_one_submission_with_its_marker(monkeypatch):
+    """The idle_timeout shape: marker joined to the body with a SPACE. It was
+    correct before this ticket and must stay on the unchanged send-keys path —
+    no paste, and the marker travelling in the SAME keystroke as the body."""
+    from bot_squad_worker.input_mux import HARNESS_NUDGE_MARKER
+    rec = _Submissions().install(monkeypatch)
+    text = (f"{HARNESS_NUDGE_MARKER} CONTEXT FULL: your session is at the "
+            "context ceiling; write your forward-state now.")
+    assert "\n" not in text
+
+    assert input_mux._type_lines("%1", text, capture=lambda p: _BUF_EMPTY) == 1
+
+    assert rec.submissions == 1
+    assert rec.pastes == 0                       # unchanged transport
+    assert rec.typed == [text]                   # marker inline with the body
+
+
+def test_type_lines_delivers_the_real_context_handoff_as_one_submission(monkeypatch):
+    """T-1038 DoD 1+2. Measured before the fix on this exact text: 21 lines ->
+    21 submissions, the first being the bare marker (which is the turn the
+    operator actually received). Now: one paste, one Enter, one turn."""
+    from bot_squad_worker.input_mux import HARNESS_NUDGE_MARKER
+    rec = _Submissions().install(monkeypatch)
+    text = _real_context_handoff()
+    assert len(text.split("\n")) > 10, "the prompt must still be multi-line"
+
+    lines = input_mux._type_lines("%1", text, capture=lambda p: _BUF_EMPTY)
+
+    assert rec.submissions == 1                  # ONE turn, not one per line
+    assert rec.pastes == 1
+    assert rec.typed == []                       # nothing typed line-by-line
+    assert rec.pasted == [text]                  # verbatim, marker at the head
+    assert rec.pasted[0].startswith(HARNESS_NUDGE_MARKER)
+    assert lines == len(text.split("\n"))        # lines_sent still counts LINES
+
+
+def test_type_lines_delivers_the_real_artifact_handoff_as_one_submission(monkeypatch):
+    """The twin composer (`handoff_prompt`, the task-LESS session's finalize):
+    18 submissions before the fix. Fixing one and leaving the other is this
+    repo's standing failure mode."""
+    rec = _Submissions().install(monkeypatch)
+    text = _real_artifact_handoff()
+    assert len(text.split("\n")) > 10
+
+    input_mux._type_lines("%1", text, capture=lambda p: _BUF_EMPTY)
+
+    assert rec.submissions == 1
+    assert rec.pastes == 1
+
+
+def test_type_lines_splits_per_line_when_the_paste_is_switched_off(monkeypatch):
+    """The guard's teeth, and the instrument's negative control in one: with
+    `BOT_SQUAD_DIRECT_PASTE=0` (the pre-T-1038 transport, kept as the rollback
+    lever) the SAME instrument reports one submission PER LINE and the first
+    one is the marker ALONE — the detached-marker turn this ticket is about.
+    Anything that puts the per-line loop back for multi-line payloads fails
+    the tests above and this one turns green."""
+    from bot_squad_worker.input_mux import HARNESS_NUDGE_MARKER
+    monkeypatch.setenv("BOT_SQUAD_DIRECT_PASTE", "0")
+    rec = _Submissions().install(monkeypatch)
+    text = _real_context_handoff()
+
+    input_mux._type_lines("%1", text, capture=lambda p: _BUF_EMPTY)
+
+    assert rec.submissions == len(text.split("\n")) > 10
+    assert rec.pastes == 0
+    assert rec.typed[0] == HARNESS_NUDGE_MARKER   # the marker, alone, as a turn
+    assert rec.typed[1] == ""                     # and an empty submission after it
+
+
+def test_deliver_direct_delivers_the_real_handoff_as_one_submission(tmp_path, monkeypatch):
+    """The same claim one layer up, through the lock + typing gate — the level
+    `autocompact._inject_context_handoff` -> `inject_input` actually calls."""
+    rec = _Submissions().install(monkeypatch)
+    text = _real_context_handoff()
+
+    lines = input_mux.deliver_direct(tmp_path, "S-almdudleer-dev-p9", "%1", text,
+                                     capture=lambda p: _BUF_EMPTY)
+
+    assert rec.submissions == 1
+    assert rec.pasted == [text]
+    assert lines == len(text.split("\n"))
+
+
+def test_queued_lane_delivers_a_multi_line_batch_as_one_submission(monkeypatch):
+    """T-1038 DoD 3, open question 1: the queued lane does NOT share the
+    defect. Measured on the same text: 1 submission, 1 paste — it has pasted
+    since T-0469 and the direct lane has now joined it."""
+    rec = _Submissions().install(monkeypatch)
+    text = _real_context_handoff()
+
+    input_mux._deliver_to_pane("%1", text)
+
+    assert rec.submissions == 1
+    assert rec.pastes == 1

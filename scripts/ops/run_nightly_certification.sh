@@ -196,7 +196,16 @@ run_arm api bash -c "docker run --rm -e BUILD_AT_IMPORT=0 -v '$DEST':/repo -w /r
 # ($DEST) is root-owned — chown it back before this user has to touch $DEST
 # again (the web arm below, and the EXIT trap's cleanup). Best-effort: a
 # failure here must not affect FAIL, so it is deliberately outside run_arm.
-docker run --rm -v "$DEST":/repo --entrypoint chown \
+#
+# `timeout 300`: measured (T-1046, R-0010 handler, host load 254 spike):
+# under extreme concurrent host load, a bare `docker run` can hang for many
+# minutes waiting for a container slot, and this call's own output was
+# already discarded (`>/dev/null`) — a hang here was indistinguishable from
+# progress until the routine's OUTER 5400s ceiling finally killed the whole
+# script with no arm having actually failed. A 300s bound on just this step
+# turns "silently eats the whole 90-minute budget" into "this one step timed
+# out," which is a diagnosable, bounded failure instead of an opaque one.
+timeout 300 docker run --rm -v "$DEST":/repo --entrypoint chown \
   bot-squad-api:latest -R "$(id -u):$(id -g)" /repo >/dev/null 2>&1 || true
 
 # web — reuse the shared web/node_modules PACKAGES (symlinked individually,

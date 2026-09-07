@@ -2646,12 +2646,40 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
         # already durable in the store; routing never breaks on a revive).
         suspended = _find_suspended_user_conversation(cfg, slug, window, gid)
         if suspended is not None:
+            # T-1054: `resume()` re-attaches the SAME stored window verbatim
+            # (see its own docstring) — it never renames. T-0964 only touched
+            # the FRESH-spawn name; an attendant that predates it never spawns
+            # fresh again, only resumes, so it was carrying the scary
+            # `<gid>-user-conversation` name forever. T-0964's "self-heals on
+            # next recycle" assumed recycle meant a fresh spawn; for THIS path
+            # recycle IS suspend+resume, exactly the one that never renamed —
+            # measured live: p727 (watchrobot) suspended 2026-09-06, resumed
+            # 2026-09-07, still `gu_dc8262…-user-conversation`. Caught here,
+            # once, right after the resume that would otherwise perpetuate it.
+            legacy_meta = _sessions._read_session_metadata(
+                _sessions._session_file(cfg.data_dir, slug, suspended))
+            needs_rename = (
+                legacy_meta is not None
+                and str(legacy_meta.get("window") or "") == window)
             try:
                 wake = ("Your conversation resumed — a new message arrived in "
                         "your user-conversation thread. Read it and respond.")
                 res = _sessions.resume(cfg, slug, suspended, initial_prompt=wake)
                 if res.get("ok") and res.get("sid"):
-                    return {"ok": True, "sid": res["sid"], "spawned": False,
+                    resumed_sid = res["sid"]
+                    if needs_rename:
+                        try:
+                            target = _sessions.user_facing_window(cfg, slug, gid)
+                            ren = _sessions.sync_session_name(
+                                cfg, slug, resumed_sid, target)
+                            if ren.get("ok") and ren.get("new_sid"):
+                                resumed_sid = ren["new_sid"]
+                        except Exception:  # noqa: BLE001 — never fails the ensure
+                            log.exception(
+                                "ensure_user_conversation: T-1054 legacy-window "
+                                "rename of %s failed — attendant resumed under "
+                                "its old name", resumed_sid)
+                    return {"ok": True, "sid": resumed_sid, "spawned": False,
                             "resumed": True}
             except Exception:  # noqa: BLE001 — fall through to a fresh spawn
                 log.exception(

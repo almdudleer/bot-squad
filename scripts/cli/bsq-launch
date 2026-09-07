@@ -396,7 +396,12 @@ def _validate(candidate: Path, siblings: list[str] | None = None
 # refresh: promote a good candidate, keep the last good one otherwise
 # --------------------------------------------------------------------------
 def _stat_key(st: os.stat_result) -> list[int]:
-    return [st.st_size, st.st_mtime_ns]
+    # Mode is part of the identity on purpose. Without it a chmod is invisible
+    # to the fast path, and the launcher cannot notice the case below — it
+    # reads the source and runs it under `sys.executable`, so it never needs
+    # the execute bit and would happily keep serving while every direct-path
+    # caller was broken.
+    return [st.st_size, st.st_mtime_ns, st.st_mode & 0o777]
 
 
 def _set_key(src: Path, names: list[str]) -> dict[str, list[int]] | None:
@@ -420,6 +425,32 @@ def _set_key(src: Path, names: list[str]) -> dict[str, list[int]] | None:
         except OSError:
             return None
     return out
+
+
+def _warn_if_source_not_executable(src: Path, st: os.stat_result,
+                                   quiet: bool = False) -> None:
+    """Say so when the source has lost its execute bit.
+
+    Raised by p735 against this launcher, and it is this ticket's own shape one
+    layer in: the launcher reads the source and runs it under
+    ``sys.executable``, so it NEVER NEEDS the execute bit. When
+    `scripts/cli/bsq` lost that bit, every session going through the launcher
+    kept working and only direct-path callers broke — the protection MASKED a
+    breakage it does not cover, which is worse than not covering it, because
+    the healthy majority is what people check.
+
+    So it is reported every time rather than once: the whole failure mode is
+    that nothing else on this host is positioned to notice.
+    """
+    if quiet or (st.st_mode & 0o111):
+        return
+    print(f"bsq: {src} is NOT EXECUTABLE ({oct(st.st_mode & 0o777)}).\n"
+          f"     I do not need the bit — I read the file and run it under "
+          f"python — but anything invoking it by path does, and it is failing "
+          f"right now.\n"
+          f"     fix: chmod +x {src}"
+          f"  (and `git update-index --chmod=+x {src}` if git disagrees, or a "
+          f"checkout puts it straight back)", file=sys.stderr)
 
 
 def _report_rejection(rej: dict, home: Path, quiet: bool = False) -> None:
@@ -460,6 +491,8 @@ def refresh(home: Path, src: Path, *, force: bool = False, quiet: bool = False,
         # The tree moved, was deleted, or is on a branch without the file. The
         # fleet keeps running; this is not a reason to take the bus down.
         return "no-source", str(exc)
+
+    _warn_if_source_not_executable(src, st, quiet=quiet)
 
     stamp = _read_json(home / "stamp")
     if (not force and snap.exists() and stamp.get("set")
@@ -630,6 +663,14 @@ def _cmd_status(home: Path, src: Path | None) -> int:
     print(f"launcher : {Path(sys.argv[0]).resolve()}")
     print(f"source   : {src if src else '(not configured)'}")
     print(f"snapshot : {snap}{'' if snap.exists() else '  (MISSING)'}")
+    if src is not None:
+        try:
+            mode = os.stat(src).st_mode & 0o777
+            print(f"src mode : {oct(mode)}"
+                  + ("" if mode & 0o111 else "  <- NOT EXECUTABLE: I still work, "
+                                             "direct-path callers do not"))
+        except OSError:
+            pass
     if stamp:
         print(f"           sha {str(stamp.get('sha',''))[:12]}  promoted {stamp.get('at')}"
               f"  {stamp.get('bytes')} bytes")

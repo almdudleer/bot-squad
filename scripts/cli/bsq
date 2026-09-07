@@ -8356,9 +8356,20 @@ def cmd_task_new(args) -> None:
         try:
             res = post("task_new", retry, fatal=False)
         except WorkerError as e2:
-            die(f"task new: dropping {sorted(dropped)} did not help.\n"
-                f"  first call: {msg}\n"
-                f"  retry:      {e2}")
+            # Say which of the two things happened. The degrade either did not
+            # help, or it helped and the retry then hit an UNRELATED gate — a
+            # dedupe refusal, a bad priority. Reporting both as "dropping X did
+            # not help" points the reader at the param again, which is the
+            # exact misdirection this whole code path exists to stop.
+            if "unexpected params" in str(e2):
+                die(f"task new: dropping {sorted(dropped)} did not help — the "
+                    f"worker still refuses params it does not know.\n"
+                    f"  first call: {msg}\n"
+                    f"  retry:      {e2}")
+            die(f"task new: {sorted(dropped)} was dropped for this worker (it "
+                f"does not accept it yet) and the retry then failed for an "
+                f"UNRELATED reason — read the retry line, not the param:\n"
+                f"  retry: {e2}")
     if dropped:
         # Only what the worker could not take is stamped post-hoc; everything
         # it accepted was already written at the gate.

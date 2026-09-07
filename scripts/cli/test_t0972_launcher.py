@@ -143,10 +143,21 @@ def lab(tmp_path):
     home = tmp_path / "home"
     src = tmp_path / "tree" / "bsq"
     src.parent.mkdir(parents=True)
-    src.write_text(_mini("v1"))
+    _save(src, _mini("v1"))
     _age(src)
     assert launch.refresh(home, src, force=True, quiet=True)[0] == "promoted"
     return home, src
+
+
+def _save(path: Path, text: str):
+    """Write a candidate source AS ONE REALLY EXISTS — executable.
+
+    `scripts/cli/bsq` is mode 755. A fixture that writes 644 is not a smaller
+    version of the real thing, it is a different thing, and it trips the
+    exec-bit warning in tests that are about something else entirely.
+    """
+    path.write_text(text)
+    os.chmod(path, 0o755)
 
 
 def _age(path: Path, seconds: float = 5.0):
@@ -169,7 +180,7 @@ def test_healthy_source_promotes_and_is_what_gets_executed(lab):
 
 def test_a_good_edit_is_promoted(lab):
     home, src = lab
-    src.write_text(_mini("v2")); _age(src)
+    _save(src, _mini("v2")); _age(src)
     assert launch.refresh(home, src)[0] == "promoted"
     assert "v2" in _snapshot_text(home)
 
@@ -177,7 +188,7 @@ def test_a_good_edit_is_promoted(lab):
 def test_a_torn_save_is_rejected_and_the_fleet_keeps_the_last_good_copy(lab, capsys):
     home, src = lab
     whole = _mini("v2")
-    src.write_text(whole[:int(len(whole) * 0.6)])  # what write_text leaves mid-stream
+    _save(src, whole[:int(len(whole) * 0.6)])  # what write_text leaves mid-stream
     _age(src)
     outcome, _ = launch.refresh(home, src)
     assert outcome == "rejected"
@@ -196,7 +207,7 @@ def test_a_subparser_collision_is_rejected_although_it_parses(lab, capsys):
     text = _mini("v2", extra='sub.add_parser("inbox")')  # a second `inbox`
     import ast
     ast.parse(text)  # the candidate is perfectly valid Python
-    src.write_text(text); _age(src)
+    _save(src, text); _age(src)
     outcome, detail = launch.refresh(home, src)
     assert outcome == "rejected"
     assert "conflicting subparser" in detail
@@ -208,7 +219,7 @@ def test_a_candidate_that_parses_and_builds_but_lost_a_core_verb_is_rejected(lab
     `it is whole`, so the verb set is checked too."""
     home, src = lab
     verbs = [v for v in launch.CORE_VERBS if v != "inbox"]
-    src.write_text(_mini("v2", verbs=verbs)); _age(src)
+    _save(src, _mini("v2", verbs=verbs)); _age(src)
     outcome, detail = launch.refresh(home, src)
     assert outcome == "rejected"
     assert "core verbs are MISSING" in detail and "inbox" in detail
@@ -217,7 +228,7 @@ def test_a_candidate_that_parses_and_builds_but_lost_a_core_verb_is_rejected(lab
 
 def test_the_rejection_is_repeated_every_time_until_it_is_fixed(lab, capsys):
     home, src = lab
-    src.write_text("def build_parser(:\n"); _age(src)
+    _save(src, "def build_parser(:\n"); _age(src)
     launch.refresh(home, src); capsys.readouterr()
     for _ in range(3):
         assert launch.refresh(home, src)[0] == "rejected"
@@ -227,9 +238,9 @@ def test_the_rejection_is_repeated_every_time_until_it_is_fixed(lab, capsys):
 
 def test_recovery_promotes_on_the_very_next_call(lab, capsys):
     home, src = lab
-    src.write_text("def build_parser(:\n"); _age(src)
+    _save(src, "def build_parser(:\n"); _age(src)
     assert launch.refresh(home, src)[0] == "rejected"
-    src.write_text(_mini("v3")); _age(src)
+    _save(src, _mini("v3")); _age(src)
     assert launch.refresh(home, src)[0] == "promoted"
     assert "v3" in _snapshot_text(home)
     assert not (home / "rejected").exists()
@@ -239,7 +250,7 @@ def test_a_save_still_in_flight_is_neither_promoted_nor_reported(lab, capsys):
     """The settle window. A file written moments ago is assumed to still be
     streaming; that state is transient by construction, so it is silent."""
     home, src = lab
-    src.write_text(_mini("v2"))
+    _save(src, _mini("v2"))
     _age(src, 5.0)
     # A 60s window against a 5s-old file: "recently saved" without depending on
     # how fast this host happens to be scheduling us.
@@ -253,7 +264,7 @@ def test_a_save_still_in_flight_is_neither_promoted_nor_reported(lab, capsys):
 def test_force_ignores_the_settle_window(lab):
     """`--bsq-publish` is an editor saying `I have finished writing`."""
     home, src = lab
-    src.write_text(_mini("v2"))
+    _save(src, _mini("v2"))
     _age(src, 5.0)
     assert launch.refresh(home, src, force=True, quiet=True,
                           settle_s=60.0)[0] == "promoted"
@@ -279,7 +290,7 @@ def test_identical_bytes_with_a_new_mtime_are_restamped_not_revalidated(lab):
 
 def test_concurrent_refreshes_produce_one_valid_snapshot(lab):
     home, src = lab
-    src.write_text(_mini("v2")); _age(src)
+    _save(src, _mini("v2")); _age(src)
     procs = [subprocess.Popen(
         [sys.executable, "-c",
          f"import importlib.machinery as m, importlib.util as u, pathlib;"
@@ -522,3 +533,84 @@ class TestSetStaleness:
         launch.refresh(home, src)
         second = json.loads((home / "stamp").read_text())["sha"]
         assert first != second
+
+
+# ==========================================================================
+# THE EXEC BIT (raised by p735 against this launcher)
+#
+# The launcher reads the source and runs it under `sys.executable`, so it
+# NEVER NEEDS the execute bit. When scripts/cli/bsq lost that bit, every
+# session going through the launcher kept working and only direct-path callers
+# broke: the protection MASKED a breakage it does not cover. That is worse
+# than not covering it, because the healthy majority is what people check.
+# ==========================================================================
+class TestSourceExecBit:
+    @pytest.fixture
+    def lab2(self, tmp_path):
+        home = tmp_path / "home"
+        src = tmp_path / "tree" / "bsq"
+        src.parent.mkdir(parents=True)
+        _save(src, _mini("v1"))
+        os.chmod(src, 0o755)
+        _age(src)
+        launch.refresh(home, src, force=True, quiet=True)
+        return home, src
+
+    def test_a_chmod_alone_is_noticed(self, lab2):
+        """chmod changes ctime, NOT mtime. A key of (size, mtime) cannot see
+        it at all, which is why mode is part of the identity."""
+        home, src = lab2
+        before = os.stat(src).st_mtime_ns
+        stamped_before = json.loads((home / "stamp").read_text())["set"]["bsq"]
+        os.chmod(src, 0o644)
+        assert os.stat(src).st_mtime_ns == before, (
+            "if chmod started moving mtime this test proves nothing — the "
+            "point is that it does not")
+
+        # The outcome is legitimately `current`: the CONTENT is unchanged, so
+        # the published snapshot is still right and nothing needs promoting.
+        # What must not happen is the pre-lock fast path swallowing the change
+        # without ever looking — which is exactly what a (size, mtime) key does.
+        launch.refresh(home, src, quiet=True)
+        stamped_after = json.loads((home / "stamp").read_text())["set"]["bsq"]
+        assert stamped_after != stamped_before, (
+            "the mode change was invisible: refresh returned without even "
+            "re-reading the source, so nothing could ever report it")
+        assert stamped_after[2] == 0o644
+
+    def test_a_non_executable_source_is_reported_every_time(self, lab2, capsys):
+        home, src = lab2
+        os.chmod(src, 0o644)
+        for _ in range(3):
+            launch.refresh(home, src)
+            err = capsys.readouterr().err
+            assert "NOT EXECUTABLE" in err, (
+                "reported EVERY time on purpose: nothing else on the host is "
+                "positioned to notice, so a once-only warning is a warning "
+                "that gets scrolled past")
+            assert "chmod +x" in err, "and it must say how to fix it"
+
+    def test_an_executable_source_says_nothing(self, lab2, capsys):
+        home, src = lab2
+        os.chmod(src, 0o755)
+        _age(src)
+        launch.refresh(home, src)
+        assert "NOT EXECUTABLE" not in capsys.readouterr().err
+
+    def test_status_shows_the_mode(self, lab2, capsys):
+        home, src = lab2
+        os.chmod(src, 0o644)
+        launch._cmd_status(home, src)
+        out = capsys.readouterr().out
+        assert "src mode : 0o644" in out and "NOT EXECUTABLE" in out
+
+    def test_the_launcher_still_works_without_the_bit(self, lab2, capsys):
+        """The masking itself is correct behaviour and must not regress into a
+        refusal — the fleet keeping working is the point. It just must not be
+        SILENT about it."""
+        home, src = lab2
+        src.write_text(_mini("v2"))
+        os.chmod(src, 0o644)
+        _age(src)
+        assert launch.refresh(home, src)[0] == "promoted"
+        assert "v2" in _snapshot_text(home)

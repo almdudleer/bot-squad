@@ -614,3 +614,106 @@ class TestSourceExecBit:
         _age(src)
         assert launch.refresh(home, src)[0] == "promoted"
         assert "v2" in _snapshot_text(home)
+
+
+# ==========================================================================
+# T-1069: THE INSTALL ITSELF MUST NEVER MAKE ~/.local/bin/bsq ABSENT
+#
+# `_cmd_install` used to `dest.unlink()` before writing the new copy, which
+# left the path a concurrent `bsq` call could resolve to NOTHING for the
+# length of a mkstemp + copyfile + chmod. `os.replace` already swaps an
+# EXISTING file atomically, so the fix is simply: never unlink first. These
+# tests pin that behaviourally — by polling the path from a concurrent thread
+# during a deliberately slowed install — rather than by asserting the
+# implementation doesn't call unlink, which would pass even if a refactor
+# reintroduced the same hazard through a different call.
+# ==========================================================================
+class TestInstallIsAtomic:
+    def _prep(self, tmp_path):
+        home = tmp_path / "home"
+        src = tmp_path / "tree" / "bsq"
+        src.parent.mkdir(parents=True)
+        _save(src, _mini("v1"))
+        dest = tmp_path / "bin" / "bsq"
+        dest.parent.mkdir(parents=True)
+        _save(dest, _mini("v0"))  # a pre-existing install, as every real host has
+        return home, src, dest
+
+    def test_dest_is_never_absent_during_a_slow_install(self, tmp_path, monkeypatch):
+        import threading
+
+        home, src, dest = self._prep(tmp_path)
+
+        real_copyfile = shutil.copyfile
+
+        def slow_copyfile(a, b):
+            # The window the old code left open: mkstemp already happened,
+            # the temp is about to be filled. Sleeping HERE, not before, is
+            # what makes a concurrent poll land inside the real install
+            # window rather than before it starts.
+            real_copyfile(a, b)
+            time.sleep(0.3)
+
+        monkeypatch.setattr(shutil, "copyfile", slow_copyfile)
+
+        seen_missing = []
+        stop = threading.Event()
+
+        def poll():
+            while not stop.is_set():
+                if not dest.exists():
+                    seen_missing.append(time.time())
+
+        poller = threading.Thread(target=poll, daemon=True)
+        poller.start()
+        try:
+            rc = launch._cmd_install(home, [str(src), str(dest)])
+        finally:
+            stop.set()
+            poller.join(timeout=5)
+
+        assert rc == 0
+        assert not seen_missing, (
+            f"{dest} was observed ABSENT {len(seen_missing)} time(s) during "
+            "install — a concurrent `bsq` call in that window gets "
+            "'command not found', the exact T-1069 incident.")
+        assert dest.exists()
+
+    def test_a_preexisting_symlink_dest_is_also_never_absent(self, tmp_path, monkeypatch):
+        """The other dest shape `_cmd_install` handles specially (recording
+        `was a symlink -> ...` before replacing it) must be equally atomic —
+        the backup bookkeeping runs BEFORE the replace either way, so this
+        pins that it does not itself introduce a window."""
+        import threading
+
+        home, src, real_dest = self._prep(tmp_path)
+        dest = tmp_path / "bin" / "bsq-link"
+        dest.symlink_to(real_dest)
+
+        real_copyfile = shutil.copyfile
+
+        def slow_copyfile(a, b):
+            real_copyfile(a, b)
+            time.sleep(0.3)
+
+        monkeypatch.setattr(shutil, "copyfile", slow_copyfile)
+
+        seen_missing = []
+        stop = threading.Event()
+
+        def poll():
+            while not stop.is_set():
+                if not dest.exists() and not dest.is_symlink():
+                    seen_missing.append(time.time())
+
+        poller = threading.Thread(target=poll, daemon=True)
+        poller.start()
+        try:
+            rc = launch._cmd_install(home, [str(src), str(dest)])
+        finally:
+            stop.set()
+            poller.join(timeout=5)
+
+        assert rc == 0
+        assert not seen_missing
+        assert not dest.is_symlink(), "install must leave a real copy, not the old symlink"

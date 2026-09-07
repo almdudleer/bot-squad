@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+from datetime import datetime, timezone
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -59,6 +60,34 @@ def test_reentry_gets_a_fresh_stamp(tmp_path, monkeypatch):
     _run_update(tmp_path, monkeypatch, "blocked_on_user")
     second = bsq.read_frontmatter(p)["status_since"]
     assert second != first  # a fresh stay gets a fresh clock
+
+
+def test_reentry_within_same_second_gets_monotonic_stamp(tmp_path, monkeypatch):
+    """T-1016: status_since is stamped at whole-second resolution, so three
+    real transitions landing inside one wall-clock second must not collapse
+    to an identical stamp — status_deadlines.py's alert dedup is keyed on
+    (ticket_id, status, status_since), so an unchanged stamp on re-entry reads
+    as "still the same stay" and swallows the alert. Freeze the clock instead
+    of relying on wall-clock luck to land in the same second (the original
+    flake failed 13/20 runs depending on exactly that)."""
+    frozen = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen
+
+    monkeypatch.setattr(bsq, "datetime", _FrozenDatetime)
+    p = tmp_path / "T-0001-demo.md"
+    _write(p, status="in_progress", status_since="2020-01-01T00:00:00Z")
+    _run_update(tmp_path, monkeypatch, "blocked_on_user")
+    first = bsq.read_frontmatter(p)["status_since"]
+    _run_update(tmp_path, monkeypatch, "in_progress")
+    _run_update(tmp_path, monkeypatch, "blocked_on_user")
+    second = bsq.read_frontmatter(p)["status_since"]
+    assert first == "2025-01-01T00:00:00Z"
+    assert second != first
+    assert second == "2025-01-01T00:00:02Z"  # two same-second collisions, each bumped 1s
 
 
 def test_first_ever_status_write_is_stamped(tmp_path, monkeypatch):

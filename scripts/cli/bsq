@@ -58,13 +58,38 @@ import sys
 import tempfile
 import time
 import tomllib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
 def _utc_now() -> str:
     """ISO-8601 UTC timestamp (``...Z``), matching the worker's note format."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _fresh_since_stamp(prev: str, now: str) -> str:
+    """A ``status_since``-style stamp guaranteed to differ from ``prev`` (T-1016).
+
+    Both status_since writers (this one and api/app/markdown_writer.py's
+    ``merge_task_update``) stamp at whole-SECOND resolution. That is not just
+    imprecise — status_deadlines.py's alert dedup is keyed on
+    ``(ticket_id, status, status_since)``, so a re-entry into the same gated
+    status that lands in the same wall-clock second as the stay it just left
+    would collide with the value already recorded and silently read as "still
+    the same stay," swallowing the fresh alert its own docstring promises.
+    Bumping by whole seconds (never sub-second) keeps the on-disk format and
+    every existing regex/consumer of it unchanged; only re-entries fast enough
+    to collide ever see a bump, and each one is exactly 1s past the last."""
+    if not prev:
+        return now
+    try:
+        prev_dt = datetime.strptime(prev, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        now_dt = datetime.strptime(now, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return now  # an unparseable prior stamp has nothing to collide with
+    if now_dt > prev_dt:
+        return now
+    return (prev_dt + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 BOT_SQUAD = os.environ.get("BOT_SQUAD", "/home/www/bot-squad")
 WORKER_SOCK = os.environ.get("WORKER_SOCK", f"{BOT_SQUAD}/data/_sock/worker.sock")
@@ -7823,7 +7848,13 @@ def cmd_ticket_update(args) -> None:
     # write boundaries need the same stamp independently, or `status_since`
     # would silently miss every CLI-driven transition (most of them).
     if old != status:
-        since_ln = f"status_since: {_utc_now()}"
+        prev_since = ""
+        for ln in lines:
+            mm = re.match(r"^status_since:\s*(.*)$", ln)
+            if mm:
+                prev_since = mm.group(1).strip()
+                break
+        since_ln = f"status_since: {_fresh_since_stamp(prev_since, _utc_now())}"
         for i, ln in enumerate(lines):
             if re.match(r"^status_since:\s*", ln):
                 lines[i] = since_ln

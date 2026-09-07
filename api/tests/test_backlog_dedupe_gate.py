@@ -122,12 +122,12 @@ def test_task_search_mirror_is_byte_identical():
     byte-identity is the anti-drift contract). Skips where the worker tree
     isn't mounted (the docker test recipe mounts api/ only)."""
     api_copy = Path(__file__).resolve().parents[1] / "app" / "task_search.py"
-    candidates = [
+    here_parents = Path(__file__).resolve().parents
+    # docker test recipe mounts api/ at /app; mount worker/ at /worker to arm this
+    candidates = [Path("/worker/bot_squad_worker/task_search.py")]
+    if len(here_parents) > 2:
         # repo checkout: <repo>/api/tests/… → <repo>/worker/…
-        Path(__file__).resolve().parents[2] / "worker" / "bot_squad_worker" / "task_search.py",
-        # docker test recipe mounts api/ at /app; mount worker/ at /worker to arm this
-        Path("/worker/bot_squad_worker/task_search.py"),
-    ]
+        candidates.insert(0, here_parents[2] / "worker" / "bot_squad_worker" / "task_search.py")
     worker_copy = next((p for p in candidates if p.exists()), None)
     if worker_copy is None:
         pytest.skip("worker tree not available in this environment")

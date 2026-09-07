@@ -50,10 +50,10 @@ def _client_logged_in(tmp_bot_squad: Path, monkeypatch):
 
 def test_task_states_mirror_is_byte_identical() -> None:
     api_copy = Path(__file__).resolve().parents[1] / "app" / "task_states.py"
-    candidates = [
-        Path(__file__).resolve().parents[3] / "worker" / "bot_squad_worker" / "task_states.py",
-        Path("/worker/bot_squad_worker/task_states.py"),
-    ]
+    here_parents = Path(__file__).resolve().parents
+    candidates = [Path("/worker/bot_squad_worker/task_states.py")]
+    if len(here_parents) > 2:
+        candidates.insert(0, here_parents[2] / "worker" / "bot_squad_worker" / "task_states.py")
     worker_copy = next((p for p in candidates if p.exists()), None)
     if worker_copy is None:
         pytest.skip("worker tree not available in this environment")

@@ -219,10 +219,34 @@ def parse_or_none(text: str) -> tuple[dict, str] | None:
         return None
 
 
+#: T-1044: line width handed to pyyaml so no scalar is ever folded. Not
+#: ``float("inf")`` — pyyaml compares it against an int column and a float
+#: works only by accident of Python's numeric tower; a plain very large int
+#: says the same thing without depending on that.
+_DUMP_WIDTH = 1 << 30
+
+
 def dump_frontmatter(meta: dict) -> str:
     """Serialize a frontmatter mapping to its YAML block (no ``---`` fences).
 
     Key order preserved; lists inline; ``None`` as ``~``; timestamps unquoted.
+
+    T-1044: ``width`` is pinned so a long scalar is NEVER folded across lines.
+    pyyaml's default is 80 columns, and a folded value is still valid YAML —
+    the shared reader here round-trips it perfectly. The readers downstream do
+    not: ``scripts/cli/bsq``'s ``read_frontmatter`` is by its own docstring a
+    "tiny flat-YAML frontmatter reader (key: value lines only)", so a folded
+    title reaches it TRUNCATED at the fold, with the opening quote left on.
+    Measured on T-1003, a real 204-char title: ``bsq`` read 84 chars of it,
+    beginning ``"'the api/worker …``.
+
+    That has always been latent — every writer through here (the API's PATCH,
+    ``task_gc``'s auto-pause, the ``bsq ticket`` verbs) could trip it. T-1044
+    made it urgent rather than latent by rewriting a ticket at every pickup,
+    which is what turned "a title reflows if someone edits it" into "every
+    long title on the board reflows the moment a dev takes the ticket".
+    Pinning the width fixes the amplification and the latent case together;
+    it changes no VALUE, only where lines break.
     """
     return yaml.dump(
         meta,
@@ -230,6 +254,7 @@ def dump_frontmatter(meta: dict) -> str:
         allow_unicode=True,
         sort_keys=False,
         default_flow_style=False,
+        width=_DUMP_WIDTH,
     )
 
 

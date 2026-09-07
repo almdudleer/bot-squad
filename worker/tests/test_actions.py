@@ -2366,6 +2366,123 @@ def test_ensure_user_conversation_no_thread_id_nudge_unchanged(tmp_path, monkeyp
 
 
 # ---------------------------------------------------------------------------
+# T-1065: multi-user is not a separate mechanism — any already-live attendant
+# for a PROJECT answers a message from any of its users, not only the gid it
+# was originally spawned for. Routing only: the claim lock, suspend/resume
+# lookup, and conversation storage all stay per-gid (named debt, T-1066).
+# ---------------------------------------------------------------------------
+
+def test_ensure_user_conversation_routes_new_user_to_existing_attendant(tmp_path, monkeypatch):
+    """No live attendant for THIS gid, but one is live for a DIFFERENT gid on
+    the same project -> route to it, never spawn a second attendant."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    existing = "S-u-gu_userA-user-conversation-p1"
+
+    def boom_spawn(*a, **k):
+        raise AssertionError("must NOT spawn a second attendant for a "
+                              "second user when one is already live")
+
+    nudged = {}
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: None)
+    monkeypatch.setattr(
+        S, "live_user_conversation_sids",
+        lambda cfg, slug: [{"sid": existing, "window": "universal_bsq_session",
+                             "tmux_session": slug, "global_user_id": "gu_userA"}])
+    monkeypatch.setattr(S, "spawn", boom_spawn)
+    monkeypatch.setattr(A, "_action_inject_input",
+                        lambda params: nudged.update(params) or {"ok": True})
+
+    result = A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_userB",
+        "message_ref": "hello from a second user",
+    })
+    assert result == {"ok": True, "sid": existing, "spawned": False}
+    assert nudged["sid"] == existing
+
+
+def test_ensure_user_conversation_cross_user_nudge_names_sender_and_url(tmp_path, monkeypatch):
+    """The nudge to a shared attendant must name the SENDING gid and its own
+    per-gid read URL — reads stay per-gid, so this is the only way the
+    attendant learns where to find a message from a user it wasn't spawned
+    for."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    existing = "S-u-gu_userA-user-conversation-p1"
+    nudged = {}
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: None)
+    monkeypatch.setattr(
+        S, "live_user_conversation_sids",
+        lambda cfg, slug: [{"sid": existing, "window": "universal_bsq_session",
+                             "tmux_session": slug, "global_user_id": "gu_userA"}])
+    monkeypatch.setattr(A, "_action_inject_input",
+                        lambda params: nudged.update(params) or {"ok": True})
+
+    A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_userB",
+        "message_ref": "hello from a second user",
+    })
+    assert "gu_userB" in nudged["text"]
+    assert "/api/m/worker/conversations/test-project/gu_userB/messages" in nudged["text"]
+
+
+def test_ensure_user_conversation_same_user_nudge_omits_cross_user_note(tmp_path, monkeypatch):
+    """Routing to the SAME gid's own attendant must not gain the cross-user
+    note — that path is unchanged from before this ticket."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    existing = "S-u-gu_a1b2c3-user-conversation-p9"
+    nudged = {}
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: existing)
+
+    def boom_sids(*a, **k):
+        raise AssertionError("must not need the slug-wide lookup when the "
+                              "exact-gid match already found an attendant")
+
+    monkeypatch.setattr(S, "live_user_conversation_sids", boom_sids)
+    monkeypatch.setattr(A, "_action_inject_input",
+                        lambda params: nudged.update(params) or {"ok": True})
+
+    A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_a1b2c3",
+        "message_ref": "another message",
+    })
+    assert nudged["text"] == (
+        "A new message arrived in your user-conversation thread — read it and respond."
+    )
+
+
+def test_ensure_user_conversation_no_live_attendant_anywhere_still_spawns(tmp_path, monkeypatch):
+    """No live attendant for this gid AND none for any other user of the
+    project -> the fresh-spawn path is unaffected."""
+    import bot_squad_worker.actions as A
+    import bot_squad_worker.sessions as S
+
+    _make_sessions_cfg(tmp_path, monkeypatch)
+    spawned = {}
+
+    def fake_spawn(cfg, slug, window, initial_prompt=None, **kw):
+        spawned["window"] = window
+        return {"ok": True, "sid": "S-u-fresh-p1"}
+
+    monkeypatch.setattr(S, "live_user_conversation_sid", lambda cfg, slug, gid: None)
+    monkeypatch.setattr(S, "live_user_conversation_sids", lambda cfg, slug: [])
+    monkeypatch.setattr(S, "spawn", fake_spawn)
+
+    result = A.dispatch("ensure_user_conversation", {
+        "slug": "test-project", "global_user_id": "gu_a1b2c3", "message_ref": "hi",
+    })
+    assert result == {"ok": True, "sid": "S-u-fresh-p1", "spawned": True}
+    assert spawned  # spawn was actually called
+
+
+# ---------------------------------------------------------------------------
 # T-0775: the conversation-read URL these prompts hand the attendant
 #
 # All three sites named `GET /api/conversations/<slug>/<gid>/messages`, which is

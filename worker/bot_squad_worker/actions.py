@@ -2453,6 +2453,11 @@ the product/protocol. Your mandate, in short:
     id> — <one-liner>"`); the operator dispatches the build, not you.
   - You are UNRESTRICTED: you may spawn an operator/TL/ad-hoc session or fix
     things yourself in service of the user's ask.
+  - T-1065: you serve this PROJECT, not only this one user — no secrets
+    between the users of one project. A later nudge may name a DIFFERENT
+    `global_user_id` than yours; when it does, read THAT user's own thread at
+    the same URL pattern with their gid substituted, and treat their message
+    exactly like this one.
 {new_msg}{thread_block}{group_block}"""
 
 
@@ -2587,6 +2592,14 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
     rather than spawning a duplicate — so a burst of messages does not fan out
     into N sessions.
 
+    T-1065: idempotent PER PROJECT, not per user — if a live attendant exists
+    for this ``slug`` under a DIFFERENT ``global_user_id``, the message routes
+    to that attendant too, rather than spawning a second one. "Several users
+    writing a lot" and "one user writing a lot" are the same event; there is
+    no per-user attendant fork (docs/architecture/D-0072). The spawn/claim-lock/
+    suspend-resume key below stays per-gid (named debt, T-1066) — this only
+    widens WHO an already-live attendant answers.
+
     Required params: slug, global_user_id
     Optional params: message_ref (a reference/snippet of the inbound message,
                      surfaced in the boot prompt; the session reads the full
@@ -2661,6 +2674,20 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
 
         # Reuse: a live attendant already holds this (slug, gid) → route to it.
         existing = _sessions.live_user_conversation_sid(cfg, slug, gid)
+        # T-1065: multi-user is not a separate mechanism — "several users
+        # writing a lot" and "one user writing a lot" are the same event, so
+        # ANY already-live attendant for this PROJECT answers a message from
+        # ANY of its users, not only the gid it originally spawned for. Only
+        # the ROUTING widens here; the claim lock below, the suspend/resume
+        # lookup, and conversation storage all stay per-gid (named debt,
+        # T-1066) — this never spawns a second attendant where one already
+        # exists for the slug. See docs/architecture/D-0072.
+        routed_to_other_user = False
+        if existing is None:
+            live_attendants = _sessions.live_user_conversation_sids(cfg, slug)
+            if live_attendants:
+                existing = live_attendants[0]["sid"]
+                routed_to_other_user = True
         if existing is not None:
             # T-1060 — the recycle clock, decided BEFORE anything is injected.
             #
@@ -2685,7 +2712,22 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
                 # Best-effort wake — the attendant re-reads its thread for the
                 # new message. A pane-timing hiccup must never fail the ensure
                 # (the message is already durable in the store).
-                nudge_text = "A new message arrived in your user-conversation thread — read it and respond."
+                # T-1065: routed_to_other_user means this message's sender is
+                # NOT the gid this attendant was originally spawned/resumed
+                # for. Reads stay per-gid (conversation_store unchanged), so
+                # the nudge must name the sending gid and its own thread URL
+                # explicitly — the shared attendant has no other way to find
+                # it. Empty when False: every existing single-user nudge is
+                # byte-identical to before this change.
+                other_user_note = (
+                    f"This message is from a different user of this project "
+                    f"than you were spawned for — `{gid}` — because one "
+                    f"attendant now serves every user of a project (T-1065: "
+                    f"multi-user is not a separate mechanism). Read that "
+                    f"user's own thread: "
+                    f"GET /api/m/worker/conversations/{slug}/{gid}/messages\n"
+                ) if routed_to_other_user else ""
+                nudge_text = f"{other_user_note}A new message arrived in your user-conversation thread — read it and respond."
                 # T-0795: the topic id LEADS the nudge in the shared highlighted
                 # rendering instead of sitting mid-sentence. This text stays
                 # ONE LINE by convention (prominence on both transports — see
@@ -2700,7 +2742,7 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
                     # T-0775: worker-token route — the bare /api/conversations/
                     # prefix this used to name is mounted nowhere (404).
                     nudge_text = (
-                        f"{ids} — a new message arrived in that topic of your "
+                        f"{other_user_note}{ids} — a new message arrived in that topic of your "
                         f"user-conversation. Read that topic's isolated thread "
                         f"(GET /api/m/worker/conversations/{slug}/{gid}/messages"
                         f"?thread_id={thread_id}) and reply into it (append with "

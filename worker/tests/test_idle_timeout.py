@@ -2472,6 +2472,48 @@ def test_nudge_text_only_names_transitions_the_graph_allows(tmp_path):
     assert "then `bsq ticket update T-1 blocked_on_user`" in text
 
 
+# --- T-1032: idle_timeout's pane-injected nudges carry the harness marker --
+#
+# Same defect as autocompact's handoff prompts: these texts land in an idle
+# pane via tmux send-keys and are indistinguishable from real human typing at
+# the transcript source, so close_hook can only exclude them if the text
+# itself is marked. The `_worker_nudge_text`/`_keepalive_nudge_text` builders
+# stay unmarked (tested above by content) — the `_send_*` wrappers are where
+# the marker is added, right before the text reaches the pane.
+
+def test_send_typing_warning_prepends_the_harness_marker(monkeypatch):
+    from bot_squad_worker import actions
+    from bot_squad_worker.input_mux import HARNESS_NUDGE_MARKER
+    sent = {}
+    monkeypatch.setattr(actions, "_action_inject_input",
+                         lambda params: sent.update(params))
+    IT._send_typing_warning("S-x-p1", "скоро закончится контекст (1 токен)")
+    assert sent["text"].startswith(HARNESS_NUDGE_MARKER)
+    assert "скоро закончится контекст" in sent["text"]
+
+
+def test_send_keepalive_nudge_prepends_the_harness_marker(monkeypatch):
+    from bot_squad_worker import actions
+    from bot_squad_worker.input_mux import HARNESS_NUDGE_MARKER
+    sent = {}
+    monkeypatch.setattr(actions, "_action_inject_input",
+                         lambda params: sent.update(params))
+    IT._send_keepalive_nudge("S-x-p1", "continue — your ~1h cache window...")
+    assert sent["text"].startswith(HARNESS_NUDGE_MARKER)
+
+
+def test_send_dev_nudge_prepends_the_harness_marker(monkeypatch):
+    from bot_squad_worker import actions
+    from bot_squad_worker.input_mux import HARNESS_NUDGE_MARKER
+    sent = {}
+    monkeypatch.setattr(actions, "_action_inject_input",
+                         lambda params: sent.update(params))
+    text = IT._worker_nudge_text("dev", task_id="T-1", status="open")
+    IT._send_dev_nudge("S-x-p1", text)
+    assert sent["text"].startswith(HARNESS_NUDGE_MARKER)
+    assert "bsq ticket update T-1 in_progress" in sent["text"]
+
+
 def test_nudge_cap_escalation_falls_back_to_the_operator(tmp_path, dev_nudge_seams,
                                                          monkeypatch):
     """An escalation nobody receives is the silent give-up the cap exists to

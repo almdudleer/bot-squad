@@ -66,6 +66,21 @@ _SID_SAFE = re.compile(r"[^A-Za-z0-9_.-]")
 
 _PROMPT_RUNE = "❯"
 
+# T-1032 (the stakeholder's own T-0976 ask, verbatim: harness system messages
+# "should be prefixed as such, to avoid confusion with user input"). A nudge
+# typed into an IDLE pane through this module's send-keys transport lands in
+# the session's transcript indistinguishable from real human typing —
+# type=user, origin={kind:human}, promptSource=typed — because that is
+# literally how a human's own keystrokes would show up too; Claude Code's
+# transcript format only marks injected text specially when it arrives while
+# the pane is BUSY (a queued, wrapped record), never for idle delivery. So a
+# caller AUTHORING a system nudge (not relaying verbatim human/stakeholder
+# text) must start it with this marker: never something a real human would
+# plausibly type, placed FIRST so it survives whitespace normalization and
+# any downstream truncation. close_hook.py's harvest (and the CLI's guidance-
+# search attribution) exclude comments starting with it.
+HARNESS_NUDGE_MARKER = "[BOT-SQUAD SYSTEM MESSAGE — not stakeholder input]"
+
 
 def _safe(sid: str) -> str:
     return _SID_SAFE.sub("_", sid)

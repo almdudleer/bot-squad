@@ -442,7 +442,8 @@ def handoff_prompt(artifact_path: str, role: str | None = None, *,
             f"returns ok, reply: HANDOFF WRITTEN. {tail}"
         )
     guidance = assignment.role_compact_guidance(role)
-    return base + ("\n\n" + guidance if guidance else "")
+    from bot_squad_worker.input_mux import HARNESS_NUDGE_MARKER
+    return HARNESS_NUDGE_MARKER + "\n\n" + base + ("\n\n" + guidance if guidance else "")
 
 
 def context_handoff_prompt(task_id: str, *, relaunch: bool,
@@ -550,7 +551,7 @@ def context_handoff_prompt(task_id: str, *, relaunch: bool,
                 "leave it as it is and a later session picks it up from the "
                 "Context you are about to write.\n\n"
             )
-    return (
+    base = (
         f"{opening}"
         "Run exactly:\n"
         f"  bsq ticket context {task_id} --file <file holding the new Context>\n\n"
@@ -574,6 +575,8 @@ def context_handoff_prompt(task_id: str, *, relaunch: bool,
         "with a blank line, a bullet or a heading in it.\n\n"
         f"After both return ok, reply: CONTEXT WRITTEN. {after}"
     )
+    from bot_squad_worker.input_mux import HARNESS_NUDGE_MARKER
+    return HARNESS_NUDGE_MARKER + "\n\n" + base
 
 
 def boot_prompt_from_ticket(*, role: str | None, task_id: str,

@@ -7211,7 +7211,12 @@ def cmd_commit(args) -> None:
 _CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
 # jsonl user-string lines that are NOT stakeholder guidance (bus signals,
 # injected briefs, dispatch envelopes, command/system wrappers).
-_NON_STAKEHOLDER_PREFIXES = ("You are a bot-squad", ENVELOPE_MARKER)
+# T-1032: HARNESS_NUDGE_MARKER mirrors bot_squad_worker.input_mux's constant
+# of the same name (this CLI is a standalone deployable and can't import the
+# worker package, same reason ENVELOPE_MARKER above has no worker-side twin)
+# — keep the literal in sync if it ever changes there.
+HARNESS_NUDGE_MARKER = "[BOT-SQUAD SYSTEM MESSAGE — not stakeholder input]"
+_NON_STAKEHOLDER_PREFIXES = ("You are a bot-squad", ENVELOPE_MARKER, HARNESS_NUDGE_MARKER)
 _JSONL_PARSE_CAP = 400  # most-recently-modified candidate files to parse
 
 

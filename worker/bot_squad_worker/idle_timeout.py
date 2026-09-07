@@ -1491,7 +1491,8 @@ WARN_BEFORE_CACHE_SEC = 300
 
 def _send_typing_warning(sid: str, text: str) -> None:
     from bot_squad_worker.actions import _action_inject_input
-    _action_inject_input({"sid": sid, "text": text})
+    from bot_squad_worker.input_mux import HARNESS_NUDGE_MARKER
+    _action_inject_input({"sid": sid, "text": f"{HARNESS_NUDGE_MARKER} {text}"})
 
 
 def cache_warning_due(idle_age: float | None, now_window: int) -> bool:
@@ -1859,7 +1860,8 @@ def _keepalive_nudge_text(cfg: Any, slug: str) -> str:
 
 def _send_keepalive_nudge(sid: str, text: str) -> None:
     from bot_squad_worker.actions import _action_inject_input
-    _action_inject_input({"sid": sid, "text": text})
+    from bot_squad_worker.input_mux import HARNESS_NUDGE_MARKER
+    _action_inject_input({"sid": sid, "text": f"{HARNESS_NUDGE_MARKER} {text}"})
 
 
 def _maybe_keepalive_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
@@ -1973,7 +1975,8 @@ def _worker_nudge_text(role: str | None, *, task_id: str | None = None,
 
 def _send_dev_nudge(sid: str, text: str) -> None:
     from bot_squad_worker.actions import _action_inject_input
-    _action_inject_input({"sid": sid, "text": text})
+    from bot_squad_worker.input_mux import HARNESS_NUDGE_MARKER
+    _action_inject_input({"sid": sid, "text": f"{HARNESS_NUDGE_MARKER} {text}"})
 
 
 # --- T-0948: the no-progress streak ----------------------------------------

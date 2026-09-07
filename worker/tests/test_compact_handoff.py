@@ -262,6 +262,40 @@ def test_handoff_prompt_is_byte_identical_for_non_operator_roles():
     assert A.handoff_prompt("/art/T-0042.md", "teamlead") == base
 
 
+# --- T-1032: every pane-injected nudge starts with the harness marker -------
+#
+# These nudges land in an IDLE pane via tmux send-keys and the resulting
+# transcript entry is bit-for-bit identical to real human typing (type=user,
+# origin=human, promptSource=typed) — there is nothing to classify after the
+# fact. The marker is the whole fix, so every variant must carry it, at the
+# very start (close_hook's harvest — and the CLI's guidance search — match it
+# with a plain prefix check).
+
+def test_handoff_prompt_variants_all_start_with_the_harness_marker():
+    from bot_squad_worker.input_mux import HARNESS_NUDGE_MARKER
+    variants = [
+        A.handoff_prompt("/art/T-0042.md"),
+        A.handoff_prompt("/art/T-0042.md", relaunch=False),
+        A.handoff_prompt("/art/T-0042.md", relaunch=False, resume=True),
+        A.handoff_prompt("/art/T-0042.md", stay=True),
+        A.handoff_prompt("/data/bot-squad/artifacts/operator-state.md", "operator"),
+    ]
+    for p in variants:
+        assert p.startswith(HARNESS_NUDGE_MARKER), p[:80]
+
+
+def test_context_handoff_prompt_variants_all_start_with_the_harness_marker():
+    from bot_squad_worker.input_mux import HARNESS_NUDGE_MARKER
+    variants = [
+        A.context_handoff_prompt("T-0042", relaunch=True),
+        A.context_handoff_prompt("T-0042", relaunch=False),
+        A.context_handoff_prompt("T-0042", relaunch=False, resume=True),
+        A.context_handoff_prompt("T-0042", relaunch=True, stay=True),
+    ]
+    for p in variants:
+        assert p.startswith(HARNESS_NUDGE_MARKER), p[:80]
+
+
 # --- the 2-phase compact state machine --------------------------------------
 
 @pytest.fixture

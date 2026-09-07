@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from bot_squad_worker import close_hook, sessions as S
+from bot_squad_worker.input_mux import HARNESS_NUDGE_MARKER
 from tests.test_jobs import _make_config_with_project, _make_project_with_repo
 
 SID = "S-tester-T-0149-p9"
@@ -91,3 +92,18 @@ def test_no_duplicate_of_existing_ticket_text(tmp_path, monkeypatch):
     ticket.write_text(ticket.read_text() + f"\n## Context\n{dup}\n")
     res = close_hook.harvest_tick(cfg, slug)
     assert res["harvested"] == []
+
+
+def test_harness_nudge_marker_excluded_from_harvest(tmp_path, monkeypatch):
+    """T-1032: a mint-time-marked harness nudge is filtered even though it is
+    otherwise byte-for-byte what a real human-typed message looks like in the
+    transcript (type=user, userType=external, isSidechain=False) — the whole
+    point of the marker is that this class of message cannot be told apart
+    from real typing any other way (see input_mux.HARNESS_NUDGE_MARKER)."""
+    nudge = (f"{HARNESS_NUDGE_MARKER} ⏳ FINALIZE — WRITE YOUR "
+             "FORWARD-STATE ONTO T-0149. Per the process-paradigm lifecycle "
+             "this incarnation is ending now.")
+    cfg, slug, ticket, md = _setup(tmp_path, monkeypatch, messages=[_human(nudge)])
+    res = close_hook.harvest_tick(cfg, slug)
+    assert res["harvested"] == []
+    assert "FINALIZE" not in ticket.read_text()

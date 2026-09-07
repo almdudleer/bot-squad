@@ -24,6 +24,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from bot_squad_worker.input_mux import HARNESS_NUDGE_MARKER
+
 log = logging.getLogger(__name__)
 
 _MARKER = "guidance_harvested"
@@ -32,7 +34,14 @@ _MIN_LEN = 40              # ignore trivial one-word stakeholder messages
 _MAX_LEN = 280             # truncate each harvested comment
 _HARVEST_HEADING = "## Stakeholder comments (harvested at session close — T-0151)"
 # Reuse the guidance-search attribution exclusions.
-_NON_STAKEHOLDER_PREFIXES = ("You are a bot-squad", "[[bsq-dispatch")
+# T-1032: HARNESS_NUDGE_MARKER is the mint-time fix for the class of nudge
+# (CHECKPOINT/FINALIZE/CONTEXT FULL/CACHE WINDOW EXPIRING, the idle typing
+# warnings, the keepalive/worker nudges) that used to be indistinguishable
+# from real stakeholder typing at the transcript source — see input_mux.py
+# for why. Older transcripts minted before this fix still lack the marker;
+# those tickets are a separate, already-harvested population this exclusion
+# does not retroactively clean up.
+_NON_STAKEHOLDER_PREFIXES = ("You are a bot-squad", "[[bsq-dispatch", HARNESS_NUDGE_MARKER)
 _MAIL_SIGNAL = "check mail"
 
 

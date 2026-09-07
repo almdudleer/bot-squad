@@ -171,12 +171,18 @@ def operator_role_holders(cfg: Any, slug: str) -> list[str]:
     once. Two different callers ask about "the operator" and they want opposite
     fallbacks:
 
-      * **the singleton GUARD** ("may I spawn/claim another operator?") must
-        keep asking :func:`live_operator_sids` — a session that merely HOLDS
-        the operator role among others is exactly what ``bsq bud operator``
-        exists to relieve, so counting it there would refuse the handover the
-        stakeholder asked for («далее уже делать budding в оператора, на
-        которого перейдет драйв»).
+      * **the singleton GUARD** ("is a session whose ONLY role is operator
+        already running?") keeps asking :func:`live_operator_sids`. NOTE, and
+        this correction cost a live defect: it is NOT the right question for
+        "may I spawn/claim another operator". That is an EXCLUSIVITY question
+        and it must count a multi-role holder too — see
+        :func:`operator_exclusivity_sids`. The original justification here
+        said counting one would refuse ``bsq bud operator``; the comment beside
+        the spawn guard in ``actions.py`` says the opposite, and it is right —
+        the handover does not come through that guard at all, it calls
+        ``sessions.spawn`` directly via ``operator_redrive`` and releases the
+        seat itself. So the narrowing bought nothing there and cost the
+        T-0472 check.
       * **ROUTING** (re-drive continue-vs-respawn, ``peer_send operator``,
         deploy notices, instant-tweak placement) must ask THIS one. A solo
         universal session holds the operator role (``sessions.roles_of``), so
@@ -208,6 +214,48 @@ def operator_role_holders(cfg: Any, slug: str) -> list[str]:
         sid = str(meta.get("sid") or md.stem)
         if sid not in out:
             out.append(sid)
+    return out
+
+
+def operator_exclusivity_sids(cfg: Any, slug: str, *,
+                              exclude_sid: str | None = None) -> list[str]:
+    """EXCLUSIVITY: every live session that HOLDS the operator role — "does
+    this board already have a driver", asked by the callers that must refuse a
+    SECOND one (T-0472).
+
+    A UNION, deliberately, where :func:`operator_role_holders` is a preference:
+    routing has to pick ONE destination, but exclusivity has to see EVERYONE,
+    and a dedicated operator running beside a talking one is precisely the
+    state this question exists to catch. Reporting only the preferred one would
+    hide the violation behind the answer.
+
+    ``exclude_sid`` is the REQUESTER, and it is what makes this safe to use at
+    a spawn/claim gate: a session may always hand its own drive over or claim
+    the seat it is already driving with. That is the requester-identity
+    argument, and it is the shape the narrowing should have had in the first
+    place — "is anyone driving" answered by excluding certain drivers is
+    answering a different question, which is the whole defect class T-0943 is
+    about.
+
+    Fail-open like its siblings: an unreadable md is skipped, never raised.
+    """
+    out: list[str] = []
+    for sid in live_operator_sids(cfg, slug):
+        if sid not in out:
+            out.append(sid)
+    sess_dir = cfg.data_dir / slug / "sessions"
+    if sess_dir.exists():
+        for md in sorted(sess_dir.glob("*.md")):
+            meta = S._read_session_metadata(md)
+            if meta is None or not S._is_live_holder(meta):
+                continue
+            if "operator" not in S.roles_of(meta):
+                continue
+            sid = str(meta.get("sid") or md.stem)
+            if sid not in out:
+                out.append(sid)
+    if exclude_sid:
+        out = [s for s in out if s != str(exclude_sid)]
     return out
 
 

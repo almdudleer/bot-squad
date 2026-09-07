@@ -188,3 +188,48 @@ def test_operator_status_survives_a_broken_topology_read(cfg_slug, monkeypatch):
 
     assert out["state"] == "pending-redrive"      # the pre-T-0855 answer
     assert "topology" not in out
+
+
+# --- T-0943: "driving" means WHOEVER HOLDS the role, not only a dedicated one -
+
+def _write_session_md(cfg, slug, sid, *, window, roles=None, status="active"):
+    d = cfg.data_dir / slug / "sessions"
+    d.mkdir(parents=True, exist_ok=True)
+    lines = ["---", f"sid: {sid}", f"status: {status}", "task_id: ~",
+             f"window: {window}"]
+    if roles is not None:
+        lines.append("roles: [" + ", ".join(roles) + "]")
+    lines += ["---", ""]
+    (d / f"{sid}.md").write_text("\n".join(lines))
+
+
+def test_operator_status_reports_driving_for_a_multi_role_operator(cfg_slug):
+    """T-0943: this read is what a HUMAN uses to decide whether to spawn an
+    operator, so reporting "no live operator" about a session that is driving
+    the board produces a correct-looking human action — a second dispatcher.
+
+    Note the fixture still stubs `live_operator_sids` to [], which is the whole
+    point: the DEDICATED-operator singleton genuinely does not see this session,
+    and the status action must not be asking it.
+    """
+    cfg, slug = cfg_slug
+    _write_task(cfg, slug)
+    _write_session_md(cfg, slug, "S-u-operator-p1", window="operator",
+                      roles=["operator", "user-conversation"])
+    out = act_dispatch("operator_status", {"slug": slug})
+    assert out["state"] == "driving"
+    assert out["live_operators"] == ["S-u-operator-p1"]
+
+
+def test_operator_status_still_reports_pending_redrive_with_no_role_holder(
+        cfg_slug):
+    """NEGATIVE CONTROL: a board whose only session is a dev still reports
+    pending-redrive. The widening is to WHOEVER HOLDS THE OPERATOR ROLE, not to
+    'any live session', and without this arm the test above would also pass if
+    the report had been widened into meaninglessness."""
+    cfg, slug = cfg_slug
+    _write_task(cfg, slug)
+    _write_session_md(cfg, slug, "S-u-dev_thing-p9", window="dev_thing")
+    out = act_dispatch("operator_status", {"slug": slug})
+    assert out["state"] == "pending-redrive"
+    assert out["live_operators"] == []

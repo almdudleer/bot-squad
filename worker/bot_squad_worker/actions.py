@@ -2283,7 +2283,17 @@ def _action_spawn_session(params: dict[str, Any]) -> dict[str, Any]:
                 "operator orchestrates and spawns devs for tickets (T-0523)"
             )
         from bot_squad_worker import dispatch as _dispatch
-        existing = _dispatch.live_operator_sids(cfg, params["slug"])
+        # T-0943 (second pass): EXCLUSIVITY, not the dedicated-operator
+        # singleton. This asks "does this board already have a driver", and a
+        # session holding operator among other roles IS driving it — asking
+        # `live_operator_sids` here let an operator spawn past a live
+        # talking-operator, which is the second dispatcher T-0472 exists to
+        # prevent. The requester is excluded so a session can always hand its
+        # own drive over; the deliberate handover does not come through here
+        # anyway (see the comment below), so that exclusion costs nothing and
+        # makes the gate's question exactly right rather than accidentally so.
+        existing = _dispatch.operator_exclusivity_sids(
+            cfg, params["slug"], exclude_sid=params.get("parent_sid"))
         if existing:
             raise ActionError(
                 f"operator already running for {params['slug']!r}: {existing[0]} "
@@ -4973,7 +4983,12 @@ def _action_operator_status(params: dict[str, Any]) -> dict[str, Any]:
     from bot_squad_worker import operator_seat as _seat
 
     paused = _ord.is_paused(cfg, slug)
-    live = _dispatch.live_operator_sids(cfg, slug)
+    # T-0943 (second pass): report WHO IS DRIVING, not who is a dedicated
+    # operator. This read is what a human uses to decide whether to spawn an
+    # operator, so a wrong "no live operator" here produces a correct-looking
+    # human action that lands on the spawn gate above. A talking-operator was
+    # reported as absent while it was driving the board.
+    live = _dispatch.operator_exclusivity_sids(cfg, slug)
     pending = _ord.count_pending_backlog(cfg, slug)
     # T-0937: a live ROOT session wearing the operator hat is the OTHER way this
     # board can have a driver, and `live_operators` cannot show it (that list is

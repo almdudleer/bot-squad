@@ -181,8 +181,11 @@ def eligibility(cfg: Any, slug: str, sid: str) -> dict:
       any leaf worker suppress the board's driver.
 
     An actual ``operator``-role session does not need a seat claim: it holds the
-    board by role, through the T-0472 singleton, and is detected by
-    ``dispatch.live_operator_sids``.
+    board by role, through the T-0472 singleton. A DEDICATED one is detected by
+    ``dispatch.live_operator_sids``; a session holding operator ALONGSIDE other
+    roles is not, which is why the claim gate below asks
+    ``dispatch.operator_exclusivity_sids`` (T-0943) — it was asking the
+    singleton, and a root could claim the seat beside a live talking-operator.
     """
     from bot_squad_worker import budding as _budding
 
@@ -366,7 +369,13 @@ def claim(cfg: Any, slug: str, sid: str, *, source: str = "",
     if not el["ok"]:
         raise ActionError(f"operator_seat.claim: {el['reason']}")
 
-    live = _dispatch.live_operator_sids(cfg, slug)
+    # T-0943 (second pass): EXCLUSIVITY — "is anyone already driving this
+    # board", which a session holding operator among other roles satisfies.
+    # `live_operator_sids` is the dedicated-operator singleton and answered a
+    # different question here, so a root could claim the seat beside a live
+    # talking-operator. The claimant is excluded: claiming the seat for the
+    # board you are already driving is not a second dispatcher.
+    live = _dispatch.operator_exclusivity_sids(cfg, slug, exclude_sid=sid)
     if live:
         raise ActionError(
             f"operator_seat.claim: operator {live[0]} is already driving this "

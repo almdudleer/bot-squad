@@ -487,8 +487,9 @@ def build_scheduler(cfg: Config) -> BackgroundScheduler:
     # backlog has pending work AND the user has not paused AND no operator is
     # currently live — the continuity mechanism that keeps the operator
     # continuously scheduled WITHOUT a persistent session (clarification-01).
-    # Continue-vs-respawn rides dispatch.live_operator_sids (the T-0472 one-
-    # operator seam); a paused project or a spawn deferred under capacity/quota
+    # Continue-vs-respawn rides dispatch.operator_role_holders (T-0943: whoever
+    # HOLDS the role, so a solo/talking operator counts as already driving); a
+    # paused project or a spawn deferred under capacity/quota
     # backpressure ("stalls out of time") re-drives nothing. Kill switch:
     # BOT_SQUAD_OPERATOR_REDRIVE=0. max_instances=1 + coalesce keeps overlapping
     # ticks from racing the spawn path; idempotent so a missed run is harmless.

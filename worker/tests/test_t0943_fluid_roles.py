@@ -1113,3 +1113,124 @@ def test_the_singleton_guard_is_untouched_by_the_routing_fix(tmp_path, monkeypat
                    roles=["operator", "user-conversation"])
     assert D.live_operator_sids(cfg, "p") == []
     assert D.operator_role_holders(cfg, "p") == ["S-u-operator-p1"]
+
+
+# ---------------------------------------------------------------------------
+# EXCLUSIVITY: "is anyone already driving this board?"
+#
+# The second defect from the same narrowing, and the correction to a piece of
+# reasoning that both this ticket's author and the operator ratified. The
+# original justification for making `live_operator_sids` dedicated-only was
+# that counting a multi-role holder would refuse the `bsq bud operator`
+# handover. The comment beside the spawn guard in actions.py says the opposite
+# and is right: THE HANDOVER DOES NOT COME THROUGH THAT GUARD AT ALL — it calls
+# sessions.spawn directly via operator_redrive and releases the seat itself.
+# So the narrowing bought nothing there and cost the T-0472 check: an operator
+# spawn, or a seat claim, was PERMITTED beside a live talking-operator.
+#
+# The right shape is a requester-identity argument, not a narrower predicate:
+# exclusivity counts ANY operator-role holder, and the SPAWN-PERMISSION
+# question excludes the session doing the handover. A predicate that answers
+# "is anyone driving" by excluding certain drivers is answering a different
+# question — which is this ticket's whole defect class, arriving inside the
+# fix for it.
+# ---------------------------------------------------------------------------
+
+def test_exclusivity_sees_a_talking_operator_that_the_guard_misses(
+        tmp_path, monkeypatch):
+    """THE DEFECT, and the two answers side by side so the difference is the
+    assertion rather than a claim about it."""
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    cfg = _make_cfg(tmp_path)
+    _write_session(tmp_path, "p", "S-u-operator-p1", window="operator",
+                   roles=["operator", "user-conversation"])
+    assert D.live_operator_sids(cfg, "p") == []
+    assert D.operator_exclusivity_sids(cfg, "p") == ["S-u-operator-p1"]
+
+
+def test_exclusivity_excludes_the_requester_so_a_handover_is_never_refused(
+        tmp_path, monkeypatch):
+    """The requester-identity half. A session may always hand its OWN drive
+    over; without this the widening would refuse the handover for real, which
+    is the thing the narrowing was wrongly believed to prevent."""
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    cfg = _make_cfg(tmp_path)
+    _write_session(tmp_path, "p", "S-u-operator-p1", window="operator",
+                   roles=["operator", "user-conversation"])
+    assert D.operator_exclusivity_sids(
+        cfg, "p", exclude_sid="S-u-operator-p1") == []
+
+
+def test_exclusivity_is_a_union_where_routing_is_a_preference(
+        tmp_path, monkeypatch):
+    """A dedicated operator running BESIDE a talking one is exactly the state
+    exclusivity exists to catch, so it must see BOTH. Routing must still pick
+    one — reporting only the preferred sid would hide the violation behind the
+    answer."""
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    cfg = _make_cfg(tmp_path)
+    _write_session(tmp_path, "p", "S-u-operator-p2", window="operator")
+    _write_session(tmp_path, "p", "S-u-universal-p1",
+                   window="universal_bsq_session")
+    assert D.operator_exclusivity_sids(cfg, "p") == [
+        "S-u-operator-p2", "S-u-universal-p1"]
+    assert D.operator_role_holders(cfg, "p") == ["S-u-operator-p2"]
+
+
+def test_exclusivity_is_empty_on_a_board_with_only_a_dev(tmp_path, monkeypatch):
+    """NEGATIVE CONTROL: this is a widening to WHOEVER HOLDS THE ROLE, not a
+    widening to 'somebody'. A board with no operator-role holder still refuses
+    nothing."""
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    cfg = _make_cfg(tmp_path)
+    _write_session(tmp_path, "p", "S-u-dev_thing-p9", window="dev_thing")
+    assert D.operator_exclusivity_sids(cfg, "p") == []
+
+
+def test_exclusivity_still_sees_a_plain_dedicated_operator(tmp_path, monkeypatch):
+    """HEALTHY CONTROL: the ordinary single-role board is unchanged."""
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    cfg = _make_cfg(tmp_path)
+    _write_session(tmp_path, "p", "S-u-operator-p2", window="operator")
+    assert D.operator_exclusivity_sids(cfg, "p") == ["S-u-operator-p2"]
+
+
+def test_seat_claim_is_refused_beside_a_live_talking_operator(
+        tmp_path, monkeypatch):
+    """AT THE CALL SITE, not at the resolver: four live defects on this ticket
+    were invisible to a suite that only tested the model of the code.
+
+    The claimant must be the ROOT user-conversation session or `eligibility`
+    refuses it first and the test would pass for the wrong reason — the gate
+    under test would never be reached."""
+    from bot_squad_worker import operator_seat as SEAT
+    from bot_squad_worker.actions import ActionError
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    cfg = _make_cfg(tmp_path)
+    _write_session(tmp_path, "p", "S-u-operator-p1", window="operator",
+                   roles=["operator", "user-conversation"])
+    _write_session(tmp_path, "p", "S-u-gu_abc-user-conversation-p5",
+                   window="gu_abc-user-conversation")
+    with pytest.raises(ActionError) as exc:
+        SEAT.claim(cfg, "p", "S-u-gu_abc-user-conversation-p5")
+    msg = str(exc.value)
+    assert "S-u-operator-p1" in msg, msg
+    assert "already driving this board" in msg, msg
+
+
+def test_seat_claim_by_the_driver_itself_is_not_refused_by_its_own_drive(
+        tmp_path, monkeypatch):
+    """The requester-identity half AT THE CALL SITE, and it is reachable: the
+    root is the only session eligible for the seat, and a root that has
+    declared `roles: [operator, user-conversation]` is itself an operator-role
+    holder. Without the requester exclusion the widened gate would refuse it
+    BECAUSE OF ITSELF — a guard that a session can never satisfy."""
+    from bot_squad_worker import operator_seat as SEAT
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    cfg = _make_cfg(tmp_path)
+    sid = "S-u-gu_abc-user-conversation-p5"
+    _write_session(tmp_path, "p", sid, window="gu_abc-user-conversation",
+                   roles=["operator", "user-conversation"])
+    rec = SEAT.claim(cfg, "p", sid)
+    assert rec["ok"] is True
+    assert (rec["seat"] or {}).get("sid") == sid

@@ -24,8 +24,13 @@ every project and, for each:
 
 Design notes
 ------------
-* Continue-vs-respawn rides :func:`dispatch.live_operator_sids` — the SAME seam
-  the T-0472 one-operator spawn guard uses, so the tick can never double-drive.
+* Continue-vs-respawn rides :func:`dispatch.operator_role_holders` — WHOEVER
+  HOLDS the operator role, not only a session dedicated to it, so a solo or
+  talking operator counts as "already driving" and the tick never double-drives
+  behind one. (It said ``live_operator_sids`` until T-0943 rewired the code at
+  the gate and left this line behind. That stale sentence was read as the
+  condition and raised a false double-drive alarm — a docstring is what you
+  read TO decide what to trust, so it is the last place a lie is noticed.)
 * The respawn brief is :func:`dispatch.operator_standing_task` — the SSOT for
   the "clear the backlog" directive (shared with the spawn-time brief) — and
   since T-0783a it carries the CONCRETE pickup queue (:mod:`pickup`) so a fresh
@@ -48,7 +53,7 @@ from typing import Any, Optional
 log = logging.getLogger(__name__)
 
 # Per-project minimum gap between operator respawns, even when work is pending.
-# Belt-and-braces (with the live_operator_sids gate) against an overlapping tick
+# Belt-and-braces (with the operator_role_holders gate) against an overlapping tick
 # or a fast-exiting operator stampeding the spawn path. Override via env in tests.
 _SPAWN_COOLDOWN_SEC = int(os.environ.get("BOT_SQUAD_OPERATOR_REDRIVE_COOLDOWN", "90"))
 
@@ -487,7 +492,7 @@ def _respawn_operator(cfg: Any, slug: str) -> Optional[str]:
 
     Returns the new SID, or None when the spawn is *deferred* (capacity / quota
     backpressure — "stalls out of time") or fails. The continue-vs-respawn gate
-    (live_operator_sids) is applied by the caller, so this never double-drives.
+    (operator_role_holders) is applied by the caller, so this never double-drives.
     """
     from bot_squad_worker import sessions as S
     from bot_squad_worker import dispatch as _dispatch

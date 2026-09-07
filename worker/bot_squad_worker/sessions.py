@@ -2243,6 +2243,16 @@ def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None,
             meta["status"] = "active"
             meta.pop("paused_at", None)
             _write_session_metadata(meta_file, meta)
+            # T-1044: the adoption above is now durable — move the board label
+            # too (see `_stamp_task_in_progress`). This early return is the
+            # in-place unpause branch; the rotating branch stamps below.
+            if adopt_task_id:
+                try:
+                    _stamp_task_in_progress(
+                        data_dir / slug / "backlog", adopt_task_id)
+                except Exception:  # noqa: BLE001 — never fails a resume
+                    log.exception(
+                        "T-1044: in_progress stamp failed for %s", adopt_task_id)
             return {"ok": True, "sid": sid, "in_place": True}
         from bot_squad_worker.actions import ActionError
         raise ActionError(
@@ -2430,6 +2440,20 @@ def resume(cfg: Any, slug: str, sid: str, initial_prompt: str | None = None,
             except OSError:
                 pass
 
+    # T-1044: the THIRD pickup door, and the one `bsq spawn` uses by DEFAULT —
+    # T-0150 auto-resumes a high-confidence expert instead of spawning fresh,
+    # and T-0166 then ADOPTS the new ticket as that session's primary. That is
+    # a pickup by every definition (the session had no primary; now it holds
+    # this one) and it wrote no status either. Only the ADOPTED id is stamped,
+    # not every id in `rotated_task_ids` — the rest were already this session's
+    # work and their labels were settled when they were picked up.
+    if adopt_task_id:
+        try:
+            _stamp_task_in_progress(data_dir / slug / "backlog", adopt_task_id)
+        except Exception:  # noqa: BLE001 — a label write never fails a resume
+            log.exception(
+                "T-1044: in_progress stamp failed for %s", adopt_task_id)
+
     # T-0150: deliver the delta brief into the resumed composer, same proven
     # path spawn() uses (composer-ready poll, then bracketed paste-buffer + a
     # separate Enter). If the composer never shows ❯, raise so the caller can
@@ -2576,6 +2600,80 @@ def _write_task_initiative_if_absent(backlog_dir: Path, task_id: str, initiative
     tmp.write_text(content, encoding="utf-8")
     os.rename(tmp, path)
     return True
+
+
+#: T-1044: statuses a pickup must NOT stamp `in_progress` even though the state
+#: machine (``task_states.TRANSITIONS``) has the edge. `blocked_on_user` is a
+#: signal a dev deliberately raised and only the stakeholder's answer clears —
+#: a re-drive or a rebind of the SAME stuck ticket would otherwise silently
+#: erase the one field telling the operator why nothing is moving. Everything
+#: else with a legal edge to `in_progress` is stamped; the eligible set is
+#: DERIVED from the transition graph rather than hand-listed here, so a state
+#: added to that graph later is picked up without editing this module.
+PICKUP_STAMP_EXCLUDE: frozenset[str] = frozenset({"blocked_on_user"})
+
+
+def _stamp_task_in_progress(backlog_dir: Path, task_id: str) -> str | None:
+    """T-1044: move a ticket that was JUST PICKED UP to ``in_progress``.
+
+    THE DEFECT THIS CLOSES. Neither :func:`spawn` nor :func:`bind_task` wrote
+    the ticket's ``status`` — they bound a live session to it (session md
+    primary/extras, ``session_history``) and left the board label at whatever
+    it was, usually ``planned``. So a ticket was worked for whole sessions
+    while every FRONTMATTER-ONLY instrument read it as not-started. Measured
+    on the live board 2026-09-06/07: 4 of 7 live devs sat on ``planned``
+    tickets, and T-1038/T-0991 each ran a full lane at ``planned``. The cost
+    is not cosmetic — a liveness predicate keyed on the label (``task_alive``
+    vs ``PARKED_STATES``, where ``planned`` IS parked) would have exited the
+    working fleet, which is exactly what T-0948 had to work around by keying
+    liveness on the roster binding instead.
+
+    ELIGIBILITY is conditioned on the state machine, not on a copy of it:
+    a stamp happens iff ``task_states.is_valid_transition(cur, "in_progress")``
+    and ``cur`` is not in :data:`PICKUP_STAMP_EXCLUDE`. ``cur == "in_progress"``
+    is a no-op (the transition check calls it valid, but there is nothing to
+    write). ``to_accept``/``totest``/``closed`` have no edge to ``in_progress``
+    and are therefore never clobbered by a re-drive that lands on delivered
+    work.
+
+    CONCURRENCY. The write takes ``mdlock.task_lock`` — the same lock the API's
+    status writer and ``task_gc``'s auto-pause flock — and re-reads the status
+    INSIDE it, so a status a dev/API moved between our read and our write is
+    seen and honoured rather than clobbered. (This is stricter than the two
+    neighbouring stamps, :func:`_append_task_session_history` and
+    :func:`_write_task_initiative_if_absent`, which are lock-free tmp+rename:
+    those touch forensic fields nothing else contends for, a status is not.)
+
+    Returns the status written (``"in_progress"``), or ``None`` when nothing
+    was written — ticket missing, unparseable, already there, or not eligible.
+    Best-effort by contract: the binding is the source of truth and a failed
+    label write must never fail a spawn.
+    """
+    from bot_squad_worker import task_states as _task_states
+
+    matches = sorted(backlog_dir.glob(f"{task_id}-*.md"))
+    if not matches:
+        return None
+    path = matches[0]
+    try:
+        with _mdlock.task_lock(path):
+            parsed = _frontmatter.parse_or_none(path.read_text(encoding="utf-8"))
+            if parsed is None:
+                return None
+            meta, body = parsed
+            meta = dict(meta or {})
+            cur = str(meta.get("status") or "").strip().lower()
+            if cur == "in_progress" or cur in PICKUP_STAMP_EXCLUDE:
+                return None
+            if not _task_states.is_valid_transition(cur, "in_progress"):
+                return None
+            meta["status"] = "in_progress"
+            meta["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            _mdlock.atomic_write(path, _frontmatter.dump(meta, body))
+    except (OSError, ValueError):
+        log.exception("T-1044: failed to stamp %s in_progress", task_id)
+        return None
+    return "in_progress"
 
 
 # T-0126: composer-ready poll. The `❯` rune is rendered by Claude Code's
@@ -3378,14 +3476,27 @@ def spawn(
     # session_history list so the task carries forensics for *every*
     # session that worked on it, not just the current binding. Best-effort.
     if task_id:
+        _backlog_dir = cfg.data_dir / slug / "backlog"
         try:
             _append_task_session_history(
-                cfg.data_dir / slug / "backlog",
+                _backlog_dir,
                 task_id.strip(),
                 new_sid,
             )
         except OSError:
             pass
+        # T-1044: and MOVE THE BOARD LABEL. A task_id on a spawn is a real
+        # pickup — the operator spawn is refused outright if it carries one
+        # (see `_action_spawn_session`), so every task-bearing spawn that
+        # reaches here (`bsq spawn`, the API, recovery-respawn, autocompact's
+        # re-drive) has just put a live session on this ticket. Without this
+        # the ticket sat at `planned` for the whole lane. Best-effort by
+        # contract: the binding above is the source of truth and the label
+        # write must never fail a spawn that already opened a pane.
+        try:
+            _stamp_task_in_progress(_backlog_dir, task_id.strip())
+        except Exception:  # noqa: BLE001 — a label write never fails a spawn
+            log.exception("T-1044: in_progress stamp failed for %s", task_id)
 
     # Deliver the initial prompt once the composer is up.
     #
@@ -4565,6 +4676,17 @@ def bind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:
     except OSError:
         pass
 
+    # T-1044: the SECOND pickup door. A `[BIND_TASK from stakeholder]` (and the
+    # in-place primary repair above) puts a LIVE dev on this ticket just as a
+    # spawn does — the cap check a few lines up refuses the bind outright if a
+    # live session already holds it, so reaching here means this session is now
+    # the holder. Same best-effort contract as spawn: the session-md write is
+    # the source of truth, the board label must never fail the bind.
+    try:
+        _stamp_task_in_progress(backlog_dir, task_id)
+    except Exception:  # noqa: BLE001 — a label write never fails a bind
+        log.exception("T-1044: in_progress stamp failed for %s", task_id)
+
     # T-0038: if the dev's session carries an initiative, propagate it to
     # the newly-bound task md (existing-wins). Lets multi-binding keep the
     # task-to-initiative graph consistent without operator intervention.
@@ -4910,14 +5032,32 @@ def morph_session(cfg: Any, slug: str, sid: str, role: str, *,
     # Task / initiative metadata. The operator never holds a single ticket (its
     # standing task is "clear the backlog"), so clear any primary on that morph;
     # dev / teamlead adopt what the caller passed.
+    morphed_task_id: str | None = None
     if role in ("operator", "user-conversation"):
         meta["task_id"] = "~"
     elif task_id is not None:
         meta["task_id"] = task_id or "~"
+        # T-1044: the FOURTH pickup door, and the one this function's own
+        # docstring describes best — "it can take on a task and become dev".
+        # A morph that adopts a real primary puts a live session on that
+        # ticket exactly as a spawn does; the two role branches above that
+        # CLEAR the primary are not pickups and are deliberately excluded.
+        morphed_task_id = task_id or None
     if initiative is not None:
         meta["initiative"] = initiative or "~"
 
     _write_session_metadata(md_path, meta, atomic=True)
+
+    # T-1044: label the board only once the binding above is durable, and
+    # best-effort — a morph that succeeded must not be reported as failed
+    # because a ticket file could not be rewritten.
+    if morphed_task_id:
+        try:
+            _stamp_task_in_progress(
+                cfg.data_dir / slug / "backlog", morphed_task_id)
+        except Exception:  # noqa: BLE001 — a label write never fails a morph
+            log.exception(
+                "T-1044: in_progress stamp failed for %s", morphed_task_id)
 
     def _norm(v):
         return None if (v is None or v == "~") else v

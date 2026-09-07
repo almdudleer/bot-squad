@@ -620,6 +620,86 @@ def test_set_context_demotes_h2_so_the_working_area_survives_a_reparse():
     assert parse_body(out)["progress"].strip() == "- a"
 
 
+# --- T-1045: `set_context` must not silently drop a DoD or a stakeholder
+# quote an operator filed INSIDE `## Context` — the only section with a bulk
+# writer, which is why the real DoD lands there when `task_new` mints a
+# top-level `## DoD` that just says TBD. Run the HEALTHY case first (DoD
+# item 2): the guard must not make the verb unusable on an ordinary ticket.
+
+def test_set_context_healthy_case_with_no_dod_replaces_cleanly():
+    """No DoD/quote-shaped heading in the old Context → an ordinary replace
+    is untouched by the guard."""
+    body = "## Stakeholder notes\n\nv\n\n## Context\n\nold state\n"
+    out = set_context(body, "new state")
+    assert parse_body(out)["context"] == "new state"
+
+
+def test_set_context_refuses_when_context_has_dod_and_replacement_drops_it():
+    """The guard bites: a `### DoD` block inside Context is about to be
+    silently dropped by a replacement that carries no DoD at all."""
+    body = ("## Stakeholder notes\n\nv\n\n## Context\n\n"
+            "### DoD\n\n1. ship it\n2. test it\n")
+    with pytest.raises(ValueError, match="DoD"):
+        set_context(body, "fresh session state, no DoD mentioned")
+    # and the on-disk body must be provably untouched by a refused call
+    assert parse_body(body)["context"] == "### DoD\n\n1. ship it\n2. test it"
+
+
+def test_set_context_allows_when_replacement_carries_the_dod_forward():
+    """Carrying the DoD block forward into the replacement — the documented
+    workaround — must keep working; the guard is presence-based, not an
+    equality check against the old text."""
+    body = ("## Stakeholder notes\n\nv\n\n## Context\n\n"
+            "### DoD\n\n1. ship it\n")
+    out = set_context(body, "### DoD\n\n1. ship it\n\nsession notes here")
+    ctx = parse_body(out)["context"]
+    assert "### DoD" in ctx
+    assert "session notes here" in ctx
+
+
+def test_set_context_guard_ignores_a_dod_populated_normally_outside_context():
+    """POSITIVE CONTROL (T-1045 DoD item 3): a ticket whose `## DoD` is a
+    normal top-level section, never pasted into Context, must never trip the
+    guard — it fires on the healthy shape or it is worse than no guard."""
+    body = ("## Stakeholder notes\n\nv\n\n## DoD\n\n1. ship it\n\n"
+            "## Context\n\nordinary working notes, no DoD in sight\n")
+    out = set_context(body, "updated working notes")
+    assert parse_body(out)["context"] == "updated working notes"
+    # the real DoD, outside Context, is untouched — set_context never even
+    # sees it, since it only splices the Context span
+    assert "1. ship it" in out
+
+
+def test_set_context_refuses_when_context_has_a_stakeholder_quote_and_replacement_drops_it():
+    """The URGENT arm (DoD item 1b): a `### Verbatim request` /
+    `### Stakeholder notes` block inside Context is unrecoverable in
+    fidelity once dropped, so this must refuse just as hard as the DoD arm."""
+    body = ("## Stakeholder notes\n\nv\n\n## Context\n\n"
+            "### Verbatim request\n\n(filed via task_new)\n\n"
+            "### Stakeholder guidance\n\n- 2026-09-07 · his words here\n")
+    with pytest.raises(ValueError, match="stakeholder"):
+        set_context(body, "fresh session state, no quotes mentioned")
+
+
+def test_set_context_allows_when_replacement_carries_the_quote_forward():
+    body = ("## Stakeholder notes\n\nv\n\n## Context\n\n"
+            "### Stakeholder notes\n\nhis words\n")
+    out = set_context(body, "### Stakeholder notes\n\nhis words\n\nsession update")
+    ctx = parse_body(out)["context"]
+    assert "his words" in ctx
+    assert "session update" in ctx
+
+
+def test_set_context_guard_ignores_stakeholder_notes_outside_context():
+    """Same positive control as the DoD arm, for the quote arm: his words
+    living in the canonical `## Stakeholder notes` section (not pasted into
+    Context) must never trip this guard."""
+    body = "## Stakeholder notes\n\nhis original ask\n\n## Context\n\nplain notes\n"
+    out = set_context(body, "updated notes")
+    assert parse_body(out)["context"] == "updated notes"
+    assert "his original ask" in out
+
+
 # --- T-0863: `## Executive summary`, the one-paragraph status ---------------
 #
 # Every arm below states the PROPERTY it pins in words first, because the

@@ -344,6 +344,72 @@ def append_stakeholder_quote(body: str, ts: str, source: str, text: str) -> str:
     return body[:start] + block + sep + line + ("\n\n" + rest if rest else "\n")
 
 
+# T-1045: `task_new` mints a ticket with a top-level `## DoD` that reads
+# literally `TBD`, and `set_context` is the ONLY bulk writer on a ticket — so
+# operators file the REAL DoD, and sometimes his own quotes, as a sub-heading
+# INSIDE `## Context` instead, because that is the one section with a bulk
+# writer at all. A plain REPLACE then drops them silently: five instances in
+# one night (T-1038/1040/1041 twice/1042/1045), one of them made by a session
+# that had this exact hazard written down in its own memory and was reading
+# it that hour, on its FIRST write. A control a rule-holding, rule-reading
+# session defeats on contact is not a rule — hence a mechanical refusal here.
+#
+# Keyed on a HEADING, at any level 1-6: `set_context` itself demotes a `## `
+# heading pasted into Context down to `### ` (see `_H2_IN_SECTION_RE` above),
+# so content a PRIOR write already carried in is sitting below level 2 by the
+# time a later write has to decide whether it is still there. Matching only
+# `## ` would stop catching exactly the case this ticket is about.
+_CONTEXT_DOD_RE = re.compile(r"(?im)^#{1,6}\s*dod\b")
+_CONTEXT_STAKEHOLDER_RE = re.compile(
+    r"(?im)^#{1,6}\s*(verbatim request|stakeholder notes)\b")
+
+
+def _guard_context_replace(old_context: str, new_text: str) -> None:
+    """Refuse a `set_context` REPLACE that would silently drop a DoD or a
+    stakeholder quote filed INSIDE the `## Context` span it is about to
+    overwrite (T-1045).
+
+    Scoped to the CONTEXT SPAN ONLY, via the caller passing just that slice —
+    a ticket's `## DoD` populated normally, OUTSIDE Context, never reaches
+    this function at all, so a healthy ticket can never trip it (T-1045 DoD
+    item 3, the positive control).
+
+    The two arms refuse for different reasons, not the same one. A DoD
+    dropped from Context is recoverable byte-for-byte from `.versions/`
+    (T-0891's whole-file snapshot) — but this still refuses up front rather
+    than leaning on that recovery path, because the failure mode that made
+    this p1 is a session that does not NOTICE the drop, and a well-formed
+    ticket gives it nothing to notice. A stakeholder quote dropped from
+    Context is not recoverable in fidelity at all: the only writer that can
+    put his words back is `append_stakeholder_quote` (`bsq ticket quote`),
+    and it stamps NOW, so a "recovery" would manufacture a plausible,
+    wrongly-dated attribution — worse than the visible hole a refusal here
+    prevents.
+    """
+    if _CONTEXT_DOD_RE.search(old_context) and not _CONTEXT_DOD_RE.search(new_text):
+        raise ValueError(
+            "refusing to replace ## Context: the current Context contains a "
+            "DoD-shaped heading (e.g. '### DoD') and the replacement text "
+            "does not carry one. task_new mints tickets with a top-level "
+            "'## DoD' that just says TBD, so the REAL DoD often lives inside "
+            "Context instead — read the live Context, carry its DoD block "
+            "forward into your replacement, then write the whole thing back "
+            "(T-1045). If this Context genuinely has no DoD to lose, this "
+            "refusal is a false positive: report it."
+        )
+    if (_CONTEXT_STAKEHOLDER_RE.search(old_context)
+            and not _CONTEXT_STAKEHOLDER_RE.search(new_text)):
+        raise ValueError(
+            "refusing to replace ## Context: the current Context contains a "
+            "stakeholder-quote-shaped heading (e.g. '### Verbatim request' / "
+            "'### Stakeholder notes') and the replacement text does not "
+            "carry one. `bsq ticket quote` stamps NOW, so a quote dropped "
+            "from here cannot be restored at the right timestamp later — "
+            "carry that block forward into your replacement text instead "
+            "(T-1045)."
+        )
+
+
 def set_context(body: str, text: str) -> str:
     """Replace the `## Context` section wholesale (T-0767).
 
@@ -376,9 +442,16 @@ def set_context(body: str, text: str) -> str:
     `###` is not a boundary. The alternative — refusing text containing `## ` —
     is louder but makes the working area unable to hold the structure it exists
     to hold.
+
+    RAISES ``ValueError`` (T-1045) when the CURRENT Context holds a DoD- or
+    stakeholder-quote-shaped heading that the replacement text does not carry
+    forward — see `_guard_context_replace`. Checked before either the current
+    or the new text is touched, so a refusal never partially applies.
     """
     new = _H2_IN_SECTION_RE.sub("### ", (text or "").strip())
     span = _section_span(body or "", "context")
+    old = body[span[0]:span[1]] if span is not None else ""
+    _guard_context_replace(old, new)
     if span is None:
         block = f"## Context\n\n{new}\n" if new else ""
         if not block:

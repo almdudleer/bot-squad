@@ -283,6 +283,69 @@ def test_set_context_replaces_and_keeps_the_feed():
     assert "- a" in parse_body(out)["progress"]
 
 
+# --- T-1045: `set_context` must not silently drop a DoD or a stakeholder
+# quote filed INSIDE `## Context` (mirror of the api tests). HEALTHY case
+# first (DoD item 2): the guard must not make the verb unusable normally.
+
+def test_set_context_healthy_case_with_no_dod_replaces_cleanly():
+    body = "## Stakeholder notes\n\nv\n\n## Context\n\nold state\n"
+    out = set_context(body, "new state")
+    assert parse_body(out)["context"] == "new state"
+
+
+def test_set_context_refuses_when_context_has_dod_and_replacement_drops_it():
+    body = ("## Stakeholder notes\n\nv\n\n## Context\n\n"
+            "### DoD\n\n1. ship it\n2. test it\n")
+    with pytest.raises(ValueError, match="DoD"):
+        set_context(body, "fresh session state, no DoD mentioned")
+    assert parse_body(body)["context"] == "### DoD\n\n1. ship it\n2. test it"
+
+
+def test_set_context_allows_when_replacement_carries_the_dod_forward():
+    body = ("## Stakeholder notes\n\nv\n\n## Context\n\n"
+            "### DoD\n\n1. ship it\n")
+    out = set_context(body, "### DoD\n\n1. ship it\n\nsession notes here")
+    ctx = parse_body(out)["context"]
+    assert "### DoD" in ctx
+    assert "session notes here" in ctx
+
+
+def test_set_context_guard_ignores_a_dod_populated_normally_outside_context():
+    """POSITIVE CONTROL (T-1045 DoD item 3): a normal top-level `## DoD`,
+    never pasted into Context, must never trip the guard."""
+    body = ("## Stakeholder notes\n\nv\n\n## DoD\n\n1. ship it\n\n"
+            "## Context\n\nordinary working notes, no DoD in sight\n")
+    out = set_context(body, "updated working notes")
+    assert parse_body(out)["context"] == "updated working notes"
+    assert "1. ship it" in out
+
+
+def test_set_context_refuses_when_context_has_a_stakeholder_quote_and_replacement_drops_it():
+    """The URGENT arm (DoD item 1b): a dropped quote is not recoverable in
+    fidelity, so this refuses just as hard as the DoD arm."""
+    body = ("## Stakeholder notes\n\nv\n\n## Context\n\n"
+            "### Verbatim request\n\n(filed via task_new)\n\n"
+            "### Stakeholder guidance\n\n- 2026-09-07 · his words here\n")
+    with pytest.raises(ValueError, match="stakeholder"):
+        set_context(body, "fresh session state, no quotes mentioned")
+
+
+def test_set_context_allows_when_replacement_carries_the_quote_forward():
+    body = ("## Stakeholder notes\n\nv\n\n## Context\n\n"
+            "### Stakeholder notes\n\nhis words\n")
+    out = set_context(body, "### Stakeholder notes\n\nhis words\n\nsession update")
+    ctx = parse_body(out)["context"]
+    assert "his words" in ctx
+    assert "session update" in ctx
+
+
+def test_set_context_guard_ignores_stakeholder_notes_outside_context():
+    body = "## Stakeholder notes\n\nhis original ask\n\n## Context\n\nplain notes\n"
+    out = set_context(body, "updated notes")
+    assert parse_body(out)["context"] == "updated notes"
+    assert "his original ask" in out
+
+
 # --- T-0863: `## Executive summary`, the one-paragraph status ---------------
 #
 # Every arm below states the PROPERTY it pins in words first, because the

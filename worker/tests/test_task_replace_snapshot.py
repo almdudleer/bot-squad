@@ -115,3 +115,44 @@ def test_the_versions_dir_is_not_mistaken_for_a_ticket(board):
     A._action_task_context_set({"slug": "demo", "task_id": "T-0655", "text": "x"})
     assert [p.name for p in sorted(board.parent.glob("*.md"))] == [board.name]
     assert [p.name for p in sorted(board.parent.glob("T-*.md"))] == [board.name]
+
+
+# --- T-1045: the guard travels all the way through the worker action, not
+# just through `set_context` in isolation — `_rewrite_task_body` must turn
+# the ValueError into an ActionError BEFORE the snapshot/write happens, so a
+# refused write leaves neither a mutated ticket nor a spurious `.versions/`
+# entry behind.
+
+def test_context_set_action_refuses_a_dod_drop_and_leaves_no_trace(board):
+    board.write_text(
+        "---\nid: T-0655\ntitle: keep-alive nudge\nstatus: closed\n"
+        "updated: 2026-07-21T00:00:00Z\n---\n\n"
+        "## Verbatim request\n\nhis words, verbatim\n\n"
+        "## DoD\n\nTBD\n\n"
+        "## Context\n\n### DoD\n\n1. ship it\n"
+    )
+    original = board.read_bytes()
+
+    with pytest.raises(A.ActionError, match="DoD"):
+        A._action_task_context_set(
+            {"slug": "demo", "task_id": "T-0655", "text": "fresh state, no DoD"})
+
+    assert board.read_bytes() == original
+    assert _versions(board) == []  # refused before the snapshot was ever taken
+
+
+def test_context_set_action_refuses_a_stakeholder_quote_drop(board):
+    board.write_text(
+        "---\nid: T-0655\ntitle: keep-alive nudge\nstatus: closed\n"
+        "updated: 2026-07-21T00:00:00Z\n---\n\n"
+        "## Verbatim request\n\n(filed via task_new)\n\n"
+        "## Context\n\n### Stakeholder notes\n\nhis words, verbatim\n"
+    )
+    original = board.read_bytes()
+
+    with pytest.raises(A.ActionError, match="stakeholder"):
+        A._action_task_context_set(
+            {"slug": "demo", "task_id": "T-0655", "text": "fresh state, no quote"})
+
+    assert board.read_bytes() == original
+    assert _versions(board) == []

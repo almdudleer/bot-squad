@@ -5625,6 +5625,36 @@ def _drift_message(st: dict, *, just_committed: bool = True) -> str | None:
     """Render `_drift_state` into the advisory, or None when there is nothing
     to say. Split from the measurement so the wording is testable without git.
 
+    T-1042: the remedy this used to print unconditionally — `git merge
+    origin/<branch>`, run by whoever read it — is exactly the action that
+    produces the divergence it warns about, AND it used to fire on every
+    single commit from every lane (measured 2026-09-07: six lanes, thirteen
+    commits, one advisory each). Both bugs have the same root cause: firing on
+    `unshipped` alone, with no regard to `behind`. In this shared tree a dev's
+    own just-made commit is ALWAYS "unshipped" until the TL's next push — that
+    is the normal steady state of the workflow, not drift — and reconciling it
+    is always a plain fast-forward (`behind == 0`: origin is a strict ancestor
+    of HEAD), which can never create a merge commit and so can never duplicate
+    anything. A real merge commit — the only place duplication can happen —
+    only gets created when the clone is BOTH ahead and behind. So: quiet
+    whenever `behind == 0`, no matter how much local work is unpushed.
+
+    Past that, `unshipped` (content-based: a replayed twin under a different
+    SHA does NOT count, see `_drift_state`) decides whether reconciling is
+    safe. Reproduced on a scratch clone (T-1042): a clone ahead=1/behind=1
+    where the ahead commit's content has NO origin equivalent — a real
+    two-sided add, not a replay — and running the OLD remedy verbatim,
+    `git merge origin/<branch>`, exits 0, prints "Auto-merging", raises no
+    conflict, and silently duplicates the added line. That is the same shape
+    as the real `deploy.py` incident under T-0959 (twin field block, kept on
+    both sides). So `behind > 0 and unshipped` is never told to self-remediate
+    — it is escalated. `behind > 0` with `unshipped == 0` (every ahead
+    commit's content already has an origin equivalent, or there is no ahead at
+    all) has nothing to lose in a merge and keeps the fast-forward/merge
+    remedy — `--ff-only` when there is nothing local at all, so the command
+    itself refuses instead of guessing if that assumption stops being true by
+    the time a human runs it.
+
     `just_committed` is the difference between the two callers, and it is not
     cosmetic: the post-commit path can say "the commit you just made", while
     `bsq clone-drift` is asked by a session that is READING the tree and has
@@ -5638,13 +5668,17 @@ def _drift_message(st: dict, *, just_committed: bool = True) -> str | None:
             "the commit you just made will ship — the deploy builds from origin/<branch>,\n"
             "not from here. Re-run `git fetch origin` before you report READY.\n"
         )
-    behind, unshipped = st.get("behind", 0), st.get("unshipped")
+    ahead, behind, unshipped = st.get("ahead", 0), st.get("behind", 0), st.get("unshipped")
     # `unshipped is None` means `git cherry` did not answer. That is NOT zero:
     # `not None` is true, so folding it into the quiet path would turn a failed
     # measurement into "nothing to say" — a guard passing because its instrument
     # broke, which is the whole failure this ticket is about.
     content_unknown = unshipped is None
-    if behind <= _DRIFT_BEHIND_LIMIT and not unshipped and not content_unknown:
+    # T-1042: `behind == 0` means origin is a strict ancestor of HEAD — a push
+    # (or a fast-forward, for anyone else catching up to this clone) ships
+    # every byte here unconditionally, whatever `unshipped`/`cherry` says.
+    # Nothing to reconcile, ever, so nothing to warn about.
+    if behind == 0:
         return None
     lines = ["\n*** CLONE DRIFT (T-0959) ***"]
     if content_unknown:
@@ -5669,12 +5703,36 @@ def _drift_message(st: dict, *, just_committed: bool = True) -> str | None:
             + f" A deploy ships origin/{st['branch']}; those commits are not on the "
               f"install\nand nothing will put them there on its own."
         )
-    lines.append(
-        "Reconcile before you report READY: `git merge origin/" + st["branch"] + "` here, "
-        "then have\nyour TL push. Do NOT cherry-pick onto a branch cut from origin and push "
-        "that — that is\nexactly what diverged this clone by 75 commits over nineteen days "
-        "while every\nindividual release looked green.\n"
-    )
+    if len(lines) == 1:
+        # behind > 0 but <= the limit, content known, nothing unshipped: routine
+        # peer traffic, resolved by the next push/fast-forward. Not worth a line.
+        return None
+    if unshipped or content_unknown:
+        lines.append(
+            f"A `git merge origin/{st['branch']}` here would create a real merge commit "
+            "(this clone is\nboth ahead and behind), and when either side carries a "
+            "replayed/twin commit — same\ncontent, different SHA — that merge can "
+            "duplicate it SILENTLY: no conflict, exit 0,\nnothing refuses (reproduced on "
+            "a scratch clone, T-1042).\nDo NOT cherry-pick onto a branch cut from origin "
+            "and push that — that is exactly what\ncreates those twins (T-0959: 75 "
+            "commits over nineteen days).\n"
+            "Do NOT run that merge yourself. Tell your TL and let them reconcile — this "
+            "is a\nhuman decision, not a default action."
+        )
+    elif ahead == 0:
+        lines.append(
+            "No local-only commits here, so this is a plain fast-forward: "
+            f"`git merge --ff-only\norigin/{st['branch']}` (or ask your TL to sync this "
+            "clone) — it refuses instead of merging\nif that stops being true by the "
+            "time you run it."
+        )
+    else:
+        lines.append(
+            f"Your local-only commit(s) already have content equivalents on origin "
+            f"(replayed under\nother SHAs), so `git merge origin/{st['branch']}` "
+            "reconciles this cleanly. Re-run\n`bsq clone-drift` afterward to confirm "
+            "`unshipped` is still 0 before you report READY."
+        )
     return "\n".join(lines)
 
 
@@ -7140,7 +7198,14 @@ def cmd_drift(args) -> None:
     if msg:
         print(msg, file=sys.stderr)
         sys.exit(1)
-    print("\nThis tree matches what a deploy ships. A grep of it can be trusted.")
+    if st["ahead"]:
+        print(
+            "\nNo missing content: a grep here will not produce a false negative for "
+            "what deploy\nships. This tree also has local-only work origin does not "
+            "have yet — normal until\nyour TL's next push, not a problem."
+        )
+    else:
+        print("\nThis tree matches what a deploy ships. A grep of it can be trusted.")
 
 
 def cmd_commit(args) -> None:

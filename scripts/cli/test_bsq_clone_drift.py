@@ -111,6 +111,48 @@ def test_a_real_drift_is_named_with_its_size(world):
     assert f"{bsq._DRIFT_BEHIND_LIMIT + 3} commit(s) BEHIND" in msg
 
 
+def test_pure_behind_with_no_local_work_gets_the_ff_only_remedy(world):
+    """T-1042: `ahead == 0` means there is nothing local to lose, so the
+    remedy is a fast-forward that REFUSES instead of merging if that stops
+    being true by the time a human runs it — the self-checking property `git
+    merge` alone does not have."""
+    _advance_origin(world, n=bsq._DRIFT_BEHIND_LIMIT + 3)
+    st = bsq._drift_state(str(world["clone"]))
+    assert st["ahead"] == 0
+    msg = bsq._drift_message(st)
+    assert "git merge --ff-only" in msg
+    assert "Do NOT run that merge yourself" not in msg  # nothing to escalate
+
+
+def test_behind_with_only_already_replayed_local_work_gets_the_safe_merge_remedy(world):
+    """T-1042: `unshipped == 0` while `behind > 0` means every local-only
+    commit's CONTENT already exists on origin (a twin under another SHA) — a
+    real merge is still needed (this is not a fast-forward), but there is
+    nothing local for it to lose, so it keeps the merge remedy rather than
+    escalating."""
+    local = _commit(world["clone"], "feature.txt", "the work")
+    other = world["tmp"] / "replayer2"
+    _git(world["tmp"], "clone", "-q", str(world["origin"]), str(other))
+    _git(other, "config", "user.email", "t@t")
+    _git(other, "config", "user.name", "t")
+    _git(other, "checkout", "-q", "work")
+    _git(other, "fetch", "-q", str(world["clone"]), "work")
+    _git(other, "cherry-pick", "-x", local)
+    for i in range(bsq._DRIFT_BEHIND_LIMIT + 2):
+        _commit(other, f"filler-{i}.txt")
+    _git(other, "push", "-q", "origin", "work")
+
+    st = bsq._drift_state(str(world["clone"]))
+    assert st["ahead"] == 1
+    assert st["behind"] == bsq._DRIFT_BEHIND_LIMIT + 3
+    assert st["unshipped"] == 0
+    msg = bsq._drift_message(st)
+    assert msg is not None
+    assert f"git merge origin/{st['branch']}` reconciles this cleanly" in msg
+    assert "Do NOT run that merge yourself" not in msg
+    assert "--ff-only" not in msg
+
+
 def test_a_stale_remote_ref_does_not_satisfy_it(world):
     """THE load-bearing test. origin moves; the clone's cached `origin/work`
     still points at the old tip. A check that reads the cache reports a clone
@@ -183,22 +225,109 @@ def test_a_sha_replayed_upstream_is_not_counted_as_unshipped(world):
     assert bsq._drift_message(st) is None
 
 
-def test_content_that_is_nowhere_upstream_is_reported_even_below_the_limit(world):
-    """The behind-count is about a stale base; the unshipped-count is about
-    work that will not reach the install. The second fires at ONE, because one
-    is already the whole failure."""
+def test_a_stranded_commit_alone_is_not_reported_while_behind_is_zero(world):
+    """T-1042: `behind == 0` means origin is a strict ancestor of HEAD — a
+    push ships this commit unconditionally, whatever `unshipped` says. This is
+    the shared tree's NORMAL steady state between TL pushes (every commit from
+    every lane sits exactly like this until the next push), not drift — firing
+    here is what made the advisory indistinguishable from "always on"."""
     _commit(world["clone"], "stranded.txt", "never pushed")
     st = bsq._drift_state(str(world["clone"]))
     assert (st["behind"], st["unshipped"]) == (0, 1)
+    assert bsq._drift_message(st) is None
+
+
+def test_content_that_is_nowhere_upstream_is_reported_once_behind_too(world):
+    """The behind-count is about a stale base; the unshipped-count is about
+    work that will not reach the install by a plain push. Reported ONLY once
+    origin has ALSO moved — a real two-sided divergence — because that is the
+    only situation reconciling needs an actual merge commit at all (T-1042)."""
+    _commit(world["clone"], "stranded.txt", "never pushed")
+    _advance_origin(world, n=1)
+    st = bsq._drift_state(str(world["clone"]))
+    assert (st["behind"], st["unshipped"]) == (1, 1)
     msg = bsq._drift_message(st)
     assert "1 commit(s) here have NO equivalent on origin" in msg
 
 
 def test_the_advisory_names_the_practice_that_caused_the_divergence(world):
     _commit(world["clone"], "stranded.txt", "never pushed")
+    _advance_origin(world, n=1)
     msg = bsq._drift_message(bsq._drift_state(str(world["clone"])))
     assert "Do NOT cherry-pick onto a branch cut from origin" in msg
     assert "merge origin/work" in msg
+    # T-1042: naming the remedy is no longer the same as recommending it.
+    assert "Do NOT run that merge yourself" in msg
+
+
+# ---------------------------------------------------------------------------
+# T-1042 positive control: the OLD remedy really does duplicate content
+# ---------------------------------------------------------------------------
+def test_the_old_remedy_really_does_silently_duplicate_content(tmp_path):
+    """Not a claim about git in the abstract — the exact scenario `_drift_state`
+    flags as `unshipped`, reproduced end to end. One base file; the clone adds a
+    line inside `build()`; a release branch cut fresh from the SAME base (the
+    T-0959-documented cherry-pick-onto-a-fresh-branch practice) independently
+    adds the byte-identical line inside `Deploy`, at a different anchor, and is
+    pushed to origin. The clone is now ahead=1/behind=1 with unshipped=1 —
+    exactly the state this ticket's redesigned advisory now escalates instead
+    of handing back `git merge origin/<branch>`.
+
+    Run that OLD remedy verbatim: it exits 0, prints "Auto-merging", raises no
+    conflict — and the added line is in the file TWICE. That is the proof this
+    ticket's DoD asked for: the action the advisory used to hand out, followed
+    exactly as printed, ends the reader in a WORSE state than before."""
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init", "-q", "-b", "work")
+    _git(seed, "config", "user.email", "t@t")
+    _git(seed, "config", "user.name", "t")
+    (seed / "deploy.py").write_text("def build():\n    do_a()\n\n\nclass Deploy:\n    stage = \"build\"\n")
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-q", "-m", "base")
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "clone", "-q", "--bare", str(seed), str(origin))
+
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", "-q", str(origin), str(clone))
+    _git(clone, "config", "user.email", "t@t")
+    _git(clone, "config", "user.name", "t")
+    _git(clone, "checkout", "-q", "work")
+    (clone / "deploy.py").write_text(
+        "def build():\n    do_a()\n    sha = fetch_sha()\n\n\nclass Deploy:\n    stage = \"build\"\n"
+    )
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-q", "-m", "T-0919: capture sha in build()")
+
+    replayer = tmp_path / "replayer"
+    _git(tmp_path, "clone", "-q", str(origin), str(replayer))
+    _git(replayer, "config", "user.email", "t@t")
+    _git(replayer, "config", "user.name", "t")
+    _git(replayer, "checkout", "-q", "work")
+    (replayer / "deploy.py").write_text(
+        "def build():\n    do_a()\n\n\nclass Deploy:\n    stage = \"build\"\n    sha = fetch_sha()\n"
+    )
+    _git(replayer, "add", "-A")
+    _git(replayer, "commit", "-q", "-m", "T-0919: capture sha (replayed on release branch)")
+    _git(replayer, "push", "-q", "origin", "work")
+
+    st = bsq._drift_state(str(clone))
+    assert (st["ahead"], st["behind"], st["unshipped"]) == (1, 1, 1), (
+        "fixture is broken — expected exactly the state the advisory escalates"
+    )
+    msg = bsq._drift_message(st)
+    assert "Do NOT run that merge yourself" in msg
+
+    merge = _git(clone, "merge", "origin/work", "-m", "merge origin/work", check=False)
+    assert merge.returncode == 0, "the OLD remedy must exit 0 for this to be SILENT"
+    assert (clone / "deploy.py.orig").exists() is False  # no conflict artifacts
+    status = _git(clone, "status", "--short").stdout
+    assert status == "", f"a conflict would have refused the merge; got: {status!r}"
+
+    content = (clone / "deploy.py").read_text()
+    assert content.count("fetch_sha()") == 2, (
+        "expected the OLD remedy to duplicate the line silently; got:\n" + content
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -305,14 +434,19 @@ def test_the_verb_asks_for_the_reader_wording():
     assert "_drift_message(st, just_committed=False)" in body
 
 
-def test_a_failed_content_check_is_UNKNOWN_not_zero():
+def test_a_failed_content_check_is_UNKNOWN_not_zero_while_actually_behind():
     """`git cherry` can fail on its own while the behind-count succeeds. The
     naive quiet path is `if behind <= LIMIT and not unshipped: return None`, and
     `not None` is TRUE — so a broken content check would have produced silence
     that reads exactly like "this clone ships everything". That is the failure
-    this whole ticket is about, reproduced inside its own guard."""
+    this whole ticket is about, reproduced inside its own guard.
+
+    T-1042: gated on `behind > 0` — with `behind == 0` a plain push ships
+    everything regardless of what `cherry` says, so there is nothing for a
+    broken content check to hide in that state (see the `behind == 0` sibling
+    test below)."""
     st = {"status": "ok", "branch": "work", "upstream": "origin/work",
-          "ahead": 3, "behind": 0, "unshipped": None}
+          "ahead": 3, "behind": 1, "unshipped": None}
     msg = bsq._drift_message(st)
     assert msg is not None, "a failed content check must never be silent"
     assert "UNKNOWN — not zero" in msg
@@ -323,10 +457,22 @@ def test_a_failed_content_check_is_UNKNOWN_not_zero():
     assert bsq._drift_message(st_zero) is None
 
 
+def test_a_failed_content_check_is_moot_when_behind_is_zero():
+    """T-1042: `behind == 0` means a plain push ships every byte here
+    regardless of `cherry`'s answer — a broken content check has nothing to
+    hide when there is nothing that could be lost."""
+    st = {"status": "ok", "branch": "work", "upstream": "origin/work",
+          "ahead": 3, "behind": 0, "unshipped": None}
+    assert bsq._drift_message(st) is None
+
+
 def test_the_content_check_really_can_return_None(world, monkeypatch):
     """The line above is only worth pinning if `_drift_state` can actually
     produce it — a test over a hand-built dict alone would be a claim about my
-    own model, not about the code."""
+    own model, not about the code. Advances origin first (T-1042: with
+    `behind == 0` a broken content check is moot, see the sibling test) so this
+    exercises the branch where a broken `cherry` actually matters."""
+    _advance_origin(world, n=1)
     real = bsq.subprocess.run
 
     def fake(args, **kw):
@@ -339,5 +485,6 @@ def test_the_content_check_really_can_return_None(world, monkeypatch):
     monkeypatch.setattr(bsq.subprocess, "run", fake)
     st = bsq._drift_state(str(world["clone"]))
     assert st["status"] == "ok"
+    assert st["behind"] == 1
     assert st["unshipped"] is None
     assert "UNKNOWN — not zero" in bsq._drift_message(st)

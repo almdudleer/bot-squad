@@ -615,7 +615,8 @@ def test_timeout_is_reported_as_not_measured(tmp_path):
     assert "MUST NOT RUN" not in out.stdout
     # A refusal names the holder, so the waiter can decide rather than guess.
     assert "build in progress" in out.stderr
-    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+    # Kill the WORK's group, not the wrapper's — see _wait_for_adopted_pgid.
+    os.killpg(_wait_for_adopted_pgid(state, p.pid, slots=1), signal.SIGKILL)
 
 
 def test_slots_config_file_is_read_without_a_restart(tmp_path):

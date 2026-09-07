@@ -252,7 +252,15 @@ def test_every_declared_arm_exists_where_the_map_says_it_does():
     every surface unfiltered — and proves each arm named in ARMS is a real job
     there whose `run:` block still names the tree it claims to cover.
     """
-    yaml = pytest.importorskip("yaml")
+    # A HARD import, never `pytest.importorskip`. `pyyaml>=6` is a declared
+    # dependency of the worker package (worker/pyproject.toml), so this import
+    # cannot legitimately fail in any arm that runs worker/tests — which means
+    # an importorskip here could only ever SKIP this file's strongest
+    # assertion silently. That is T-1036's defect verbatim (a guard that reads
+    # as a harmless `+1 skipped` while pinning nothing), and it would be a
+    # poor joke to reproduce it inside the census written to detect it.
+    import yaml
+
     wf = REPO / ".github" / "workflows" / "nightly-suites.yml"
     assert wf.is_file(), f"{wf} is missing — every arm claim below is unbacked"
     jobs = yaml.safe_load(wf.read_text(encoding="utf-8"))["jobs"]

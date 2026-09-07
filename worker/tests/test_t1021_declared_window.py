@@ -83,9 +83,18 @@ pytestmark = pytest.mark.skipif(
 def _env(state: Path) -> dict:
     env = dict(os.environ)
     env["BOT_SQUAD_FLEET_SLOTS_DIR"] = str(state)
-    # This box runs at D-state 8-80 with several lanes live. A test whose
-    # verdict depends on the host's D-state that second measures the host.
+    # This box runs at D-state 8-80 with several lanes live, and this file's
+    # own tests + T-1031's calibration runs both push real r_state/psi_mem
+    # readings across their default ceilings under nothing worse than normal
+    # concurrent-suite load (T-1048: the owner's OWN `run --under` its own
+    # declared window still passes through admission_check first, so an
+    # armed host-health gate can refuse it same as any other run). A test
+    # whose verdict depends on the host's ambient D-state/R-state/memory-stall
+    # that second measures the host, not the declared-window mechanism this
+    # file exists to test — that coverage lives in test_t1031_memory_admission.py.
     env["BOT_SQUAD_FLEET_DSTATE_MAX"] = ""
+    env["BOT_SQUAD_FLEET_RSTATE_MAX"] = ""
+    env["BOT_SQUAD_FLEET_PSI_MEM_MAX"] = ""
     # Never contend for the REAL fleet's stopgap semaphore from a test.
     env["BOT_SQUAD_FLEET_LEGACY_SLOT_DIR"] = ""
     env.pop("BOT_SQUAD_FLEET_SLOTS", None)

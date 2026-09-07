@@ -255,7 +255,29 @@ the board yourself.
 
 See the `bot-squad-session-lifecycle-roles` skill, cross-cutting principle 4 — "the concept" is recorded; look it up, never treat it as unknown.
 
-## Task hygiene
+## Release tickets: one ticket per release (T-1034)
+
+**Once a release ticket reaches `to_accept`, `totest` or `closed`, a further
+push gets its OWN new ticket id, with `provenance:` pointing back at it —
+never reuse the resting ticket's own Progress/Context as the log for a second
+release.** T-1009 shipped this way twice (release 1 accepted it into
+`totest`; release 2 then narrated a second, different commit range onto that
+same ticket) and hit a real wall: `bsq ticket update <id> to_accept` from
+`totest` is refused, because the transition graph has no edge back — and it
+should not gain one. `to_accept` answers one question, "has the operator
+accepted this delivery for human review", and that question is already
+answered the first time a ticket reaches `totest`; there is nothing left for
+a second visit to gate. `reopened` already covers "the human found a problem,
+run it through again" — a further release shipping MORE while the ticket
+merely waited is the opposite case, and forcing it through either edge would
+either lie (reopened: nothing came back) or let work cycle out of `totest`
+for a reason the stakeholder never decided (it is his gate, T-0944: «to test
+это для меня уже, человека»).
+
+**File the next release as its own ticket instead** — exactly what happened
+one release later: T-1035 (release 3) took a further commit range under
+`provenance: T-1009` and reached `totest` with zero state-machine friction.
+That is the pattern to repeat, not the exception.
 
 - When you create a new task (e.g. handling a DEV SPAWN REQUEST without
   a bound task), put the stakeholder's exact words in the `## Stakeholder

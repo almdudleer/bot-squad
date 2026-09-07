@@ -827,3 +827,202 @@ def test_the_user_conversation_contract_no_longer_offloads_unconditionally():
     i = text.index("NOT execute or orchestrate the work itself")
     clause = text[i:i + 400]
     assert "when there is somebody to offload it to" in clause
+
+
+# ---------------------------------------------------------------------------
+# THE REOPEN (2026-09-07): a right label that changed nothing
+# ---------------------------------------------------------------------------
+#
+# A user-conversation session did operator work for three hours; when an
+# operator finally appeared the two ran side by side with the mail going to the
+# wrong one. `bsq role set operator,user-conversation` then printed
+# `talking-operator` — and changed NOTHING, because every consumer resolved the
+# old way. `live_user_conversation_sids`, which `ensure_user_conversation` uses
+# to find a live attendant, filtered on `_role_of` — the SINGLE-VALUED resolver,
+# `role:` plus the window — and never read `roles:` at all.
+#
+# That is a worse shape than a wrong label: the label is RIGHT and nothing
+# downstream observes it. A watchrobot operator nearly shut its live attendant
+# down on the strength of that printed label, and stopped only because it read
+# the code first.
+
+def _live(monkeypatch, *sids):
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set(sids))
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+
+
+def test_a_declared_talking_operator_IS_a_live_attendant(tmp_path, monkeypatch):
+    """THE ACCEPTANCE CONDITION for the reopen's fourth gap. Red before the fix:
+    the declaration existed and this function could not see it."""
+    cfg = _make_cfg(tmp_path)
+    sid = "S-u-operator-p640"
+    _write_session(tmp_path, "p", sid, window="operator",
+                   roles=["operator", "user-conversation"])
+    _live(monkeypatch, sid)
+
+    rows = S.live_user_conversation_sids(cfg, "p")
+
+    assert [r["sid"] for r in rows] == [sid], (
+        "a session that DECLARED user-conversation is an attendant; "
+        "ensure_user_conversation must find it instead of spawning a duplicate")
+
+
+def test_the_healthy_attendant_is_unchanged(tmp_path, monkeypatch):
+    """HEALTHY CONTROL FIRST, and it differs along exactly the tested axis: an
+    ordinary attendant, no declaration, found the way it always was."""
+    cfg = _make_cfg(tmp_path)
+    sid = "S-u-universal_bsq_session-p1"
+    _write_session(tmp_path, "p", sid, window="universal_bsq_session")
+    _live(monkeypatch, sid)
+    assert [r["sid"] for r in S.live_user_conversation_sids(cfg, "p")] == [sid]
+
+
+def test_a_plain_operator_is_still_NOT_an_attendant(tmp_path, monkeypatch):
+    """The negative the widening must not swallow. A pure operator holds no
+    user-conversation role and must stay invisible here, or every operator
+    becomes an attendant and the dup-spawn guard inverts."""
+    cfg = _make_cfg(tmp_path)
+    sid = "S-u-operator-p2"
+    _write_session(tmp_path, "p", sid, window="operator")
+    _live(monkeypatch, sid)
+    assert S.live_user_conversation_sids(cfg, "p") == []
+
+
+def test_a_tombstoned_session_is_not_an_attendant(tmp_path, monkeypatch):
+    """`roles: []` means it holds nothing, including this."""
+    cfg = _make_cfg(tmp_path)
+    sid = "S-u-universal_bsq_session-p1"
+    _write_session(tmp_path, "p", sid, window="universal_bsq_session", roles=[])
+    _live(monkeypatch, sid)
+    assert S.live_user_conversation_sids(cfg, "p") == []
+
+
+def test_a_declared_holder_answers_the_gid_keyed_lookup_too(tmp_path, monkeypatch):
+    """`ensure_user_conversation` asks the (slug, gid) question, not the roster
+    one. A declared holder with no gid stamped was invisible to it as well."""
+    cfg = _make_cfg(tmp_path)
+    sid = "S-u-operator-p640"
+    _write_session(tmp_path, "p", sid, window="operator",
+                   roles=["operator", "user-conversation"])
+    _live(monkeypatch, sid)
+    assert S.live_user_conversation_sid(cfg, "p", "gu_abc") == sid
+
+
+def test_binding_a_ticket_to_a_solo_session_is_allowed(tmp_path, monkeypatch):
+    """`bsq bud absorb` — a solo session holds `dev` and must be able to take a
+    ticket. The guard asked `_role_of(...) != "dev"`, which a solo session
+    always fails."""
+    assert "dev" in S.roles_of({"window": S.UNIVERSAL_WINDOW})
+
+
+# --- role_holders: routing by role, for every role in the model -------------
+
+def test_role_holders_finds_every_declared_role(tmp_path, monkeypatch):
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    _write_session(tmp_path, "p", "S-u-operator-p640", window="operator",
+                   roles=["operator", "user-conversation"])
+    _write_session(tmp_path, "p", "S-u-dev_x-p9", window="dev_x")
+    assert S.role_holders(cfg, "p", "user-conversation") == ["S-u-operator-p640"]
+    assert S.role_holders(cfg, "p", "operator") == ["S-u-operator-p640"]
+    assert S.role_holders(cfg, "p", "dev") == ["S-u-dev_x-p9"]
+    assert S.role_holders(cfg, "p", "qa") == []
+
+
+def test_user_conversation_is_addressable_on_the_bus(tmp_path, monkeypatch):
+    """GAP 1, measured by the operator as a refusal: the one role whose entire
+    purpose is being a human's address could not be addressed by role."""
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    sid = "S-u-universal_bsq_session-p1"
+    _write_session(tmp_path, "p", sid, window="universal_bsq_session")
+    assert "user-conversation" in I._ROLE_KEYWORDS
+    out = I.send(cfg, "p", "S-u-dev_x-p9", "user-conversation", "for the human")
+    assert out["ok"] is True
+    assert out["delivered_to"] == [sid]
+
+
+def test_an_unknown_target_is_still_not_a_role(tmp_path, monkeypatch):
+    """The resolver must NOT have been widened into something that accepts
+    anything — the operator was explicit about that. An unknown name still
+    falls through to the literal-SID branch."""
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    assert "archduke" not in I._ROLE_KEYWORDS
+    cfg = _make_cfg(tmp_path)
+    assert I._resolve_recipients(cfg, "p", "archduke") == ["archduke"]
+
+
+# --- DoD 4: the bad state must be VISIBLE -----------------------------------
+
+def _row(sid, roles, activity="running", status="active"):
+    return {"sid": sid, "roles": list(roles), "activity": activity,
+            "status": status, "role": roles[0] if roles else ""}
+
+
+def test_the_incident_state_is_reported(tmp_path):
+    """A live user-conversation beside a live IDLE operator — the exact state
+    that caused this reopen. Today nothing said so."""
+    cfg = _make_cfg(tmp_path)
+    rows = [_row("S-u-universal_bsq_session-p1", ["user-conversation"]),
+            _row("S-u-operator-p640", ["operator"], activity="idle")]
+    found = S.role_split_findings(cfg, "p", rows)
+    assert len(found) == 1
+    assert found[0]["kind"] == S.SPLIT_ATTENDANT_AND_IDLE_OPERATOR
+    assert set(found[0]["sids"]) == {"S-u-universal_bsq_session-p1", "S-u-operator-p640"}
+    assert "talking-operator" in found[0]["message"].lower()
+
+
+def test_an_attendant_beside_a_WORKING_operator_is_not_flagged(tmp_path):
+    """HEALTHY CONTROL, differing along exactly the tested axis: same two roles,
+    same two sessions, operator RUNNING. That is a legitimate row of his own
+    table — what budding user-session off is for — and a warning that fires on
+    the healthy case is one nobody reads."""
+    cfg = _make_cfg(tmp_path)
+    rows = [_row("S-u-universal_bsq_session-p1", ["user-conversation"]),
+            _row("S-u-operator-p640", ["operator"], activity="running")]
+    assert S.role_split_findings(cfg, "p", rows) == []
+
+
+def test_a_talking_operator_is_not_flagged(tmp_path):
+    """The COLLAPSED state is the fix, so it must not be reported as the defect."""
+    cfg = _make_cfg(tmp_path)
+    rows = [_row("S-u-operator-p640", ["operator", "user-conversation"],
+                 activity="idle")]
+    assert S.role_split_findings(cfg, "p", rows) == []
+
+
+def test_a_solo_session_alone_is_not_flagged(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    rows = [_row("S-u-universal_bsq_session-p1", list(S.SOLO_ROLES))]
+    assert S.role_split_findings(cfg, "p", rows) == []
+
+
+def test_a_DERIVED_dev_does_not_receive_a_dev_broadcast(tmp_path, monkeypatch):
+    """The regression this union caused and the reason `declared_only` exists.
+
+    `_derive_role`'s default branch returns "dev", so every task-less session
+    with an unmarked window DERIVES the dev role. Unioning derived holders into
+    the `dev` fan-out delivered a dev broadcast to every team-lead on the
+    project. A DECLARATION may widen who receives a broadcast; a DERIVATION —
+    which is just the fallthrough — may not.
+    """
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    _write_session(tmp_path, "p", "S-u-tl1-p0", window="tl1")      # derives dev
+    _write_session(tmp_path, "p", "S-u-w1-p2", window="w1")        # derives dev
+    # ...but neither DECLARED it, so neither is a role-holder for the fan-out.
+    assert S.role_holders(cfg, "p", "dev", declared_only=True) == []
+    # ...while the derived read still sees both, which is what makes the
+    # distinction load-bearing rather than cosmetic.
+    assert len(S.role_holders(cfg, "p", "dev")) == 2
+
+
+def test_a_DECLARED_dev_does_receive_one(tmp_path, monkeypatch):
+    """The other direction: a solo session holds `dev` with no ticket, and once
+    it says so it is in the dev fan-out."""
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "list_panes", lambda: [])
+    _write_session(tmp_path, "p", "S-u-universal_bsq_session-p1",
+                   window="universal_bsq_session", roles=list(S.SOLO_ROLES))
+    assert S.role_holders(cfg, "p", "dev", declared_only=True) == [
+        "S-u-universal_bsq_session-p1"]

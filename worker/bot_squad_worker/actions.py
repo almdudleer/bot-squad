@@ -2085,8 +2085,19 @@ def _action_list_sessions(params: dict[str, Any]) -> dict[str, Any]:
 
     cfg = _get_config()
     from bot_squad_worker import sessions as _sessions
+    rows = _sessions.list_sessions(cfg, params["slug"])
+    # T-0943 reopen (DoD 4): the roster read is where a reader looks, so it is
+    # where the BAD role state has to announce itself. Computed from the rows
+    # just read — no second scan — and best-effort, because a finding must
+    # never be able to break the listing it rides on.
+    try:
+        findings = _sessions.role_split_findings(cfg, params["slug"], rows)
+    except Exception:  # noqa: BLE001
+        log.debug("list_sessions: role_split_findings failed for %s",
+                  params["slug"], exc_info=True)
+        findings = []
     # Wrap in a dict so the FastAPI response (typed `-> dict`) validates.
-    return {"sessions": _sessions.list_sessions(cfg, params["slug"])}
+    return {"sessions": rows, "role_findings": findings}
 
 
 _TELEMETRY_GET_REQUIRED = {"slug"}
@@ -3360,6 +3371,10 @@ def _action_peer_send(params: dict[str, Any]) -> dict[str, Any]:
     result = _is.send(
         cfg, delivery_slug, params["from_sid"], to, params["text"],
         user=params.get("user"),
+        # T-0943: a DECLARED block (T-0977) addressed to a role nobody holds is
+        # refused rather than reported as delivered — the sender is telling the
+        # watchdog it is stopped until an answer that can never arrive.
+        blocked=bool(params.get("blocked")),
     )
     # T-0827: an over-cap message is refused whole rather than delivered
     # truncated, and the CLI caller is the one that can act on it. Raised

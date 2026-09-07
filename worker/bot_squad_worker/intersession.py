@@ -37,7 +37,34 @@ _MAX_TEXT_LEN = 4000
 # tell a redirect from a fan-out, and the ``peer_send`` action uses it to decide
 # whether a target needs cross-project SID resolution (T-0624). ``operator``
 # joined in T-0790 — see ``_resolve_recipients``.
-_ROLE_KEYWORDS = frozenset({"teamlead", "dev", "all", "operator"})
+#: T-0943 reopen, gap 1: EVERY role in the model is addressable by role, not
+#: just the four that happened to be here. `bsq peer send user-conversation` was
+#: REFUSED -- "recipient SID has no registered session under any known project"
+#: -- so the one role whose entire purpose is being a human's address could not
+#: be addressed by role, which is how three hours of operator mail reached an
+#: attendant. Derived from `sessions.DECLARABLE_ROLES` rather than re-listed,
+#: because a hand-kept second copy of a role enum is exactly what went stale
+#: here (T-0778 is the same lesson one layer down).
+#:
+#: `all` is not a role; it is the broadcast, and it stays.
+def _model_role_keywords() -> frozenset:
+    try:
+        from bot_squad_worker.sessions import DECLARABLE_ROLES
+    except Exception:  # noqa: BLE001 — never let this break the bus at import
+        DECLARABLE_ROLES = ("user-conversation", "operator", "dev", "teamlead",
+                            "prod-teamlead", "qa", "routine-handler")
+    return frozenset(DECLARABLE_ROLES) | {"all"}
+
+
+_ROLE_KEYWORDS = _model_role_keywords()
+
+#: The two that resolve by TASK SHAPE rather than by held role, and keep doing
+#: so. `dev` has meant "a session holding a ticket" since the bus existed and
+#: ~12 internal callers rely on that; `teamlead` means "a coordinator with no
+#: ticket". T-0943 UNIONS the role holders into both rather than replacing the
+#: walk -- additive, so nobody who received before stops receiving, and a
+#: session that DECLARED the role now receives too.
+_TASK_SHAPED_KEYWORDS = frozenset({"teamlead", "dev", "all"})
 
 #: T-0943: role keywords that mean "hand this UP to somebody". A send to one of
 #: these that reaches NOBODY is refused rather than reported as sent — see the
@@ -360,7 +387,7 @@ def _resolve_recipients(
     # NB: ``operator`` returned above — it is a role fan-out but resolves via the
     # identity SSOT, not this task_id-shaped walk. Keep this set literal so
     # reordering the branches can't silently route ``operator`` through here.
-    if to in {"teamlead", "dev", "all"}:
+    if to in _TASK_SHAPED_KEYWORDS:
         from bot_squad_worker.sessions import _is_live_holder
         rows = [
             (sid, meta) for sid, meta in _list_session_sids(cfg, slug)
@@ -387,7 +414,28 @@ def _resolve_recipients(
                 sids.append(sid)
             elif to == "dev" and is_dev:
                 sids.append(sid)
+        # T-0943: a session that DECLARED the role receives it too, even when
+        # its task shape says otherwise -- a solo session holds `dev` with no
+        # ticket, and a talking-operator holds none. Union, never replacement:
+        # the walk above is the legacy contract and it keeps its recipients.
+        if to in ("dev", "teamlead"):
+            from bot_squad_worker.sessions import role_holders
+            # DECLARED holders only — see `role_holders`. `dev` is
+            # `_derive_role`'s default, so a derived union delivers every
+            # dev broadcast to every coordinator.
+            for sid in role_holders(cfg, slug, to, declared_only=True):
+                if sid not in sids and not (
+                        apply_scope and _linux_user_from_sid(sid) != scope_user):
+                    sids.append(sid)
         return sids
+    # T-0943 reopen: every other model role -- `user-conversation` above all --
+    # resolves to whoever HOLDS it. This is the missing keyword, not a widening
+    # of the resolver: an unknown target still falls through to the literal-SID
+    # branch below and is still refused by `_action_peer_send` if it names no
+    # registered session.
+    if to in _ROLE_KEYWORDS:
+        from bot_squad_worker.sessions import role_holders
+        return role_holders(cfg, slug, to)
     successor = live_successor_sid(cfg, slug, to)
     if successor is not None:
         log.warning(

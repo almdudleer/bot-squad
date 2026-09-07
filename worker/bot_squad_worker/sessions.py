@@ -1284,6 +1284,137 @@ def declare_roles(
     return out
 
 
+def roles_declared(meta: dict | None) -> bool:
+    """True when this session's role set is RECORDED rather than guessed.
+
+    T-0943 reopen. Derivation is a good FALLBACK and a bad DEFAULT: the
+    stakeholder found this project's operator reading ``pure-operator`` while it
+    was in fact a talking-operator, because the label came from the WINDOW NAME.
+    His requirement: «эти роли должны explicitly вешаться на сессии в системе,
+    чтобы ни у кого не было сомнения, какие роли из трех на них висят».
+
+    A derived label is a guess that READS LIKE A FACT, and only a parenthetical
+    separates them. So every surface that prints a role set asks this and says
+    which it is — see ``bsq role show`` / ``bsq team status``.
+    """
+    return declared_roles(meta) is not None
+
+
+def role_holders(cfg: Any, slug: str, role: str,
+                 *, declared_only: bool = False) -> list[str]:
+    """SIDs of the LIVE sessions holding ``role`` — the general form of
+    :func:`dispatch.operator_role_holders`, for every role in the model.
+
+    T-0943 reopen, gap 1. ``bsq peer send user-conversation`` was REFUSED: the
+    keywords were teamlead/dev/all/operator, so **the one role whose entire
+    purpose is being a human's address could not be addressed by role**. The
+    resolver was not broken — it refused rather than misfiling, which is right —
+    it was missing the case.
+
+    ``operator`` is deliberately NOT routed through here by the bus: it has a
+    PREFERENCE rule (a dedicated operator outranks a multi-role holder) that
+    only :func:`dispatch.operator_role_holders` implements. Everything else is
+    a plain "who holds it", which is what routing by role means.
+
+    ``declared_only`` counts a session ONLY when it SAID SO. Required for
+    ``dev``, and the reason is not fussiness: ``_derive_role``'s default branch
+    returns ``"dev"``, so every task-less session with an unmarked window
+    derives it. Unioning derived holders into the ``dev`` fan-out delivered a
+    dev broadcast to every team-lead on the project — measured, as a red
+    ``test_role_fanout_teamlead_and_dev``. A DECLARATION is a statement; a
+    DERIVATION is the fallthrough default, and only the first may widen who
+    receives a broadcast.
+
+    Fail-open: an unreadable md is skipped rather than raising inside a tick.
+    """
+    out: list[str] = []
+    sess_dir = Path(cfg.data_dir) / slug / "sessions"
+    if not sess_dir.exists():
+        return out
+    for md in sorted(sess_dir.glob("*.md")):
+        meta = _read_session_metadata(md)
+        if meta is None or not _is_live_holder(meta):
+            continue
+        held = declared_roles(meta) if declared_only else roles_of(meta)
+        if not held or role not in held:
+            continue
+        sid = str(meta.get("sid") or md.stem)
+        if sid not in out:
+            out.append(sid)
+    return out
+
+
+#: T-0943 reopen, DoD 4 — the finding kind for the state that caused it.
+SPLIT_ATTENDANT_AND_IDLE_OPERATOR = "split_attendant_and_idle_operator"
+
+
+def role_split_findings(cfg: Any, slug: str, rows: list[dict] | None = None) -> list[dict]:
+    """The bad role states this project is IN right now, as ``{kind, sids,
+    message}`` — empty when there are none.
+
+    T-0943 reopen, DoD 4, and it is the item the operator cared about most:
+    *"Do not settle for making the good state expressible; make the bad state
+    visible."*
+
+    THE INCIDENT THIS DETECTS, measured rather than imagined. A
+    user-conversation session did operator work for three hours because no
+    operator was live; when one finally appeared the two ran SIDE BY SIDE with
+    the mail going to the wrong one — peer-fleet coordination, instrument duty
+    and load negotiation all flowing through the session whose only job is
+    talking to the stakeholder, while a separate operator sat IDLE. Nothing in
+    the system said so, and ``bsq team status`` had no role column to say it
+    with.
+
+    WHY THE IDLE QUALIFIER IS PART OF THE FINDING, not a softener. An attendant
+    beside a WORKING operator is a legitimate row of his own table (that is what
+    ``bsq start`` produces beside an operator, and what budding user-session off
+    is FOR). The state he called incorrect is the one where the split bought
+    nothing: *«была юзер-сессия, которая решала операторские вопросы, и получала
+    почту, и отдельный оператор, который стоял»* — and «стоял» is the word doing
+    the work. Flagging every attendant-plus-operator pair would be a warning
+    that fires on the healthy case, which is a warning nobody reads.
+
+    Pure over ``rows`` when given (``list_sessions`` output), so a caller that
+    already has the roster does not re-scan, and so this is testable as a table.
+    """
+    if rows is None:
+        try:
+            rows = list_sessions(cfg, slug)
+        except Exception:  # noqa: BLE001 — a finding never breaks its caller
+            log.debug("role_split_findings: roster read failed for %s", slug,
+                      exc_info=True)
+            return []
+    live = [r for r in (rows or []) if str(r.get("status") or "") in ("active", "paused")]
+
+    def _holds(row: dict, role: str) -> bool:
+        held = row.get("roles") or ([row.get("role")] if row.get("role") else [])
+        return role in held
+
+    attendants = [r for r in live
+                  if _holds(r, "user-conversation") and not _holds(r, "operator")]
+    idle_ops = [r for r in live
+                if _holds(r, "operator") and not _holds(r, "user-conversation")
+                and str(r.get("activity") or "") == "idle"]
+    if not attendants or not idle_ops:
+        return []
+    a = attendants[0]["sid"]
+    o = idle_ops[0]["sid"]
+    return [{
+        "kind": SPLIT_ATTENDANT_AND_IDLE_OPERATOR,
+        "sids": [a, o],
+        "message": (
+            f"SPLIT ROLE STATE: {a} holds user-conversation and {o} holds "
+            f"operator while sitting IDLE. This is the state that caused "
+            f"T-0943's reopen — the attendant ends up doing operator work and "
+            f"receiving operator mail while the operator waits. Either collapse "
+            f"them into a TALKING-OPERATOR (`bsq role set "
+            f"operator,user-conversation` on the one that stays, and let the "
+            f"other finish and exit), or give the operator work so the split is "
+            f"earning its second process."
+        ),
+    }]
+
+
 def _cwd_matches_repo(
     cwd: Path | str | None,
     repo_path: Path,
@@ -2067,6 +2198,9 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 extra_task_ids=extra_task_ids,
                 extra_initiatives=extra_initiatives,
             )),
+            # T-0943 reopen: DECLARED or guessed. Every surface that prints the
+            # set has to be able to say which, or a guess reads as a fact.
+            "roles_declared": roles_declared(existing or {}),
             "window": pane.window,
             "cwd": pane.cwd,
             "started_at": started_at,
@@ -2213,6 +2347,7 @@ def list_sessions(cfg: Any, slug: str) -> list[dict]:
                 "roles_label": roles_label(roles_of(
                     {**dict(meta), "role": md_role},
                     window=meta.get("window", ""))),
+                "roles_declared": roles_declared(meta),
                 # T-0220: True when an elevated window-derived role was
                 # neutralized because the persisted cwd didn't match the project.
                 "role_cwd_mismatch": role_cwd_mismatch,
@@ -4274,7 +4409,16 @@ def live_user_conversation_sid(
         if meta is None:
             continue
         sid = str(meta.get("sid") or md.stem)
-        if session_global_user_id(meta) != gid and _window_from_sid(sid) != want:
+        # T-0943 REOPEN: a THIRD way to match, and it is the one a declaration
+        # creates. The gid arm and the legacy-window arm both key on how the
+        # session was SPAWNED; a session that later declared `user-conversation`
+        # (a talking-operator collapsing the split) was spawned as neither and
+        # was invisible to `ensure_user_conversation`, which is what spawned the
+        # duplicate. An explicit tombstone still excludes, via `roles_of`.
+        declared_uc = "user-conversation" in roles_of(meta)
+        if (session_global_user_id(meta) != gid
+                and _window_from_sid(sid) != want
+                and not declared_uc):
             continue
         if sid in live:
             return sid
@@ -4314,7 +4458,19 @@ def live_user_conversation_sids(cfg: Any, slug: str) -> list[dict]:
         if sid not in live:
             continue
         window = str(meta.get("window") or _window_from_sid(sid) or "")
-        if _role_of(meta, window=window) != "user-conversation":
+        # T-0943 REOPEN: ask the ROLE SET, not the single-valued resolver.
+        # `_role_of` reads `role:` plus the window and never looks at `roles:`,
+        # so a correctly declared TALKING-OPERATOR was filtered out here — the
+        # label was right and this, the function `ensure_user_conversation` uses
+        # to find a live attendant, could not see it. The stakeholder's message
+        # then went to the old attendant or spawned a duplicate, and the
+        # collapse he asked for could not happen.
+        #
+        # `roles_of` reduces to `(_role_of(...),)` for every md that declares
+        # nothing, so this is byte-identical for the whole existing fleet; it
+        # widens only to a session that SAID SO, and narrows only for the
+        # explicit `roles: []` tombstone, which is the point of a tombstone.
+        if "user-conversation" not in roles_of(meta, window=window):
             continue
         rows.append({
             "sid": sid,
@@ -5049,8 +5205,12 @@ def bind_task(cfg: Any, slug: str, sid: str, task_id: str) -> dict:
         # task_id as the PRIMARY below (the in-place repair the old append-only
         # path couldn't do), so an unbound session is fixable via the action, not
         # only a hand-edit. Role is resolved from the window marker (T-0175).
+        # T-0943 REOPEN: HOLDS the dev role, not "is only a dev". A solo
+        # session holds `dev` among three and must be able to take a ticket —
+        # that is exactly what `bsq bud absorb` does — and under the
+        # single-valued read it could never bind one.
         role = _role_of(meta, task_id=primary)  # T-0509: honor a morph stamp
-        if role != "dev":
+        if "dev" not in roles_of(meta, task_id=primary):
             raise ActionError(
                 f"bind_task: session {sid!r} is not a dev session (no primary task_id)"
             )

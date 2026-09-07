@@ -2928,6 +2928,38 @@ def _roles_label(roles) -> str:
     return "+".join(r)
 
 
+def _adjacent_role_moves(roles) -> list[str]:
+    """The states one move away from ``roles``, as printable lines.
+
+    T-0943 reopen, gap 3. The failing session explained its own role correctly
+    and STILL could not name the combination it was in — it reached for
+    `bsq bud --help`, the OLD mechanism, which buds a role OFF a root and cannot
+    express "collapse these two into a talking-operator". His requirement was
+    «чтобы они знали vocabulary комбинаций ролей», and a doc read at startup is
+    not where a session looks at the moment it is deciding what it is. So the
+    vocabulary is printed AT the decision, by `bsq role show`.
+
+    Only the three model roles move: `teamlead`/`qa`/`routine-handler` are not
+    rungs of this ladder (routine-handler is «боком от остальных»), so offering
+    to shed or absorb them would invent moves the model does not have.
+    """
+    held = [r for r in FLUID_ROLES if r in set(roles or ())]
+    out: list[str] = []
+    for r in held:
+        rest = tuple(x for x in held if x != r)
+        verb = "bsq bud dev" if r == "dev" else (
+            "bsq bud operator" if r == "operator" else "bud the user-session off")
+        out.append(f"  shed {r:<19} -> {_roles_label(rest):<18} ({verb})")
+    for r in FLUID_ROLES:
+        if r in held:
+            continue
+        nxt = tuple(x for x in FLUID_ROLES if x in set(held) | {r})
+        verb = ("bsq bud absorb" if r == "dev"
+                else f"bsq role take {r}")
+        out.append(f"  absorb {r:<17} -> {_roles_label(nxt):<18} ({verb})")
+    return out
+
+
 def _contract_files_for(roles) -> list[str]:
     """Contract filenames `bsq brief` prints for a held role set.
 
@@ -3083,6 +3115,24 @@ def _default_brief(slug: str, ticket: str, path: Path, fm: dict, bundle: list[st
     )
 
 
+def _print_role_findings(slug: str, findings=None) -> None:
+    """Print the bad role states this project is in (T-0943 reopen, DoD 4).
+
+    The operator's own framing: do not settle for making the good state
+    expressible, make the BAD state visible. This runs on the two surfaces a
+    session or a human actually looks at — `bsq role show` and
+    `bsq team status`.
+    """
+    if findings is None:
+        try:
+            res = post("list_sessions", {"slug": slug}, fatal=False)
+            findings = (res or {}).get("role_findings") or []
+        except WorkerError:
+            return
+    for f in findings or []:
+        print(f"\n!! {f.get('message') or f.get('kind')}")
+
+
 def cmd_team_status(args) -> None:
     slug = resolve_slug()
     res = post("list_sessions", {"slug": slug})
@@ -3097,7 +3147,12 @@ def cmd_team_status(args) -> None:
     if not sessions:
         print("(no active/paused sessions — use --all to include suspended)")
         return
-    rows = [("SID", "USER", "STATUS", "ACT", "WINDOW", "TASK", "INITIATIVE")]
+    # T-0943 reopen, gap 3 as the operator measured it: this table had a WINDOW
+    # column and NO ROLE column, so a reader of the fleet could not see who
+    # held what — which is how two sessions ran for three hours with the mail
+    # going to the wrong one and nobody noticed. `?` marks a set that was
+    # GUESSED from the window rather than declared.
+    rows = [("SID", "USER", "STATUS", "ACT", "ROLES", "WINDOW", "TASK", "INITIATIVE")]
     for s in sessions:
         # T-0157: surface the owning linux user (explicit field, else SID prefix).
         luser = s.get("linux_user") or ""
@@ -3106,11 +3161,22 @@ def cmd_team_status(args) -> None:
             if sid.startswith("S-"):
                 parts = sid.split("-", 2)
                 luser = parts[1] if len(parts) >= 2 else ""
+        label = s.get("roles_label") or s.get("role") or "-"
+        # ABSENT is not FALSE. A worker that predates T-0943's reopen sends no
+        # `roles_declared` at all, and defaulting that to "guessed" would print
+        # a confident `?` on every row of a fleet whose sets may well be
+        # declared — a false claim, in the direction that looks like caution.
+        declared = s.get("roles_declared")
+        if declared is False:
+            label += "?"
+        elif declared is None:
+            label += "·"
         rows.append((
             s.get("sid", ""),
             luser or "-",
             s.get("status", ""),
             s.get("activity", "") or "-",
+            label,
             s.get("window", ""),
             s.get("task_id") or "-",
             s.get("initiative") or "-",
@@ -3118,6 +3184,14 @@ def cmd_team_status(args) -> None:
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     for r in rows:
         print("  ".join(c.ljust(widths[i]) for i, c in enumerate(r)))
+    if any(x.get("roles_declared") is False for x in sessions):
+        print("\n? = the role set was GUESSED from the window name, not "
+              "declared. `bsq role set <a,b>` records one.")
+    if any(x.get("roles_declared") is None for x in sessions):
+        print("\n· = this worker does not report whether the set was declared "
+              "(it predates T-0943's reopen). Restart it to find out; do not "
+              "read the dot as either answer.")
+    _print_role_findings(slug, res.get("role_findings"))
 
 
 def cmd_team_list(args) -> None:
@@ -4208,13 +4282,29 @@ def cmd_role(args) -> None:
                 fm = {}
         window = str(fm.get("window") or "").strip() or _window_of_sid(sid)
         roles = _roles_for(window, fm)
-        print(_role_line({"roles": list(roles), "label": _roles_label(roles)}))
-        if fm.get("roles") is None:
-            print("(derived from the window — this session has not DECLARED a "
-                  "set; `bsq role set <a,b>` records one)")
+        declared = _declared_roles(fm) is not None
+        # T-0943 reopen, gap 2. A DERIVED label is a guess that reads like a
+        # fact; the stakeholder found this project's operator reading
+        # `pure-operator` while it was a talking-operator, because the label
+        # came from the window name. So the state is part of the line, not a
+        # parenthetical under it.
+        state = "DECLARED" if declared else "UNDECLARED (guessed from window)"
+        print(f"{_role_line({'roles': list(roles), 'label': _roles_label(roles)})}"
+              f"   [{state}]")
+        if not declared:
+            print("  ^ nothing recorded this — it was inferred from the window "
+                  "name, which is wrong the moment you take on a second role. "
+                  "Record it: `bsq role set <a,b>` (e.g. "
+                  "`bsq role set operator,user-conversation`).")
         if len(roles) > 1:
             print("Every one of those routes HERE. There is nobody else holding "
                   "them, so there is nobody to hand their work to.")
+        moves = _adjacent_role_moves(roles)
+        if moves:
+            print("\nONE MOVE AWAY:")
+            for line in moves:
+                print(line)
+        _print_role_findings(slug)
         return
 
     params = {"slug": slug, "sid": sid}

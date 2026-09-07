@@ -2922,6 +2922,89 @@ def _provider_for_pane(cfg: Any, sid: str, pane: Any) -> str | None:
     return value or None
 
 
+def _mail_nudge_state_path(cfg: Any, sid: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", sid)
+    return Path(cfg.data_dir) / "_worker" / "mail_nudge" / f"{safe}.json"
+
+
+def _mail_nudge_redundant(cfg: Any, sid: str) -> str | None:
+    """Why this ``check mail`` would be a wasted turn — or None to send it.
+
+    T-0979: fourteen identical nudges landed in one session's composer inside a
+    single turn and ``bsq inbox check`` answered "(no new mail)". Each was a
+    full model invocation whose entire content was a nudge to do something
+    already done. Two independent reasons, and BOTH are needed:
+
+    * **already drained** — unread is 0, so there is nothing to be told about.
+      Kills the post-drain nudge, which is guaranteed waste rather than merely
+      likely (a nudge is fire-and-forget at SEND time and lands at DELIVERY
+      time, which on a busy lane is minutes later).
+    * **already told, and they have not drained since** — the read mark has not
+      moved since our last CONFIRMED nudge. A second nudge adds nothing: one
+      ``bsq inbox check`` drains everything queued, so N sends need one wake.
+      This is what collapses the burst; the unread check alone cannot, because
+      during a burst unread is >0 every time.
+
+    **The suppression is conditioned on `submitted`, and that is the whole
+    safety argument** (T-0913 is what made it knowable). If the previous nudge
+    was typed into a composer that never submitted, the recipient was NOT told,
+    and suppressing the next one would turn a transport failure into a silent
+    permanent one — which is precisely the failure measured on this fleet at
+    14:11:51Z, when an operator hold sat unread in a live lane for 10m16s.
+    A nudge that did not land never earns quiet.
+
+    **Fails OPEN, everywhere.** Any uncertainty — unknown slug, unreadable
+    state, an unread count we could not measure — sends the nudge. The cost of
+    a wrong "send" is one wasted turn; the cost of a wrong "skip" is a message
+    nobody ever hears about.
+    """
+    try:
+        from bot_squad_worker import intersession as _isn
+        from bot_squad_worker.park import _slug_for_sid
+
+        slug = _slug_for_sid(cfg, sid)
+        if not slug:
+            return None
+        unread = _isn.unread_bytes(cfg, slug, sid)
+        if unread is None:
+            return None            # could not measure — never suppress on that
+        if unread == 0:
+            return "inbox already drained (nothing unread)"
+        mark = _isn.read_mark(cfg, slug, sid)
+        st = json.loads(_mail_nudge_state_path(cfg, sid).read_text())
+        if st.get("submitted") and st.get("mark") == mark:
+            return (f"already nudged at mark {mark} and it has not drained "
+                    f"since; one inbox check takes all {unread} unread bytes")
+    except (FileNotFoundError, ValueError, OSError, KeyError, AttributeError):
+        return None
+    except Exception:  # noqa: BLE001
+        log.exception("inject_input: mail-nudge precondition failed for %s "
+                      "— sending anyway", sid)
+        return None
+    return None
+
+
+def _record_mail_nudge(cfg: Any, sid: str, *, submitted: bool) -> None:
+    """Remember the mark we nudged at, and whether it actually landed."""
+    try:
+        from bot_squad_worker import intersession as _isn
+        from bot_squad_worker.park import _slug_for_sid
+
+        slug = _slug_for_sid(cfg, sid)
+        if not slug:
+            return
+        p = _mail_nudge_state_path(cfg, sid)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps({"mark": _isn.read_mark(cfg, slug, sid),
+                                   "submitted": bool(submitted),
+                                   "at": time.time()}))
+        os.replace(tmp, p)
+    except Exception:  # noqa: BLE001 — bookkeeping must never break a delivery
+        log.warning("inject_input: could not record the mail nudge for %s",
+                    sid, exc_info=True)
+
+
 def _action_inject_input(params: dict[str, Any]) -> dict[str, Any]:
     """Send text to the tmux pane for a SID.
 
@@ -2979,7 +3062,13 @@ def _action_inject_input(params: dict[str, Any]) -> dict[str, Any]:
     # providers the nudge carries its own instruction; `check mail` stays
     # byte-identical everywhere else (the string is load-bearing for claude
     # sessions and pinned by tests).
-    if text == _boot.MAIL_SIGNAL:
+    is_mail_nudge = text == _boot.MAIL_SIGNAL
+    if is_mail_nudge:
+        skip = _mail_nudge_redundant(cfg, sid)
+        if skip:
+            log.info("inject_input: mail nudge for %s skipped — %s", sid, skip)
+            return {"ok": True, "pane_id": pane.pane_id, "lines_sent": 0,
+                    "submitted": False, "outcome": "skipped", "skipped": skip}
         text = _boot.mail_nudge(_provider_for_pane(cfg, sid, pane))
 
     sent = input_mux.deliver_direct(
@@ -2997,6 +3086,8 @@ def _action_inject_input(params: dict[str, Any]) -> dict[str, Any]:
             "inject_input: %s took %d line(s) into its composer but never "
             "submitted them (outcome=%s) — reporting NOT delivered",
             sid, sent.lines, sent.outcome)
+    if is_mail_nudge:
+        _record_mail_nudge(cfg, sid, submitted=sent.submitted)
     return {"ok": True, "pane_id": pane.pane_id, "lines_sent": sent.lines,
             "submitted": sent.submitted, "outcome": sent.outcome}
 

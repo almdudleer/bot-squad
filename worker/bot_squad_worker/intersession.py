@@ -777,6 +777,49 @@ def _split_for_bus(text: str) -> list[str]:
     return [text[i:i + size] for i in range(0, len(text), size)]
 
 
+def unread_bytes(cfg: Any, slug: str, sid: str) -> int | None:
+    """How many bytes are queued for ``sid`` past its read mark — a PEEK.
+
+    T-0979. The mail nudge is emitted per peer_send with nothing consulting the
+    recipient's state, so N sends inside one of its turns cost N agent turns
+    even when a single ``bsq inbox check`` would drain all N — and a nudge that
+    lands after the recipient has already drained is a GUARANTEED wasted turn.
+    This is the fact that makes both cases answerable.
+
+    Deliberately NOT :func:`inbox_read`: this must not touch the heartbeat (it
+    is not the session reading) and must not move the mark (it is not a drain).
+    Reading either of those as a side effect would corrupt the very instrument
+    a delivery question is answered with — the heartbeat mtime is how anyone
+    later tells "never called" from "called and found nothing".
+
+    Returns ``None``, never 0, when it cannot tell — no inbox file, an
+    unreadable mark, anything raising. **Callers must treat None as "send it".**
+    Zero is a licence to SUPPRESS a wake, and a wake suppressed in error is the
+    defect this system has been chasing all day; it may only be returned when
+    it was actually measured.
+    """
+    try:
+        inbox = _inbox_path(cfg, slug, sid)
+        if not inbox.exists():
+            return None
+        size = inbox.stat().st_size
+    except OSError:
+        return None
+    try:
+        offset = int(_seen_path(cfg, slug, sid).read_text().strip())
+    except (FileNotFoundError, ValueError, OSError):
+        offset = 0
+    return max(0, size - offset)
+
+
+def read_mark(cfg: Any, slug: str, sid: str) -> int:
+    """``sid``'s current read offset — the "has it drained since?" coordinate."""
+    try:
+        return int(_seen_path(cfg, slug, sid).read_text().strip())
+    except (FileNotFoundError, ValueError, OSError):
+        return 0
+
+
 def inbox_read(cfg: Any, slug: str, sid: str) -> dict:
     """Drain inbox lines since the seen-<sid> byte offset."""
     _touch(_heartbeat_path(cfg, slug, sid))

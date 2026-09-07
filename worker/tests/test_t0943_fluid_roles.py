@@ -1553,3 +1553,27 @@ def test_a_pre_binding_holder_with_no_identity_at_all_answers_for_nobody(
     # and it is not silently invisible either — the roster still shows it, so
     # `bsq team status` / `role show` can say it is UNBOUND rather than absent.
     assert any(r.get("sid") == a for r in S.live_user_conversation_sids(cfg, "p"))
+
+
+def test_a_binding_without_a_declaration_matches_nobody(tmp_path, monkeypatch):
+    """SEPARATES THE TWO CONDITIONS, and it exists because a mutation test said
+    they were not separated.
+
+    The arm requires DECLARED-ONLY *and* BOUND-ONLY. I claimed each rejects
+    cases the other admits; then I measured it by deleting one condition at a
+    time on a frozen extract. Deleting BOUND-ONLY failed six tests. Deleting
+    DECLARED-ONLY FAILED NOTHING — because the write side clears the binding
+    whenever `user-conversation` leaves the set, so on data this code produces a
+    binding always implies a declaration and the second condition was
+    redundant-by-construction rather than load-bearing.
+
+    This is the case that is NOT produced by that write side: a stale binding
+    left on an md whose role set no longer contains `user-conversation` — a
+    hand-edited md, an older writer, or a future one that sets the field
+    without the role. The session must not answer. Without this test,
+    DECLARED-ONLY could be deleted and every other test would stay green, which
+    is the definition of a condition nobody is checking."""
+    a = "S-u-operator-p1"
+    _uc_md(tmp_path, a, window="operator", roles=["operator"], uc_gid="gu_a")
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: {a})
+    assert S.live_user_conversation_sid(_uc_cfg(tmp_path), "p", "gu_a") is None

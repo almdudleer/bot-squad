@@ -4683,6 +4683,192 @@ def test_gc_sessions_other_user_sids_untouched(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# T-1062: a project-level role (operator/user-conversation) reaped by
+# gc_sessions with no deliberate handoff ever armed has no ticket to note its
+# death onto (unlike a task-bound dev, T-1055) — alert instead.
+# ---------------------------------------------------------------------------
+
+def test_gc_sessions_raw_uc_death_alerts_operator(tmp_path, monkeypatch):
+    """A user-conversation session dies with no live pane and no handoff
+    marker on its md (compact_stay_phase / idle_recycle_phase) -> the raw
+    death, previously visible only in the unread suspend_source field, now
+    reaches the operator."""
+    import bot_squad_worker.sessions as S
+    import bot_squad_worker.intersession as intersession
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set())
+
+    calls = []
+    monkeypatch.setattr(intersession, "send_notice",
+                        lambda *a, **k: calls.append(k) or {"ok": True, "delivered_to": ["S-op"]})
+
+    sessions_dir = tmp_path / "data" / "test-project" / "sessions"
+    md = sessions_dir / "S-testuser-attendant-p9.md"
+    _write_session_metadata(md, {
+        "sid": "S-testuser-attendant-p9", "status": "active",
+        "role": "user-conversation", "started_at": "2026-09-07T09:00:00Z",
+    })
+
+    result = S.gc_sessions(cfg, "test-project")
+    assert result["repaired"] == 1
+    assert len(calls) == 1
+    assert calls[0]["to"] == "operator"
+    assert "S-testuser-attendant-p9" in calls[0]["text"]
+
+
+def test_gc_sessions_raw_death_falls_back_to_stakeholder_dm(tmp_path, monkeypatch):
+    """When send_notice(to='operator') reaches nobody (T-0943: escalation is
+    conditioned on a recipient existing — the exact solo-session case, where
+    the session that just died was the only one running), the alert must not
+    silently vanish: it falls back to paging the stakeholder directly."""
+    import bot_squad_worker.sessions as S
+    import bot_squad_worker.intersession as intersession
+    import bot_squad_worker.actions as actions
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set())
+    monkeypatch.setattr(intersession, "send_notice",
+                        lambda *a, **k: {"ok": False, "delivered_to": []})
+
+    dm_calls = []
+    monkeypatch.setattr(actions, "_send_stakeholder_dm",
+                        lambda *a, **k: dm_calls.append(k) or {"sent": True})
+
+    sessions_dir = tmp_path / "data" / "test-project" / "sessions"
+    md = sessions_dir / "S-testuser-attendant-p9.md"
+    _write_session_metadata(md, {
+        "sid": "S-testuser-attendant-p9", "status": "active",
+        "role": "user-conversation", "started_at": "2026-09-07T09:00:00Z",
+    })
+
+    result = S.gc_sessions(cfg, "test-project")
+    assert result["repaired"] == 1
+    assert len(dm_calls) == 1
+    assert "S-testuser-attendant-p9" in dm_calls[0]["message"]
+
+
+def test_gc_sessions_deliberate_handoff_death_does_not_alert(tmp_path, monkeypatch):
+    """Twin negative: a compact_stay_phase (or idle_recycle_phase) stamp on
+    the md means the deliberate handoff sequence DID get armed for this life
+    — not the raw death this alert exists for — so no alert fires."""
+    import bot_squad_worker.sessions as S
+    import bot_squad_worker.intersession as intersession
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set())
+
+    calls = []
+    monkeypatch.setattr(intersession, "send_notice",
+                        lambda *a, **k: calls.append(k) or {"ok": True, "delivered_to": ["S-op"]})
+
+    sessions_dir = tmp_path / "data" / "test-project" / "sessions"
+    md = sessions_dir / "S-testuser-attendant-p9.md"
+    _write_session_metadata(md, {
+        "sid": "S-testuser-attendant-p9", "status": "active",
+        "role": "user-conversation", "started_at": "2026-09-07T09:00:00Z",
+        "compact_stay_phase": "handoff",
+    })
+
+    result = S.gc_sessions(cfg, "test-project")
+    assert result["repaired"] == 1
+    assert calls == []
+
+
+def test_gc_sessions_task_bound_project_role_death_notes_the_ticket(tmp_path, monkeypatch):
+    """A fluid/solo session (T-0943) can hold a project-level role AND a task
+    at once — task-binding is what the deliberate handoff actually routes on
+    (autocompact._resolve_compact_target), so its forward-state home was that
+    TICKET's Context, not work-state.md. The operator alert alone doesn't put
+    anything where whoever is tracking that specific task would look; this
+    death must ALSO land on the ticket, same as T-1055 does for a dev."""
+    import bot_squad_worker.sessions as S
+    import bot_squad_worker.intersession as intersession
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set())
+    monkeypatch.setattr(intersession, "send_notice",
+                        lambda *a, **k: {"ok": True, "delivered_to": ["S-op"]})
+
+    backlog_dir = tmp_path / "data" / "test-project" / "backlog"
+    (backlog_dir / "T-0002-thing.md").write_text(
+        "---\nid: T-0002\nstatus: in_progress\n---\nbody\n")
+
+    sessions_dir = tmp_path / "data" / "test-project" / "sessions"
+    md = sessions_dir / "S-testuser-universal-p9.md"
+    _write_session_metadata(md, {
+        "sid": "S-testuser-universal-p9", "status": "active",
+        "role": "user-conversation", "task_id": "T-0002",
+        "started_at": "2026-09-07T09:00:00Z",
+    })
+
+    result = S.gc_sessions(cfg, "test-project")
+    assert result["repaired"] == 1
+    ticket_body = (backlog_dir / "T-0002-thing.md").read_text()
+    assert "## Progress" in ticket_body
+    assert "S-testuser-universal-p9" in ticket_body
+    assert "no handoff" in ticket_body
+
+
+def test_gc_sessions_taskless_project_role_death_touches_no_ticket(tmp_path, monkeypatch):
+    """Negative twin: without a task_id there is no ticket to note onto — the
+    operator/stakeholder alert is the whole of the record, same as before this
+    branch existed."""
+    import bot_squad_worker.sessions as S
+    import bot_squad_worker.intersession as intersession
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set())
+    monkeypatch.setattr(intersession, "send_notice",
+                        lambda *a, **k: {"ok": True, "delivered_to": ["S-op"]})
+
+    backlog_dir = tmp_path / "data" / "test-project" / "backlog"
+
+    sessions_dir = tmp_path / "data" / "test-project" / "sessions"
+    md = sessions_dir / "S-testuser-attendant-p9.md"
+    _write_session_metadata(md, {
+        "sid": "S-testuser-attendant-p9", "status": "active",
+        "role": "user-conversation", "started_at": "2026-09-07T09:00:00Z",
+    })
+
+    result = S.gc_sessions(cfg, "test-project")
+    assert result["repaired"] == 1
+    assert list(backlog_dir.glob("*.md")) == []
+
+
+def test_gc_sessions_dev_role_death_does_not_alert(tmp_path, monkeypatch):
+    """Twin negative: a task-bound dev's raw death is T-1055's territory
+    (note_ticket_death, onto its ticket) — this alert is scoped to
+    project-level roles only, so a dev must not double-fire it."""
+    import bot_squad_worker.sessions as S
+    import bot_squad_worker.intersession as intersession
+
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "testuser")
+    monkeypatch.setattr(S, "_live_agent_sids", lambda: set())
+
+    calls = []
+    monkeypatch.setattr(intersession, "send_notice",
+                        lambda *a, **k: calls.append(k) or {"ok": True, "delivered_to": ["S-op"]})
+
+    sessions_dir = tmp_path / "data" / "test-project" / "sessions"
+    md = sessions_dir / "S-testuser-feat-dev-p9.md"
+    _write_session_metadata(md, {
+        "sid": "S-testuser-feat-dev-p9", "status": "active",
+        "role": "dev", "task_id": "T-0001", "started_at": "2026-09-07T09:00:00Z",
+    })
+
+    result = S.gc_sessions(cfg, "test-project")
+    assert result["repaired"] == 1
+    assert calls == []
+
+
+# ---------------------------------------------------------------------------
 # T-0073: gc_stale_bindings — strip primary task_id from dup-claim losers
 # ---------------------------------------------------------------------------
 

@@ -5399,6 +5399,34 @@ def gc_sessions(cfg: Any, slug: str) -> dict:
         meta["suspend_reason"] = "auto-suspended: no live claude pane"
         _write_session_metadata(md, meta, atomic=True)
         repaired.append(sid)
+        # T-1062: a project-level role (operator/user-conversation) has no
+        # ticket to note its death onto (note_ticket_death's home, T-1055) —
+        # alert instead, but only when no DELIBERATE handoff sequence ever got
+        # to run for this life (compact_stay_phase / idle_recycle_phase unset).
+        # A clean idle_timeout exit stamps suspend_source itself before the
+        # pane closes, so reaching THIS branch at all already means the
+        # deliberate flow didn't finish — this guard additionally excludes the
+        # in-flight case where it started but the pane died mid-sequence.
+        role = meta.get("role") or _derive_role(
+            meta.get("window"), meta.get("task_id"), meta.get("initiative"))
+        from bot_squad_worker.work_state import PROJECT_ROLES
+        if role in PROJECT_ROLES and not (
+                meta.get("compact_stay_phase") or meta.get("idle_recycle_phase")):
+            note_project_role_death(cfg, slug, sid, role)
+            # T-1062: a fluid/solo session (T-0943) can hold a project-level
+            # role AND a task at once — task-binding is what _resolve_compact_
+            # target actually routes on, so its forward-state home was that
+            # TICKET's Context, not work-state.md. The alert above still fires
+            # (nobody may be watching that ticket), but the durable record also
+            # needs to land where T-1055 already puts it for every other
+            # task-bound death: the ticket's own Progress feed.
+            tid = meta.get("task_id")
+            if tid and tid != "~":
+                note_ticket_death(
+                    cfg, slug, tid, "gc_sessions",
+                    f"session {sid} ({role}) went unresponsive (no live claude "
+                    f"pane) and was auto-suspended with no handoff written — "
+                    f"this task was left bound with no forward-state captured.")
     return {"ok": True, "scanned": scanned, "repaired": len(repaired), "sids": repaired}
 
 
@@ -6714,6 +6742,55 @@ def note_ticket_death(cfg: Any, slug: str, task_id: Any, sid_label: str,
             atomic_write(path, _frontmatter.dump(meta, new_body))
     except Exception:
         log.exception("sessions: could not note ticket death for %s/%s", slug, tid)
+
+
+def note_project_role_death(cfg: Any, slug: str, sid: str, role: str) -> None:
+    """T-1062: alert the operator when a PROJECT-LEVEL role (operator,
+    user-conversation) is reaped by :func:`gc_sessions` with no task to note
+    death onto.
+
+    :func:`note_ticket_death` (T-1055) puts the same fact on a ticket's
+    ``## Progress`` — the home a task-bound session's forward-state was
+    supposed to reach. A project-level role has no ticket; its forward-state
+    home is ``artifacts/work-state.md`` (T-0942), written only by the
+    deliberate handoff sequence (:mod:`autocompact`/:mod:`idle_timeout`).
+    Reaching this reap means that sequence never ran for this incarnation —
+    the same "nothing records how" gap T-1055 closed for tickets, here for the
+    one role class that has no ticket to close it onto.
+
+    T-1062: ``to="operator"`` delivers NOTHING when no operator is live
+    (T-0943 — escalation is conditioned on a recipient existing) — exactly the
+    solo-session case this alert exists for, where the session that just died
+    was the only one running. So this falls back to paging the stakeholder
+    directly (the same ``_send_stakeholder_dm`` SSOT :mod:`tg_stall` uses) when
+    the in-app notice reached nobody.
+
+    Best-effort and silent on failure, same contract as ``note_ticket_death``:
+    a diagnostics alert must never block or fail the reap it documents.
+    """
+    text = (f"⚠️ {sid} (role: {role}) went unresponsive (no live claude "
+            f"pane) and was auto-suspended with no handoff written — "
+            f"its forward-state was never captured into work-state.md.")
+    try:
+        from bot_squad_worker import intersession
+        res = intersession.send_notice(cfg, slug, from_sid="S-gc_sessions",
+                                       to="operator", text=text)
+        if res.get("delivered_to"):
+            return
+        project = cfg.projects.get(slug)
+        chat_id = getattr(project, "tg_chat", "") if project else ""
+        if not chat_id:
+            return
+        from bot_squad_worker.actions import _send_stakeholder_dm
+        from bot_squad_worker import tg_topics as _tg_topics
+        _send_stakeholder_dm(
+            cfg, message=text, sid=sid, tg_chat_id=chat_id,
+            tg_topic_id=_tg_topics.resolve(cfg, slug, "team_queries"),
+            group_record=True, do_slim=False, msg_type="needs_input",
+            route_slug=slug)
+    except Exception:
+        log.exception("sessions: could not alert project-role death for %s/%s",
+                     slug, sid)
 
 
 def _log_reap_event(cfg: Any, slug: str, sid: str, reason: str, *,

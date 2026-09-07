@@ -795,27 +795,50 @@ def declare(cfg: Any, slug: str, *, instruction: str,
             "next_run_at": meta["next_run_at"]}
 
 
+#: T-0972: the last version of each routine md that PARSED, keyed by path.
+#:
+#: These files are live shared state — sessions edit them and the worker reads
+#: every routine md on its tick. Nothing makes those edits atomic:
+#: ``Path.write_text()`` truncates in place and streams, so a reader arriving
+#: mid-write gets a PREFIX. A prefix has no closing ``---``, so
+#: ``parse_or_none`` returns None, and this function used to answer None too —
+#: whereupon the routine simply vanished from ``_monitor_routines`` and
+#: ``list_routines``. **The monitor stopped evaluating and said nothing.**
+#:
+#: That is strictly worse than the ``bsq`` case in the same ticket, which at
+#: least refuses loudly at parse time in front of the person who broke it.
+#: Silence here is indistinguishable from "no routines are due".
+#:
+#: So: a file that parsed before and does not parse now keeps serving its last
+#: good version and says so at ERROR. A file that never parsed is not a
+#: regression and stays quiet — otherwise every README in the directory
+#: becomes a recurring alarm.
+_LAST_GOOD_MD: dict[str, "Routine"] = {}
+
+
 def _routine_from_md(path: Path) -> Optional[Routine]:
     from bot_squad_worker import frontmatter as fm
 
+    key = str(path)
     try:
         parsed = fm.parse_or_none(path.read_text(encoding="utf-8"))
     except OSError:
-        return None
+        return _degraded(key, "unreadable")
     if not parsed:
-        return None
+        return _degraded(key, "frontmatter did not parse (a torn write looks "
+                              "exactly like this)")
     meta, body = parsed
     meta = meta or {}
     rid = str(meta.get("id", "")).strip()
     if not rid:
-        return None
+        return _degraded(key, "no `id` in frontmatter")
     # the instruction is the body sans the "## Instruction" heading
     instruction = body
     m = re.match(r"\s*##\s+Instruction\s*\n+", body, flags=re.IGNORECASE)
     if m:
         instruction = body[m.end():]
     monitor = meta.get("monitor")
-    return Routine(
+    routine = Routine(
         id=rid,
         title=str(meta.get("title", "") or ""),
         instruction=instruction.strip(),
@@ -832,6 +855,25 @@ def _routine_from_md(path: Path) -> Optional[Routine]:
         mute_reason=(str(meta["mute_reason"]).strip()
                      if meta.get("mute_reason") else None),
     )
+    _LAST_GOOD_MD[key] = routine
+    return routine
+
+
+def _degraded(key: str, why: str) -> Optional[Routine]:
+    """Serve the last good version of a routine md that has stopped parsing.
+
+    Returns None when there is no last-good — a file that never parsed is not
+    a regression and must not be announced on every tick.
+    """
+    last = _LAST_GOOD_MD.get(key)
+    if last is None:
+        return None
+    log.error(
+        "routine md %s stopped parsing (%s) — SERVING THE LAST GOOD VERSION "
+        "(%s). If this is a save in flight it clears itself on the next tick; "
+        "if it persists, that file is broken and the routine is running on "
+        "stale text.", key, why, last.id)
+    return last
 
 
 def _routine_path(cfg: Any, slug: str, rid: str) -> Optional[Path]:

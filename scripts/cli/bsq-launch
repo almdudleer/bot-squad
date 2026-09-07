@@ -1,0 +1,776 @@
+#!/usr/bin/env python3
+"""bsq launcher — the file the fleet EXECUTES, which is no longer the file
+anyone EDITS (T-0972).
+
+## What this exists for
+
+``~/.local/bin/bsq`` used to be a symlink into the shared working tree, so
+the ~9800-line ``scripts/cli/bsq`` that eleven sessions run was byte-for-byte
+the file one session was mid-save on. Every save was an unreviewed fleet-wide
+deploy of the bus that carries ``inbox check``, ``peer send``, ``ticket
+update``, ``spawn`` and ``commit`` — and when it broke, the channel anyone
+would use to say so was broken too. Three outages in nine minutes on
+2026-09-06, by three different mechanisms:
+
+* an argparse subparser collision — **compiles perfectly**, raises inside
+  ``build_parser()``, so ``ast.parse``/``py_compile`` cannot see it;
+* a torn read — ``Path.write_text()`` truncates in place and streams, so a
+  reader mid-write gets a PREFIX, and the SyntaxError names the line where
+  truncation caught rather than any line anyone edited;
+* a half-applied rename — 41 measured seconds of a dead fleet, self-healing
+  when the writer finished.
+
+Per-lane discipline provably does not close this: one lane landed real
+controls for its own edits and a different lane broke the same file from a
+different direction forty minutes later. The failure is in *how a file is
+saved*, and every session has a dozen ways to save one.
+
+## The mechanism
+
+``~/.local/bin/bsq`` is a COPY of this launcher — never a symlink, never in
+the working tree. It execs a published snapshot, and refreshes that snapshot
+from the repo only when the candidate passes BOTH ``ast.parse`` and a real
+``build_parser()`` call in a subprocess. A torn or semantically broken save is
+invisible to every other lane by construction, and the editor is told at their
+next command instead of the fleet finding out at their next ``inbox check``.
+
+**No promoter command to remember.** The refresh is on the exec path: the very
+next ``bsq`` anything re-validates and promotes. That is deliberate — a
+promoter people must remember is a habit, and the whole point of this ticket is
+that habits do not travel. ``bsq --bsq-publish`` exists only for an editor who
+wants the verdict *now*, without running a real verb.
+
+## What this file may depend on
+
+Nothing in the working tree, and no third-party package. It is copied to
+``~/.local/bin`` and must keep working while the tree it points at is
+mid-save, half-deleted, or on a branch that does not build. Everything it
+needs is inline and stdlib. Keep it small enough to audit in one sitting.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+# fcntl / hashlib / shutil / subprocess / tempfile are imported INSIDE the
+# functions that need them. Every one of them is slow-path only (promotion,
+# validation, install), and the fast path — "the source has not changed, exec
+# the snapshot" — runs on every bsq invocation the fleet makes. Measured on
+# this host: those five cost 12.4ms of import on top of a 13.3ms interpreter
+# start, which is 12.4ms added to every `bsq inbox check` in exchange for
+# nothing on the path that pays it.
+
+DEFAULT_HOME = Path.home() / ".local" / "share" / "bot-squad" / "bsq"
+
+#: Verbs that must survive every promotion. A truncated candidate can still
+#: parse (a prefix ending at a statement boundary is valid Python), so
+#: "it parsed" is not "it is whole" — build_parser() on a prefix returns a
+#: parser missing whatever came after the cut. These are the bus itself: if
+#: any one of them is gone, the fleet cannot coordinate its way out.
+CORE_VERBS = ("inbox", "peer", "ticket", "task", "spawn", "commit", "tg", "team")
+
+CONTROL_FLAGS = ("--bsq-publish", "--bsq-status", "--bsq-install", "--bsq-where")
+
+#: A source modified within this many seconds is treated as STILL BEING
+#: SAVED, and is neither validated nor promoted.
+#:
+#: Measured, not guessed. Against a writer streaming the real ~470KB bsq in
+#: 8KB chunks — which is what `Path.write_text()` does — the launcher without
+#: a settle window read a torn prefix whose (size, mtime) happened to hold
+#: still across the read, validated it, and reported a REJECTION for a save
+#: that was simply not finished yet. Correct in the letter (you were not
+#: running your latest edit) and wrong in the spirit: it cries wolf at
+#: mid-save states that resolve on their own a moment later, and it burns a
+#: ~290ms validation on each one, which is why the same arm did 7 invocations
+#: in the window the unprotected path did 20.
+#:
+#: The cost of the window is latency-to-live for a GOOD edit, and it is paid
+#: only once per save. `--bsq-publish` ignores it: an editor asking for the
+#: verdict now has finished writing.
+SETTLE_S = 0.5
+
+
+# --------------------------------------------------------------------------
+# paths + tiny json state
+# --------------------------------------------------------------------------
+def _home() -> Path:
+    return Path(os.environ.get("BSQ_HOME") or DEFAULT_HOME)
+
+
+def _snapshot(home: Path) -> Path:
+    # basename MUST be `bsq`: argparse takes prog from basename(sys.argv[0]),
+    # so a snapshot called anything else makes every usage/error message in
+    # the CLI name a file nobody can find.
+    #
+    # `bin` is a SYMLINK to a per-revision directory holding bsq AND its
+    # sibling modules. Publishing a directory rather than a file is not
+    # tidiness — see SIBLING SET below; a revision is only ever swapped in
+    # whole, by renaming this one symlink, which is atomic.
+    return home / "bin" / "bsq"
+
+
+def _revs(home: Path) -> Path:
+    return home / "rev"
+
+
+# --------------------------------------------------------------------------
+# THE SIBLING SET IS THE INTERFACE, NOT AN IMPLEMENTATION DETAIL
+#
+# `scripts/cli/bsq` loads four modules as SIBLING FILES by path —
+# ``Path(__file__).resolve().parent / "frontmatter.py"`` and three more —
+# rather than importing them. That is not a shortcut: the worker package is
+# not importable across the scripts/cli boundary, and a mirrored module may
+# not depend on its package being importable AT ALL. The sibling pattern
+# exists to satisfy exactly that constraint.
+#
+# So the unit that can be published is the DIRECTORY, never the file. This
+# launcher learned that the expensive way: its first cutover copied `bsq`
+# alone, which moved __file__ into a directory where none of the four
+# existed, and every frontmatter-reading verb — `ticket note`, `ticket
+# update`, anything that reads a ticket title — died fleet-wide with
+# FileNotFoundError while `--help`, `team status` and `inbox check` all
+# passed, because none of those three touches a sibling.
+#
+# The set is DERIVED from the candidate, transitively, and never hardcoded: a
+# frozen list of four names is the same defect one layer up, and it goes
+# stale the first time somebody adds a fifth.
+# --------------------------------------------------------------------------
+def sibling_modules(path: Path, _seen: set[str] | None = None) -> list[str]:
+    """Names of the modules ``path`` loads as siblings, transitively.
+
+    Found by AST rather than by regex: this file's own prose mentions
+    ``frontmatter.py``, and a textual scan of a 470KB script cannot tell a
+    docstring from a load.
+    """
+    import ast
+
+    seen = _seen if _seen is not None else set()
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError, ValueError):
+        return sorted(seen)
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div)
+                and isinstance(node.right, ast.Constant)
+                and isinstance(node.right.value, str)
+                and "__file__" in ast.unparse(node.left)):
+            continue
+        name = node.right.value
+        # ANY filename, not just *.py. Today all four siblings are Python, but
+        # a launcher that publishes only the extensions it knows about would
+        # drop a `.sh` or `.toml` companion silently — the exact shape of the
+        # bug that made this widening necessary, one file type over.
+        if "/" in name or "." not in name.strip("."):
+            continue
+        found.append(name)
+    for name in found:
+        if name in seen:
+            continue
+        seen.add(name)
+        sib = path.parent / name
+        # Only Python can itself declare siblings; recursion stops elsewhere.
+        if sib.is_file() and name.endswith(".py"):
+            sibling_modules(sib, seen)
+    return sorted(seen)
+
+
+def _source(home: Path) -> Path | None:
+    env = os.environ.get("BSQ_SOURCE")
+    if env:
+        return Path(env)
+    ptr = home / "source"
+    try:
+        text = ptr.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return Path(text) if text else None
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    _atomic_write(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def _atomic_write(path: Path, text: str, mode: int = 0o644) -> None:
+    """Write via a UNIQUELY named temp + os.replace.
+
+    A fixed temp name (``path.name + ".tmp"``) is not atomic between two
+    writers: both stream into the same temp and whichever renames second
+    publishes a file the other was still writing. That is the very hazard this
+    launcher exists to contain, so it is not repeated here.
+    """
+    import tempfile
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp is not None and os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _write_bytes(path: Path, data: bytes, mode: int) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.chmod(path, mode)
+
+
+def shutil_rmtree(path: Path) -> None:
+    import shutil
+
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _publish(home: Path, rev: Path) -> None:
+    """Point ``<home>/bin`` at ``rev`` atomically.
+
+    ``os.rename`` over an existing symlink is atomic, so no reader ever sees a
+    missing or half-built `bin`. This is the step that makes the sibling set
+    publishable as a unit.
+    """
+    link = home / "bin"
+    if link.is_dir() and not link.is_symlink():
+        # Migration from the first cutover, which published `bin` as a real
+        # directory holding bsq ALONE — the shape that broke every
+        # frontmatter-reading verb. Replace it with the symlink.
+        shutil_rmtree(link)
+    tmp = home / f".bin.new.{os.getpid()}"
+    if tmp.exists() or tmp.is_symlink():
+        tmp.unlink()
+    os.symlink(str(rev), str(tmp))
+    os.rename(str(tmp), str(link))
+
+
+def _verify_published(home: Path, siblings: list[str]) -> str | None:
+    """Post-swap: is the thing the fleet will now execute actually complete?
+
+    Checked at the PUBLISHED path rather than the staging path. The first
+    cutover of this launcher validated a lone copy in a temp directory and
+    published something different; a check that never looks at what shipped
+    cannot catch that class at all.
+    """
+    snap = _snapshot(home)
+    if not snap.is_file():
+        return f"{snap} is missing"
+    missing = [n for n in siblings if not (snap.parent / n).is_file()]
+    if missing:
+        return f"sibling modules missing from {snap.parent}: {missing}"
+    return None
+
+
+def _gc_revs(home: Path, keep: int = 3) -> None:
+    """Keep a few old revisions: a rollback target, and a rev a live process
+    may still be exec'ing out of."""
+    try:
+        revs = [d for d in _revs(home).iterdir() if d.is_dir()]
+    except OSError:
+        return
+    current = None
+    try:
+        current = (home / "bin").resolve()
+    except OSError:
+        pass
+    revs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    for d in revs[keep:]:
+        if current is not None and d.resolve() == current:
+            continue
+        shutil_rmtree(d)
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _sha(data: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest()
+
+
+# --------------------------------------------------------------------------
+# validation — ast.parse AND build_parser(), because the first alone provably
+# misses the subparser-collision class that took the fleet down first.
+# --------------------------------------------------------------------------
+#: Run against the candidate SITTING IN ITS PUBLISHED DIRECTORY, so
+#: ``Path(__file__).resolve().parent`` means during validation exactly what it
+#: will mean at runtime. Validating a lone copy in a temp dir is what let a
+#: sibling-less snapshot pass.
+_PROBE = r"""
+import ast, importlib.machinery, importlib.util, json, pathlib, sys
+path = sys.argv[1]
+expected_siblings = json.loads(sys.argv[2])
+here = pathlib.Path(path).resolve().parent
+
+src = pathlib.Path(path).read_text(encoding="utf-8")
+ast.parse(src, filename=path)
+
+missing = [n for n in expected_siblings if not (here / n).is_file()]
+if missing:
+    raise SystemExit("sibling modules missing beside the candidate: %s" % missing)
+
+loader = importlib.machinery.SourceFileLoader("bsq_candidate", path)
+spec = importlib.util.spec_from_loader("bsq_candidate", loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+parser = mod.build_parser()
+verbs = sorted(parser._subparsers._group_actions[0].choices)
+
+# Exercise the candidate's OWN sibling resolution, not our model of it. Every
+# `_load_*` helper is called; a helper that resolves a sibling by path fails
+# here if that sibling is absent or unloadable. `--help` reaches none of
+# these, which is why `--help` was worthless as a smoke test.
+loaded = []
+for name in sorted(dir(mod)):
+    if not name.startswith("_load_"):
+        continue
+    fn = getattr(mod, name)
+    if not callable(fn):
+        continue
+    try:
+        fn()
+    except TypeError:
+        continue          # takes arguments — not a zero-arg sibling loader
+    loaded.append(name)
+print(json.dumps({"verbs": verbs, "loaders": loaded,
+                  "siblings": sorted(expected_siblings)}))
+"""
+
+
+def _validate(candidate: Path, siblings: list[str] | None = None
+              ) -> tuple[str | None, list[str]]:
+    """Return ``(error_or_None, verbs)`` for a candidate file on disk.
+
+    Runs in a subprocess with bytecode writing OFF. That flag is load-bearing,
+    not tidiness: ``SourceFileLoader`` will happily execute a cached ``.pyc``,
+    and validating yesterday's bytecode while promoting today's source is a
+    green light for exactly the breakage this guards.
+    """
+    import subprocess
+
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    env.pop("PYTHONSTARTUP", None)
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _PROBE, str(candidate),
+             json.dumps(siblings if siblings is not None
+                        else sibling_modules(candidate))],
+            capture_output=True, text=True, timeout=120, env=env)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"could not run the validator: {exc}", []
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip().splitlines()
+        return "\n".join(err[-12:]) or f"validator exited {proc.returncode}", []
+    try:
+        verbs = json.loads(proc.stdout.strip().splitlines()[-1])["verbs"]
+    except (ValueError, IndexError, KeyError):
+        return "the validator produced no verb list", []
+    missing = [v for v in CORE_VERBS if v not in verbs]
+    if missing:
+        return (f"the candidate parses and builds, but core verbs are MISSING: "
+                f"{missing} — a truncated file can still be valid Python, so "
+                f"this is what a torn save looks like after ast.parse passes"), verbs
+    return None, verbs
+
+
+# --------------------------------------------------------------------------
+# refresh: promote a good candidate, keep the last good one otherwise
+# --------------------------------------------------------------------------
+def _stat_key(st: os.stat_result) -> list[int]:
+    return [st.st_size, st.st_mtime_ns]
+
+
+def _set_key(src: Path, names: list[str]) -> dict[str, list[int]] | None:
+    """(size, mtime_ns) for bsq AND every sibling, as one comparable key.
+
+    Keying the fast path on bsq alone was a real defect, found by p731 after
+    the cutover: editing `frontmatter.py` without touching `bsq` left the stat
+    of `bsq` unchanged, so the fast path answered "current", the sibling edit
+    was NEVER promoted, and `--bsq-status` cheerfully reported `in sync` while
+    the snapshot served stale bytes. Silent version skew — worse than the loud
+    breakage this launcher was built to stop, and invisible for the same
+    reason: the thing being checked was not the thing that changed.
+
+    Returns None if any member is unreadable, which forces the slow path.
+    """
+    out: dict[str, list[int]] = {}
+    for name in ["bsq"] + list(names):
+        path = src if name == "bsq" else src.parent / name
+        try:
+            out[name] = _stat_key(os.stat(path))
+        except OSError:
+            return None
+    return out
+
+
+def _report_rejection(rej: dict, home: Path, quiet: bool = False) -> None:
+    if quiet:
+        return
+    stamp = _read_json(home / "stamp")
+    say = lambda m: print(m, file=sys.stderr)  # noqa: E731
+    say("bsq: YOU ARE NOT RUNNING YOUR LATEST EDIT.")
+    say(f"     the candidate failed validation, so every session stays on the "
+        f"last good copy.")
+    say(f"     candidate : {rej.get('source', '?')}")
+    say(f"                 sha {str(rej.get('sha', '?'))[:12]}  rejected {rej.get('at', '?')}")
+    say(f"     running   : {_snapshot(home)}")
+    say(f"                 sha {str(stamp.get('sha', '?'))[:12]}  promoted {stamp.get('at', '?')}")
+    for line in str(rej.get("error", "")).splitlines():
+        say(f"     | {line}")
+    say("     fix it and run anything — the next bsq re-validates. Verdict now: "
+        "bsq --bsq-publish")
+
+
+def refresh(home: Path, src: Path, *, force: bool = False, quiet: bool = False,
+            settle_s: float | None = None) -> tuple[str, str]:
+    """Bring the snapshot up to date with ``src``.
+
+    Returns ``(outcome, detail)`` where outcome is one of ``current``,
+    ``promoted``, ``rejected``, ``in-flight``, ``no-source``.
+
+    ``settle_s`` overrides :data:`SETTLE_S`. It exists so a test can assert the
+    debounce without racing the scheduler: on a loaded host the gap between
+    writing a file and reaching this line is not bounded, and a test that
+    depends on it being under half a second is a test that goes red for
+    reasons that have nothing to do with the code.
+    """
+    snap = _snapshot(home)
+    try:
+        st = os.stat(src)
+    except OSError as exc:
+        # The tree moved, was deleted, or is on a branch without the file. The
+        # fleet keeps running; this is not a reason to take the bus down.
+        return "no-source", str(exc)
+
+    stamp = _read_json(home / "stamp")
+    if (not force and snap.exists() and stamp.get("set")
+            and stamp["set"] == _set_key(src, stamp.get("siblings") or [])):
+        return "current", ""
+
+    import fcntl
+    import tempfile
+
+    home.mkdir(parents=True, exist_ok=True)
+    lock = home / "lock"
+    lock.touch(exist_ok=True)
+    with open(lock, "r+") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            # Re-read under the lock: another session may have promoted the
+            # same candidate while we waited.
+            st = os.stat(src)
+            stamp = _read_json(home / "stamp")
+            if (not force and snap.exists() and stamp.get("set")
+                    and stamp["set"] == _set_key(src, stamp.get("siblings") or [])):
+                return "current", ""
+
+            window = SETTLE_S if settle_s is None else settle_s
+            newest = st.st_mtime
+            for _n in (stamp.get("siblings") or []):
+                try:
+                    newest = max(newest, os.stat(src.parent / _n).st_mtime)
+                except OSError:
+                    pass
+            if not force and (time.time() - newest) < window:
+                # Saved a moment ago: assume the writer is still streaming.
+                # Silent by design — this state is transient by construction
+                # and resolves itself at the next invocation. A validation
+                # FAILURE is never silent; see _report_rejection.
+                return "in-flight", "the source was modified moments ago"
+
+            data = src.read_bytes()
+            after = os.stat(src)
+            if _stat_key(after) != _stat_key(st):
+                # The file changed size/mtime across our own read — a save is
+                # in flight and what we hold is very likely a prefix. Say
+                # nothing: the next invocation sees the settled file. Silence
+                # is right here ONLY because the state is transient by
+                # construction; a validation failure is never silent.
+                return "in-flight", "the source changed while being read"
+
+            # The identity of a revision is the identity of the whole SET.
+            # A digest over bsq alone cannot tell two revisions apart when only
+            # a sibling changed, so both the "already current" and the "already
+            # rejected" shortcuts below would fire on the wrong evidence.
+            siblings = sibling_modules(src)
+            member_bytes: dict[str, bytes] = {"bsq": data}
+            missing_at_source = []
+            for name in siblings:
+                origin = src.parent / name
+                if not origin.is_file():
+                    missing_at_source.append(name)
+                    continue
+                try:
+                    member_bytes[name] = origin.read_bytes()
+                except OSError:
+                    missing_at_source.append(name)
+            digest = _sha(b"".join(
+                f"{n}\0".encode() + member_bytes[n]
+                for n in sorted(member_bytes)))
+            if (not force and snap.exists() and stamp.get("sha") == digest
+                    and not _verify_published(home, stamp.get("siblings") or [])):
+                # Same bytes, new mtime — a `git checkout` or `touch` of an
+                # unchanged file. Re-stamp so the fast path stops missing.
+                #
+                # `not force` and the completeness check are both load-bearing,
+                # and both were missing when this shortcut was first written.
+                # Without them the shortcut is unreachable-by-repair: a snapshot
+                # damaged on disk (the 10:05 cutover published bsq with no
+                # siblings) matched by sha, so `--bsq-publish` and
+                # `--bsq-install` BOTH answered "already current" and left the
+                # broken tree in place. A promoter that cannot repair is not a
+                # promoter. Caught by the install-time smoke on its first live
+                # run, which is the only reason it is not still here.
+                _write_json(home / "stamp", {
+                    **stamp, "stat": _stat_key(st),
+                    "set": _set_key(src, stamp.get("siblings") or [])})
+                return "current", ""
+
+            rej = _read_json(home / "rejected")
+            if not force and rej.get("sha") == digest and snap.exists():
+                # Already validated these exact bytes and they were bad. Do not
+                # burn 290ms per invocation re-proving it — but DO keep saying
+                # so, every time, until it is fixed.
+                _report_rejection(rej, home, quiet=quiet)
+                return "rejected", str(rej.get("error", ""))
+
+            # Stage the WHOLE revision — bsq plus every sibling it resolves
+            # by path — then publish it by renaming one symlink. A revision is
+            # never half-visible: readers see the old directory or the new one.
+            staged = _revs(home) / f"stage-{os.getpid()}-{digest[:12]}"
+            if staged.exists():
+                shutil_rmtree(staged)
+            staged.mkdir(parents=True)
+            try:
+                _write_bytes(staged / "bsq", data, 0o755)
+                for name in siblings:
+                    if name in member_bytes:
+                        _write_bytes(staged / name, member_bytes[name], 0o644)
+                if missing_at_source:
+                    err = (f"the candidate loads {missing_at_source} as sibling "
+                           f"modules but they are not in {src.parent}")
+                    payload = {"sha": digest, "source": str(src), "at": _now(),
+                               "error": err, "stat": _stat_key(st)}
+                    _write_json(home / "rejected", payload)
+                    if snap.exists():
+                        _report_rejection(payload, home, quiet=quiet)
+                    return "rejected", err
+
+                err, _verbs = _validate(staged / "bsq", siblings)
+                if err:
+                    payload = {"sha": digest, "source": str(src), "at": _now(),
+                               "error": err, "stat": _stat_key(st)}
+                    _write_json(home / "rejected", payload)
+                    if not snap.exists():
+                        # Nothing to fall back TO. This is the one case where
+                        # the launcher cannot protect anyone.
+                        return "rejected", err
+                    _report_rejection(payload, home, quiet=quiet)
+                    return "rejected", err
+
+                final = _revs(home) / digest[:16]
+                if final.exists():
+                    shutil_rmtree(final)
+                os.rename(staged, final)
+                staged = None
+                _publish(home, final)
+                bad = _verify_published(home, siblings)
+                if bad:
+                    # Should be unreachable: the same bytes validated a moment
+                    # ago in the staging dir. If it happens, the swap is wrong
+                    # and saying so is the only useful thing left to do.
+                    print(f"bsq: PUBLISHED SNAPSHOT IS INCOMPLETE — {bad}\n"
+                          f"     re-run: {sys.argv[0]} --bsq-install {src}",
+                          file=sys.stderr)
+            finally:
+                if staged is not None and staged.exists():
+                    shutil_rmtree(staged)
+
+            _write_json(home / "stamp", {
+                "sha": digest, "stat": _stat_key(st), "source": str(src),
+                "at": _now(), "bytes": len(data), "siblings": siblings,
+                "set": _set_key(src, siblings),
+                "rev": str(_revs(home) / digest[:16])})
+            _gc_revs(home)
+            try:
+                (home / "rejected").unlink()
+            except OSError:
+                pass
+            return "promoted", digest
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+# --------------------------------------------------------------------------
+# control flags (never forwarded to bsq)
+# --------------------------------------------------------------------------
+def _cmd_status(home: Path, src: Path | None) -> int:
+    snap = _snapshot(home)
+    stamp = _read_json(home / "stamp")
+    rej = _read_json(home / "rejected")
+    print(f"launcher : {Path(sys.argv[0]).resolve()}")
+    print(f"source   : {src if src else '(not configured)'}")
+    print(f"snapshot : {snap}{'' if snap.exists() else '  (MISSING)'}")
+    if stamp:
+        print(f"           sha {str(stamp.get('sha',''))[:12]}  promoted {stamp.get('at')}"
+              f"  {stamp.get('bytes')} bytes")
+    if src is not None:
+        try:
+            key = _set_key(src, stamp.get("siblings") or [])
+            fresh = bool(stamp.get("set")) and stamp["set"] == key
+            print(f"in sync  : {'yes' if fresh else 'NO — next bsq re-validates'}")
+            if not fresh and key and stamp.get("set"):
+                drifted = [n for n, v in key.items() if stamp["set"].get(n) != v]
+                print(f"           changed since promotion: {drifted}")
+        except OSError as exc:
+            print(f"in sync  : source unreadable ({exc})")
+    if rej:
+        print(f"rejected : sha {str(rej.get('sha',''))[:12]}  at {rej.get('at')}")
+        for line in str(rej.get("error", "")).splitlines():
+            print(f"           | {line}")
+    return 0
+
+
+def _cmd_publish(home: Path, src: Path | None) -> int:
+    if src is None:
+        print("bsq: no source configured — run `bsq --bsq-install <path-to-scripts/cli/bsq>`",
+              file=sys.stderr)
+        return 2
+    outcome, detail = refresh(home, src, force=True, quiet=True)
+    snap = _snapshot(home)
+    if outcome == "promoted":
+        print(f"promoted {src} -> {snap}  (sha {detail[:12]})")
+        return 0
+    if outcome == "current":
+        print(f"already current: {snap}")
+        return 0
+    if outcome == "in-flight":
+        print(f"bsq: {src} is being written right now — nothing promoted, "
+              f"run this again when the save settles", file=sys.stderr)
+        return 1
+    if outcome == "no-source":
+        print(f"bsq: cannot read {src}: {detail}", file=sys.stderr)
+        return 2
+    print(f"bsq: REFUSED to promote {src} — the fleet stays on {snap}",
+          file=sys.stderr)
+    for line in detail.splitlines():
+        print(f"  | {line}", file=sys.stderr)
+    return 1
+
+
+def _cmd_install(home: Path, argv: list[str]) -> int:
+    """Point ~/.local/bin/bsq at a COPY of this launcher and seed the snapshot."""
+    import shutil
+    import tempfile
+
+    if not argv:
+        print("usage: bsq --bsq-install <path to the repo's scripts/cli/bsq> "
+              "[<install path, default ~/.local/bin/bsq>]", file=sys.stderr)
+        return 2
+    src = Path(argv[0]).expanduser().resolve()
+    dest = Path(argv[1]).expanduser() if len(argv) > 1 else Path.home() / ".local" / "bin" / "bsq"
+    if not src.is_file():
+        print(f"bsq: no such source file: {src}", file=sys.stderr)
+        return 2
+
+    home.mkdir(parents=True, exist_ok=True)
+    _atomic_write(home / "source", str(src) + "\n")
+
+    outcome, detail = refresh(home, src, force=True, quiet=True)
+    if outcome not in ("promoted", "current"):
+        print(f"bsq: NOT installing — {src} does not validate ({outcome}).",
+              file=sys.stderr)
+        for line in detail.splitlines():
+            print(f"  | {line}", file=sys.stderr)
+        return 1
+
+    # Smoke the PUBLISHED snapshot, not the source and not the staging copy.
+    # `--help` is worthless here: it is the one command guaranteed to touch no
+    # sibling module, which is why the first cutover looked clean while every
+    # frontmatter-reading verb was dead. _validate calls the candidate's own
+    # `_load_*` helpers, so this exercises the exact resolution that broke.
+    smoke_err, _ = _validate(_snapshot(home), sibling_modules(src))
+    if smoke_err:
+        print(f"bsq: NOT installing — the published snapshot at "
+              f"{_snapshot(home)} does not work:", file=sys.stderr)
+        for line in smoke_err.splitlines():
+            print(f"  | {line}", file=sys.stderr)
+        return 1
+
+    me = Path(__file__).resolve()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() or dest.is_symlink():
+        was = os.readlink(dest) if dest.is_symlink() else "(regular file)"
+        backup = home / f"previous-install-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+        if dest.is_symlink():
+            _atomic_write(backup, f"was a symlink -> {was}\n")
+        else:
+            shutil.copyfile(dest, backup)
+        print(f"previous {dest}: {was}  (recorded at {backup})")
+        dest.unlink()
+    fd, tmp = tempfile.mkstemp(dir=str(dest.parent), prefix=".bsq-install.")
+    os.close(fd)
+    shutil.copyfile(me, tmp)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, dest)
+    print(f"installed launcher : {dest}  (a copy of {me}, not a symlink)")
+    print(f"snapshot           : {_snapshot(home)}")
+    print(f"source             : {src}")
+    return 0
+
+
+def _cmd_where(home: Path, src: Path | None) -> int:
+    print(_snapshot(home))
+    return 0
+
+
+# --------------------------------------------------------------------------
+def main(argv: list[str]) -> int:
+    home = _home()
+    src = _source(home)
+
+    if argv and argv[0] in CONTROL_FLAGS:
+        flag, rest = argv[0], argv[1:]
+        if flag == "--bsq-status":
+            return _cmd_status(home, src)
+        if flag == "--bsq-publish":
+            return _cmd_publish(home, src)
+        if flag == "--bsq-install":
+            return _cmd_install(home, rest)
+        if flag == "--bsq-where":
+            return _cmd_where(home, src)
+
+    if src is not None and not os.environ.get("BSQ_NO_REFRESH"):
+        refresh(home, src)
+
+    snap = _snapshot(home)
+    if not snap.exists():
+        print(f"bsq: no published snapshot at {snap}.\n"
+              f"     bootstrap it with:  {sys.argv[0]} --bsq-install "
+              f"<repo>/scripts/cli/bsq", file=sys.stderr)
+        return 2
+    os.execv(sys.executable, [sys.executable, str(snap), *argv])
+    return 0  # unreachable
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

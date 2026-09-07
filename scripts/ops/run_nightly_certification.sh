@@ -53,23 +53,35 @@ TMPDIR="/home/www/bot-squad/data/bot-squad/_jobs/nightly-certification/scratch"
 mkdir -p "$TMPDIR"
 export TMPDIR
 
-# Measured (T-1046, second bug found by the ACTUAL routine): pointing pytest
-# itself at the long TMPDIR above breaks the worker suite's own socket-based
-# tests. pytest's `tmp_path` fixture nests under
-# "$TMPDIR/pytest-of-<user>/pytest-<N>/<test-name><idx>/...", and several
-# worker tests (test_worker_census.py, test_jobs.py's heartbeat test) bind a
-# REAL AF_UNIX socket under `tmp_path/data/_sock/worker.sock` — Linux caps a
-# unix socket path (`sun_path`) at 108 bytes, and the long TMPDIR above blew
-# through it, one 8-test batch of them failed with `OSError: AF_UNIX path
-# too long`, none of them touched by this ticket's own change.
-# `--basetemp=<PYTEST_TMP>` skips pytest's "pytest-of-<user>/pytest-<N>/"
-# wrapper (saves ~35 bytes) and PYTEST_TMP itself is kept short and
-# PID-unique — short because a long base is the whole problem, unique
-# because a SHARED short path across concurrent runs would just trade this
-# bug for T-1004's exact hazard (a race on a fixed path). Verified short
-# enough: with PYTEST_TMP this length, the worst offending test's full
-# socket path measured 75 bytes, 33 under the 108 cap.
-PYTEST_TMP="/tmp/tmux-1000/t1046-$$"
+# Measured (T-1046, two more bugs found by the ACTUAL routine, root-caused
+# by the R-0010 handler — not by inspection): pointing pytest itself at the
+# long TMPDIR above breaks worker tests two DIFFERENT ways, same root cause
+# (TMPDIR above sits under /home/www/bot-squad, which is both long AND an
+# ambient git repo):
+#   (a) pytest's `tmp_path` fixture nests under
+#       "$TMPDIR/pytest-of-<user>/pytest-<N>/<test-name><idx>/...", and
+#       several worker tests (test_worker_census.py, test_jobs.py's
+#       heartbeat test) bind a REAL AF_UNIX socket under
+#       `tmp_path/data/_sock/worker.sock` — Linux caps a unix socket path
+#       (`sun_path`) at 108 bytes; the long TMPDIR blew through it.
+#   (b) test_t1019_provenance_gate.py's "no git reachable" tests build a
+#       throwaway dir under tmp_path and assert the provenance gate's repo
+#       walk finds NOTHING above it. Nested under the long TMPDIR, that walk
+#       instead finds the ambient repo at /home/www/bot-squad — the gate
+#       goes SILENT (a clean pass) rather than loud, on a test that exists
+#       to prove it fires.
+# `--basetemp=<PYTEST_TMP>` where PYTEST_TMP is short, PID-unique, AND has
+# no git repo above it fixes both at once: short (skips pytest's
+# "pytest-of-<user>/pytest-<N>/" wrapper too, ~35 more bytes saved — the
+# worst offending socket path measured 75 bytes against the 108 cap) and
+# rooted under plain /tmp, which is not inside any repo. PID-unique because
+# a SHARED short path across concurrent runs would trade this bug for
+# T-1004's exact hazard (a race on a fixed path). /tmp/claude-1000 specifically
+# (not /tmp/tmux-1000, which is tmux's own runtime dir and not ours to use)
+# because it's in the worker's systemd ReadWritePaths and nothing sits above
+# it in a repo. Verified against all 10 previously-failing tests directly,
+# not just inferred from a passing mktemp probe.
+PYTEST_TMP="/tmp/claude-1000/t1046-$$"
 mkdir -p "$PYTEST_TMP"
 
 exec > >(tee -a "$LOG") 2>&1

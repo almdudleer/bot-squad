@@ -99,7 +99,11 @@ if argv[:1] == ["tag"]:
     sys.exit(0 if os.environ.get("STUB_TAG_RC", "0") == "0" else 1)
 
 if argv[:1] == ["images"]:
-    print(os.environ.get("STUB_CERT_TAGS", ""), end="")
+    pattern = argv[-1] if argv else ""
+    if "pinned" in pattern:
+        print(os.environ.get("STUB_PINNED_TAGS", ""), end="")
+    else:
+        print(os.environ.get("STUB_CERT_TAGS", ""), end="")
     sys.exit(0)
 
 if argv[:1] == ["rmi"]:
@@ -132,6 +136,7 @@ def _run(tmp_path, **env):
         "STUB_CREATED": CREATED,
         "STUB_ENV": REAL_IMAGE_ENV,
         "STUB_CERT_TAGS": "",
+        "STUB_PINNED_TAGS": "",
     })
     child.update({k: str(v) for k, v in env.items()})
     proc = subprocess.run(["bash", str(script)], capture_output=True, text=True,
@@ -263,6 +268,68 @@ def test_reclamation_is_announced_rather_than_silent(tmp_path):
         "20260901T101010Z", "20260902T101010Z", "20260903T101010Z",
         "20260904T101010Z", "20260905T101010Z"))
     assert "RECLAIMING bot-squad-api:cert-20260901T101010Z" in proc.stdout
+    assert "no longer re-runnable" in proc.stdout
+
+
+# --- T-1027: verify-isolated's pinned- window, reclaimed by the SAME loop ---
+#
+# cert- is the deploy's own tag; pinned- is verify-isolated's (T-1005 Arm A,
+# retained before every certification run — T-1027 moved it off cert- so a
+# certification could no longer contaminate the T-1001/T-1005 survival
+# check's own observable). "Only the deploy reclaims, never a measurement
+# tool" (T-1005) still holds: the deploy sweeps BOTH namespaces, on two
+# independent windows, so neither can crowd the other out.
+
+def _pinned_tags(*stamps):
+    return "".join(
+        f"bot-squad-api:pinned-{s}-abcdef012345 bbbb{i}\n"
+        for i, s in enumerate(stamps))
+
+
+def test_it_reclaims_the_pinned_window_independently_of_cert(tmp_path):
+    older = _pinned_tags("20260901T101010Z", "20260902T101010Z",
+                        "20260903T101010Z", "20260904T101010Z",
+                        "20260905T101010Z")
+    proc, calls = _run(tmp_path, STUB_PINNED_TAGS=older)
+    assert proc.returncode == 0, proc.stderr
+    assert _removed(calls) == [
+        "bot-squad-api:pinned-20260902T101010Z-abcdef012345",
+        "bot-squad-api:pinned-20260901T101010Z-abcdef012345",
+    ]
+
+
+def test_a_pinned_set_inside_the_window_loses_nothing(tmp_path):
+    """The green control for the test above."""
+    proc, calls = _run(tmp_path, STUB_PINNED_TAGS=_pinned_tags(
+        "20260904T101010Z", "20260905T101010Z"))
+    assert proc.returncode == 0, proc.stderr
+    assert _removed(calls) == []
+
+
+def test_a_full_cert_window_does_not_touch_pinned_and_vice_versa(tmp_path):
+    """The two windows are independent counts, not a shared budget — a
+    reclaim in one namespace must not consume or skip the other's."""
+    proc, calls = _run(
+        tmp_path,
+        STUB_CERT_TAGS=_cert_tags("20260901T101010Z", "20260902T101010Z",
+                                  "20260903T101010Z", "20260904T101010Z",
+                                  "20260905T101010Z"),
+        STUB_PINNED_TAGS=_pinned_tags("20260901T101010Z", "20260902T101010Z",
+                                     "20260903T101010Z"),
+    )
+    assert proc.returncode == 0, proc.stderr
+    removed = _removed(calls)
+    assert "bot-squad-api:cert-20260901T101010Z-abcdef012345" in removed
+    assert "bot-squad-api:cert-20260902T101010Z-abcdef012345" in removed
+    # 3 pinned tags is exactly the PINNED_KEEP window — nothing to reclaim yet.
+    assert not any("pinned" in r for r in removed)
+
+
+def test_pinned_reclamation_is_announced_too(tmp_path):
+    proc, _ = _run(tmp_path, STUB_PINNED_TAGS=_pinned_tags(
+        "20260901T101010Z", "20260902T101010Z", "20260903T101010Z",
+        "20260904T101010Z", "20260905T101010Z"))
+    assert "RECLAIMING bot-squad-api:pinned-20260901T101010Z" in proc.stdout
     assert "no longer re-runnable" in proc.stdout
 
 

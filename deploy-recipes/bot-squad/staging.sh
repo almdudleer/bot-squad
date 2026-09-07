@@ -176,6 +176,11 @@ echo "[bot-squad/staging] building image stamped GIT_SHA=$GIT_SHA"
 # >>> T-1001-IMAGE-RETAIN (extracted verbatim by
 #     worker/tests/test_t1001_image_retain.py — keep the markers)
 RETAIN_KEEP=3
+# T-1027: verify-isolated's own retention (bot-squad-api:pinned-*) shares this
+# reclaimer — "only the deploy reclaims, never a measurement tool" (T-1005) —
+# but counts against its OWN window, so certification traffic cannot crowd
+# out the deploy's cert- tags or vice versa.
+PINNED_KEEP=3
 RETAIN_OLD_ID="$(docker image inspect bot-squad-api:latest --format '{{.Id}}' 2>/dev/null || true)"
 if [ -z "$RETAIN_OLD_ID" ]; then
     echo "[bot-squad/staging] T-1001: no outgoing bot-squad-api:latest to retain (first build on this host)"
@@ -214,15 +219,29 @@ else
     # Reclaim beyond the window — LOUDLY. Silent reclamation is the whole
     # defect: nobody noticed the afternoon's images going because nothing said
     # so. Never touch the image :latest currently points at.
-    docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' 'bot-squad-api:cert-*' 2>/dev/null \
-        | sort -r | tail -n +$((RETAIN_KEEP + 1)) \
-        | while read -r _old _oldid; do
-              case "$RETAIN_OLD_ID" in
-                  *"$_oldid"*) echo "[bot-squad/staging] T-1001: keeping $_old — it is the outgoing image"; continue ;;
-              esac
-              echo "[bot-squad/staging] T-1001: RECLAIMING $_old — beyond the $RETAIN_KEEP-deploy retention window; measurements naming it are no longer re-runnable"
-              docker rmi "$_old" >/dev/null 2>&1 || true
-          done || true
+    #
+    # T-1027: two independent windows, one function. bot-squad-api:cert-* is
+    # this deploy's own tag; bot-squad-api:pinned-* is verify-isolated's
+    # (T-1005 Arm A, retained at MEASUREMENT time, before every certification
+    # run). Both must be swept by the SAME reclaimer — a measurement tool
+    # that deletes images can destroy what it was asked to preserve — but
+    # each counts against its own window so certification traffic (many runs
+    # a day) cannot crowd out the deploy's window (one per deploy) or vice
+    # versa.
+    _t1001_reclaim_window() {
+        local glob="$1" keep="$2" label="$3"
+        docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' "$glob" 2>/dev/null \
+            | sort -r | tail -n +$((keep + 1)) \
+            | while read -r _old _oldid; do
+                  case "$RETAIN_OLD_ID" in
+                      *"$_oldid"*) echo "[bot-squad/staging] T-1001: keeping $_old — it is the outgoing image"; continue ;;
+                  esac
+                  echo "[bot-squad/staging] T-1001: RECLAIMING $_old — beyond the $keep-$label retention window; measurements naming it are no longer re-runnable"
+                  docker rmi "$_old" >/dev/null 2>&1 || true
+              done || true
+    }
+    _t1001_reclaim_window 'bot-squad-api:cert-*' "$RETAIN_KEEP" "deploy"
+    _t1001_reclaim_window 'bot-squad-api:pinned-*' "$PINNED_KEEP" "certification"
 fi
 # <<< T-1001-IMAGE-RETAIN
 

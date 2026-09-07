@@ -6583,13 +6583,12 @@ def _image_retain_tag(reference: str, info: dict, prefix: str = "cert"):
     T-1027: ``prefix`` exists because ``cert-`` is not just storage — it is
     the OBSERVABLE the T-1001/T-1005 two-deploy survival check reads, which
     depends on the first ``cert-`` tag to appear being one a DEPLOY wrote.
-    ``_image_retain_tag`` is a pure function of the image, so a hand retain
-    that also wrote ``cert-`` would compute the SAME tag a deploy would later
-    write — accurate, idempotent, and indistinguishable from the deploy's own
-    retention, which is exactly what would mask a broken one. Callers writing
-    into the namespace the instrument reads (``verify-isolated``, the deploy)
-    keep the default; callers retaining by hand (``bsq build-api``) pass a
-    different prefix so the two can never collide.
+    ``cert-`` is now DEPLOY-EXCLUSIVE: only the deploy's own
+    T-1001-IMAGE-RETAIN block uses the default. Every other caller passes its
+    own prefix so nothing else can land in the namespace the survival check
+    reads — ``verify-isolated`` retains under ``pinned-`` (see
+    ``_pin_image_in_cmd`` for why not a name implying a verdict), hand
+    retention via ``bsq build-api`` under ``handretain-``.
     """
     repo = _image_repo(reference)
     if repo is None:
@@ -6616,9 +6615,8 @@ def _retain_image(reference: str, info: dict, prefix: str = "cert"):
     precisely as fragile as every certification taken before this existed.
 
     ``prefix`` (T-1027): see ``_image_retain_tag`` — the default ``"cert"`` is
-    the namespace the deploy and ``verify-isolated`` write and the survival
-    check reads; a caller retaining for its own sake, not as a certification,
-    must pass a different one.
+    now DEPLOY-EXCLUSIVE, the namespace the survival check reads. Every other
+    caller passes its own prefix.
     """
     tag = _image_retain_tag(reference, info, prefix=prefix)
     if not tag:
@@ -6675,7 +6673,18 @@ def _pin_image_in_cmd(cmd: list, explicit: str):
     # suite is still going would otherwise orphan the very image this
     # certification is about, and the run would finish reporting an id nobody
     # can inspect.
-    tag, err = _retain_image(ref, info)
+    #
+    # T-1027 — "pinned-", not "cert-" and not "verified-". Two reasons: (1)
+    # cert- is now the T-1001/T-1005 survival check's own observable, deploy-
+    # exclusive, and every real certification run would otherwise write into
+    # it just by existing (measured: 11 certifications in 2 minutes minted a
+    # SECOND, unattributed cert- tag on 2026-09-06). (2) the tag is minted
+    # HERE, BEFORE the run — at this point nobody knows whether the suite
+    # passes, so a name claiming a verdict ("verified-") would be a
+    # measurement claim the tag cannot back up, indistinguishable between a
+    # green run and a red one. "pinned-" says only what is true at mint time:
+    # this image was pinned for a measurement.
+    tag, err = _retain_image(ref, info, prefix="pinned")
     env = (f"verify-isolated: ENVIRONMENT {ref} = {info['id']} "
            f"(created {info['created']})")
     if tag:

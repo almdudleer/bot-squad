@@ -19,6 +19,13 @@ THE ORDERING IS STRUCTURAL, NOT A CONVENTION. The retain lives inside
 "retained before the run" cannot drift to "retained after" without the pin
 drifting with it, and a rebuild landing mid-suite cannot orphan the image the
 run is about.
+
+T-1027: this arm tags under `pinned-`, not `cert-`. `cert-` became the
+T-1001/T-1005 two-deploy survival check's own observable — a name every real
+certification would otherwise write into just by running — and the tag is
+minted HERE, before the run, when nobody yet knows whether the suite passes,
+so a name implying a verdict (`verified-`) would be a claim the tag cannot
+back up. `pinned-` says only what is true at mint time.
 """
 from __future__ import annotations
 
@@ -39,7 +46,7 @@ REAL_ID = ("sha256:ed6e988565481254409d0d1cc8238e24d29e01f58465baa45c7b4ad8"
            "d9e4b17f")
 REAL_CREATED = "2026-09-06T17:51:32.664462466Z"
 REAL_SHA = "760c0fe29136324a0146fbb82e1e15ebb1ae8712"
-EXPECTED_TAG = "bot-squad-api:cert-20260906T175132Z-760c0fe29136"
+EXPECTED_TAG = "bot-squad-api:pinned-20260906T175132Z-760c0fe29136"
 
 REAL_RECIPE = [
     "docker", "run", "--rm", "-e", "BUILD_AT_IMPORT=0",
@@ -182,11 +189,16 @@ def test_the_repository_half_of_a_reference(ref, expect):
 
 def test_a_bare_id_falls_back_to_the_image_own_repo_tags():
     """Someone who passes an id has given us no repository — take the image's
-    own, rather than inventing one or silently skipping the retain."""
+    own, rather than inventing one or silently skipping the retain.
+
+    T-1027: this calls `_image_retain_tag` directly, with no `prefix` — the
+    bare DEFAULT, which is `cert-`, deploy-exclusive. Not the same claim as
+    the `_pin_image_in_cmd` tests above, which go through verify-isolated and
+    now expect `pinned-`."""
     tag = bsq._image_retain_tag("sha256:" + "e" * 64, {
         "id": REAL_ID, "created": REAL_CREATED, "git_sha": REAL_SHA,
         "repo_tags": ["bot-squad-api:latest"]})
-    assert tag == EXPECTED_TAG
+    assert tag == "bot-squad-api:cert-20260906T175132Z-760c0fe29136"
 
 
 def test_an_image_with_no_repository_anywhere_cannot_be_retained():
@@ -215,4 +227,4 @@ def test_an_unstamped_image_is_named_by_its_own_id(docker, monkeypatch):
                        '["PATH=/usr/bin", "BOT_SQUAD_GIT_SHA=unknown"]')
     bsq._pin_image_in_cmd(list(REAL_RECIPE), None)
     assert docker.tags == [[REAL_ID,
-                            "bot-squad-api:cert-20260906T175132Z-ed6e98856548"]]
+                            "bot-squad-api:pinned-20260906T175132Z-ed6e98856548"]]

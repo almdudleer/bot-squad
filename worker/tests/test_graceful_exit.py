@@ -593,6 +593,40 @@ def test_exit_handoff_never_wedges_on_a_session_that_ignores_it(tmp_path, seams)
     assert seams["calls"]["compact"] == []   # never, on this path
 
 
+def test_exit_handoff_timeout_notes_the_missing_handoff_on_the_ticket(tmp_path, seams):
+    """T-1055: a handoff that timed out used to leave ONLY a `log.warning` line —
+    a worker-process log nobody reads — as the record that ## Context was never
+    actually written. This suspend looks identical to a clean graceful-exit
+    (same `_suspend` call, same source) unless the ticket itself says otherwise."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="totest")
+    row = _row(sid, role="dev", cwd_repo=data.parent / "repo")
+    now = time.time()
+    assert GE.maybe_exit(cfg, "bot-squad", row, now=now, user_home="/home/x") is True
+    late = now + A.handoff_timeout_sec() + 60
+    assert GE.maybe_exit(cfg, "bot-squad", row, now=late,
+                         user_home="/home/x") is True
+    assert seams["calls"]["suspend"] == [sid]
+    body = (data / "bot-squad" / "backlog" / "T-0042-demo.md").read_text()
+    assert "## Progress" in body
+    assert sid in body
+    assert "never finished writing" in body
+
+
+def test_exit_handoff_write_in_time_leaves_no_death_note(tmp_path, seams):
+    """The twin negative: when the handoff DOES land in time, nothing about a
+    missing handoff is written to the ticket — the note is specific to the
+    timeout case, not stamped on every graceful exit."""
+    sid = "S-almdudleer-bot-squad-demo-p5"
+    cfg, data = _make_cfg(tmp_path, sid=sid, window="demo", task_id="T-0042",
+                          task_status="totest")
+    row = _row(sid, role="dev", cwd_repo=data.parent / "repo")
+    assert _exit_after_handoff(cfg, data, row, seams) is True
+    body = (data / "bot-squad" / "backlog" / "T-0042-demo.md").read_text()
+    assert "never finished writing" not in body
+
+
 def test_exit_handoff_kill_switch_restores_the_record_free_exit(tmp_path, seams,
                                                                 monkeypatch):
     monkeypatch.setenv("BOT_SQUAD_EXIT_HANDOFF", "0")

@@ -400,6 +400,16 @@ def _maybe_arm_exit_handoff(cfg: Any, slug: str, sid: str, meta: dict, md_path,
             log.warning("graceful_exit: %s never updated %s's ## Context within "
                         "the handoff window — exiting anyway (never wedge)",
                         sid, task_id)
+            # T-1055: that log line was the ONLY record — a worker-process log
+            # the stakeholder never reads. Put the same fact on the ticket
+            # itself: this suspend LOOKS like a clean graceful-exit (same
+            # suspend_source) but no ## Context was actually written.
+            sessions.note_ticket_death(
+                cfg, slug, task_id, "graceful-exit",
+                f"session {sid} was suspended (graceful-exit, work believed "
+                f"done) but never finished writing ## Context within the "
+                f"handoff window — no forward-state was recorded before it "
+                f"went idle.")
         _clear_exit_handoff(meta)
         sessions._write_session_metadata(md_path, meta, atomic=True)
         return None

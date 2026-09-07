@@ -2508,14 +2508,7 @@ _ROLE_FILES = {"dev": "dev.md", "tl": "teamlead.md", "teamlead": "teamlead.md",
                # T-0197: prod-TL and QA are first-class spawnable roles.
                "prod-teamlead": "prod-teamlead.md", "qa": "qa.md",
                # T-0478: user-conversation intake session role contract.
-               "user-conversation": "user-conversation.md",
-               # T-0943: the contract for a session holding ALL THREE roles —
-               # the one a project runs when it runs one. NOT a fourth role:
-               # `_role_from_window` never returns this, `_derive_role` never
-               # emits it, and `_roles_for` computes it from the held SET. It is
-               # keyed here because it is a contract FILE, and `bsq brief` needs
-               # a name to resolve.
-               "solo-session": "solo-session.md"}
+               "user-conversation": "user-conversation.md"}
 
 # `--role` choices for `spawn` / `cluster-launch` (T-0778 decision).
 #
@@ -2802,20 +2795,6 @@ def _role_from_window(window: str | None) -> str:
     return "dev"
 
 
-def _window_of_sid(sid: str | None) -> str:
-    """The window segment of a SID (``S-<user>-<window>-p<pane>``), or ``""``.
-
-    Same parse `_role_from_sid` performs; named so a caller that wants the
-    WINDOW (not the role) does not re-derive it. A SID that does not parse
-    yields the SID itself, which is what `_role_from_window` is already
-    tolerant of.
-    """
-    if not sid:
-        return ""
-    m = re.match(r"^S-[^-]+-(.*)-p\d+$", sid)
-    return m.group(1) if m else sid
-
-
 def _role_from_sid(sid: str | None) -> str:
     """Role of a session from its SID (``S-<user>-<window>-p<pane>``).
 
@@ -2829,124 +2808,6 @@ def _role_from_sid(sid: str | None) -> str:
         return "dev"
     m = re.match(r"^S-[^-]+-(.*)-p\d+$", sid)
     return _role_from_window(m.group(1) if m else sid)
-
-
-# T-0943: the MULTI-ROLE half of the mirror above.
-#
-# Canonical implementation: `worker/bot_squad_worker/sessions.py::roles_of`
-# (+ `declared_roles`, `roles_label`). Same reason for a copy as the
-# single-role derivation right above: bsq is stdlib-only and must not import
-# the worker tree. `worker/tests/test_bsq_role_derivation_mirror.py` drives
-# both through one table.
-#
-# The stakeholder's model, which is what makes the widening correct rather
-# than a special case: «в целом роли не должны быть такими жесткими [...] Если
-# одна сессия успевает все 3 — окей, хорошо», and «solo universal session
-# [...] in fact it's user-session, operator and dev all at once».
-_UNIVERSAL_WINDOW_ONLY_RE = re.compile(
-    r"^universal[-_]bsq[-_]session(?:[-_]|$)", re.IGNORECASE)
-
-FLUID_ROLES = ("user-conversation", "operator", "dev")
-SOLO_ROLES = FLUID_ROLES
-SOLO_ROLES_LABEL = "solo-session"
-
-# The stakeholder's names for the COMBINATIONS (2026-09-07). Mirror of
-# `sessions.ROLE_SET_LABELS`.
-# The two combination windows that read BACK to their set. Mirror of
-# `sessions._ROLE_COMBO_WINDOWS`. Both already derive role `operator` (they end
-# in `operator`), so this only widens the SET.
-_ROLE_COMBO_WINDOWS = {
-    "talking_operator": ("operator", "user-conversation"),
-    "talking-operator": ("operator", "user-conversation"),
-    "working_operator": ("operator", "dev"),
-    "working-operator": ("operator", "dev"),
-}
-
-ROLE_SET_LABELS = {
-    frozenset(SOLO_ROLES): SOLO_ROLES_LABEL,
-    frozenset({"operator", "user-conversation"}): "talking-operator",
-    frozenset({"operator", "dev"}): "working-operator",
-    frozenset({"operator"}): "pure-operator",
-    frozenset({"user-conversation"}): "attendant",
-}
-
-
-def _declared_roles(meta: dict | None) -> tuple[str, ...] | None:
-    """The `roles:` a session declared on its md, or None when it declared none.
-
-    `roles: []` is an explicit tombstone (holds nothing) and is NOT None —
-    mirrors `sessions.declared_roles`.
-    """
-    m = meta or {}
-    if "roles" not in m:
-        return None
-    raw = m.get("roles")
-    if raw is None:
-        return None
-    if isinstance(raw, str):
-        t = raw.strip()
-        if t in ("", "~"):
-            return None
-        if t.startswith("[") and t.endswith("]"):
-            t = t[1:-1]
-        items = [x.strip().strip("'\"") for x in t.split(",")]
-    else:
-        try:
-            items = [str(x).strip() for x in raw]
-        except TypeError:
-            return None
-    return tuple(dict.fromkeys(x for x in items if x and x != "~"))
-
-
-def _roles_for(window: str | None, meta: dict | None = None) -> tuple[str, ...]:
-    """Every role a session holds. Mirror of `sessions.roles_of`."""
-    declared = _declared_roles(meta)
-    if declared is not None:
-        return declared
-    stored = str((meta or {}).get("role") or "").strip()
-    primary = stored if stored and stored != "~" else _role_from_window(window)
-    w = (window or "").strip()
-    if primary == "user-conversation" and _UNIVERSAL_WINDOW_ONLY_RE.match(w):
-        return SOLO_ROLES
-    if primary == "operator":
-        combo = _ROLE_COMBO_WINDOWS.get(w.lower())
-        if combo:
-            return combo
-    return (primary,)
-
-
-def _roles_label(roles) -> str:
-    """Mirror of `sessions.roles_label` — what the held SET is called."""
-    r = tuple(roles or ())
-    if not r:
-        return "none"
-    named = ROLE_SET_LABELS.get(frozenset(r))
-    if named:
-        return named
-    if len(r) == 1:
-        return r[0]
-    return "+".join(r)
-
-
-def _contract_files_for(roles) -> list[str]:
-    """Contract filenames `bsq brief` prints for a held role set.
-
-    A holder of all three gets `bot-squad.md` — which names the three roles,
-    the routing and the escalation rule — FOLLOWED BY its primary role's full
-    contract, so the preface never becomes a correction sitting on top of a
-    body that still says the opposite. The other two contracts stay one
-    `bsq brief --role <role>` away rather than tripling every boot.
-    """
-    r = tuple(roles or ())
-    if not r:
-        return [_ROLE_FILES["dev"]]
-    files: list[str] = []
-    if set(r) == set(SOLO_ROLES):
-        files.append(_ROLE_FILES[SOLO_ROLES_LABEL])
-    primary = _ROLE_FILES.get(r[0], "dev.md")
-    if primary not in files:
-        files.append(primary)
-    return files
 
 
 def _fm_list(raw) -> list[str]:
@@ -2972,45 +2833,10 @@ def cmd_brief(args) -> None:
     data = Path(BOT_SQUAD) / "data" / slug
     sid = my_sid()
     role = _role_from_sid(sid)
+    role_file = _ROLE_FILES.get(role, "dev.md")
 
-    # T-0943: a session holds a SET of roles. Read the md's own `roles:`
-    # declaration (the ticket's "sessions DECLARE roles to the system") before
-    # falling back to the window derivation, so `bsq brief` reports what this
-    # session actually holds rather than the one role its window is named for.
-    md_for_roles = (data / "sessions" / f"{sid}.md") if sid else None
-    fm_for_roles: dict = {}
-    if md_for_roles is not None and md_for_roles.exists():
-        try:
-            fm_for_roles = dict(read_frontmatter(md_for_roles) or {})
-        except Exception:
-            fm_for_roles = {}
-    window_for_roles = str(fm_for_roles.get("window") or "").strip() or (
-        _window_of_sid(sid) if sid else "")
-    roles = _roles_for(window_for_roles, fm_for_roles)
-    label = _roles_label(roles)
-
-    # `--role X` prints X's contract instead. It is the pull-verb the
-    # bot-squad contract points at: a holder of three roles boots with its
-    # primary one and fetches the others when the work calls for them, rather
-    # than paying for all three every time.
-    want = (getattr(args, "role", None) or "").strip()
-    if want:
-        if want not in _ROLE_FILES:
-            print(f"unknown role {want!r} — choices: "
-                  f"{', '.join(sorted(_ROLE_FILES))}")
-            return
-        role_files = [_ROLE_FILES[want]]
-    else:
-        role_files = _contract_files_for(roles)
-
-    print(f"=== BRIEF: {slug} === role: {label.upper()}"
+    print(f"=== BRIEF: {slug} === role: {role.upper()}"
           + (f"  ·  {sid}" if sid else ""))
-    if len(roles) > 1:
-        print(f"ROLES YOU HOLD: {', '.join(roles)} — the system routes each of "
-              f"them HERE. There is nobody else holding them, so there is "
-              f"nobody to hand their work to; `bsq team status` says who is "
-              f"actually live. Shed one deliberately with `bsq bud dev` / "
-              f"`bsq bud operator`.")
     provider = _project_provider_default()
     print(f"Project agent-provider default: {provider}. Ordinary `bsq spawn` "
           "must inherit it; use `--provider` only for a deliberate override.")
@@ -3024,8 +2850,7 @@ def cmd_brief(args) -> None:
 
     _emit("PRODUCT", data / "vision" / "product.md")
     _emit("TEAM PROTOCOL", data / "vision" / "team_protocol.md")
-    for role_file in role_files:  # T-0198: SSOT
-        _emit(f"YOUR ROLE CONTRACT ({role_file})", _roles_ssot_dir() / role_file)
+    _emit(f"YOUR ROLE CONTRACT ({role_file})", _roles_ssot_dir() / role_file)  # T-0198: SSOT
 
     # Bindings from the session md (primary + extras).
     if sid:
@@ -3649,53 +3474,6 @@ def _bud_morph(slug: str, sid: str, role: str, task_id: str | None = None) -> di
     return post("morph_session", params)
 
 
-def _bud_take_role(slug: str, sid: str | None, role: str) -> None:
-    """The deflation half of :func:`_bud_shed_role` — the parent takes a role
-    BACK (`bsq bud absorb`). Same best-effort-and-loud contract."""
-    if not sid:
-        return
-    try:
-        res = post("declare_roles", {"slug": slug, "sid": sid, "add": role})
-    except WorkerError as exc:
-        print(f"\nWARNING: you absorbed the work, but this session does not read "
-              f"as holding `{role}` — `declare_roles` was refused ({exc}). Its "
-              f"nudges will not reach you until you run `bsq role take {role}`.",
-              file=sys.stderr)
-        return
-    print(f"you now hold: {', '.join(res.get('roles') or []) or '(nothing)'}"
-          f"   ->   {res.get('label')}")
-
-
-def _bud_shed_role(slug: str, sid: str | None, role: str) -> None:
-    """T-0943: budding is TOTAL — record that the parent no longer holds ``role``.
-
-    Stakeholder: «нет ситуации когда оператор делает что-то сам, а что-то
-    помощник, как только отпочковывает, сразу же начинает только всё
-    делегировать». The bud takes the role; the parent must STOP being routed
-    that role's work, or the split is nominal — the drive nudges and the task
-    nudges would keep arriving here beside the bud they now belong to.
-
-    Best-effort AND LOUD. The declaration is a worker action, so it is
-    unavailable until this code is deployed; refusing to bud on that would
-    break the verb for every live session in the meantime, and silently
-    skipping it would leave the parent believing it shed a role it still
-    holds. So it prints exactly what did not happen and what to run.
-    """
-    if not sid:
-        return
-    try:
-        res = post("declare_roles", {"slug": slug, "sid": sid, "drop": role})
-    except WorkerError as exc:
-        print(f"\nWARNING: the bud was created, but this session still reads as "
-              f"holding `{role}` — `declare_roles` was refused ({exc}). Until "
-              f"that lands you will keep receiving that role's nudges beside "
-              f"the bud. Re-run `bsq role drop {role}` once it is available.",
-              file=sys.stderr)
-        return
-    print(f"you now hold: {', '.join(res.get('roles') or []) or '(nothing)'}"
-          f"   ->   {res.get('label')}")
-
-
 def cmd_bud_dev(args) -> None:
     """L0 -> L1: hand the task you are holding to a DEV bud, then narrow back
     to the conversation.
@@ -3762,13 +3540,8 @@ def cmd_bud_dev(args) -> None:
                   file=sys.stderr)
         raise
 
-    # T-0943: the dev role went WITH the task. Budding is total — after this
-    # the parent delegates all work and writes no code itself.
-    _bud_shed_role(slug, sid, "dev")
-
-    print(f"\nthe bud owns {task} and exits when it closes; you never exit. "
-          f"You have shed the dev role with it: delegate the work from here on, "
-          f"do not write code yourself.")
+    print(f"\nyou are now role=user-conversation (task shed — the bud owns "
+          f"{task} and exits when it closes; you never exit).")
     print("Go back to the user: record requests, dispatch, review. "
           "`bsq bud` to re-read the ladder.")
 
@@ -3787,11 +3560,6 @@ def cmd_bud_operator(args) -> None:
         print(f"no operator budded — {res.get('reason')}")
         return
     print(f"✔ {res.get('reason')}")
-
-    # T-0943: the drive goes with the operator role — «budding в оператора, на
-    # которого перейдет драйв». Shedding it here is what moves the re-drive
-    # tick's continue-vs-respawn answer, and the drive nudges, onto the bud.
-    _bud_shed_role(slug, sid, "operator")
 
     # The parent narrows to the conversation only if it is still carrying a
     # dev task; an operator bud does not take that task, so this is a no-op for
@@ -3822,10 +3590,6 @@ def cmd_bud_absorb(args) -> None:
     # never bind a same-numbered ticket from another project.
     _slug, tid, _path = resolve_ticket_ref(task, slug, verb="bud absorb")
     res = _bud_morph(slug, sid, "dev", tid)
-    # T-0943: taking the work back means taking the dev ROLE back — otherwise
-    # the ticket's own nudges and pause warnings still route to the bud that no
-    # longer exists.
-    _bud_take_role(slug, sid, "dev")
     print(f"absorbed {tid}: you are now role={res.get('role')} holding it. "
           f"Read the ticket and build — `bsq bud dev {tid}` hands it off again "
           f"if the user starts queueing requests.")
@@ -4170,65 +3934,6 @@ def _my_pane_fields() -> "tuple[str | None, str | None]":
         return window, cwd
     except (OSError, subprocess.SubprocessError):
         return None, None
-
-
-def _role_line(res: dict) -> str:
-    roles = res.get("roles") or []
-    label = res.get("label") or "none"
-    return (f"roles: {', '.join(roles) or '(none)'}   ->   {label}")
-
-
-def cmd_role(args) -> None:
-    """T-0943: DECLARE the roles this session holds — the write side of the
-    role-based routing.
-
-    «И в итоге сессии должны сообщать просто эти роли системе, и система должна
-    в ту сессию, которая выполняет роль, давать правильный guidance.»
-
-    `show` reads what you hold and what that combination is CALLED (his
-    vocabulary: solo-session / talking operator / working operator / pure
-    operator / attendant / dev). `take` / `drop` adjust the set against the md
-    rather than against a snapshot, so two of them cannot race. `set` replaces
-    it outright — `bsq role set ''` writes the explicit "I hold nothing"
-    tombstone.
-    """
-    slug = resolve_slug()
-    sid = require_sid(getattr(args, "sid", None))
-    sub = getattr(args, "sub", "show")
-
-    if sub == "show":
-        # Pure read — no write verb for a question.
-        data = Path(BOT_SQUAD) / "data" / slug
-        md = data / "sessions" / f"{sid}.md"
-        fm = {}
-        if md.exists():
-            try:
-                fm = dict(read_frontmatter(md) or {})
-            except Exception:
-                fm = {}
-        window = str(fm.get("window") or "").strip() or _window_of_sid(sid)
-        roles = _roles_for(window, fm)
-        print(_role_line({"roles": list(roles), "label": _roles_label(roles)}))
-        if fm.get("roles") is None:
-            print("(derived from the window — this session has not DECLARED a "
-                  "set; `bsq role set <a,b>` records one)")
-        if len(roles) > 1:
-            print("Every one of those routes HERE. There is nobody else holding "
-                  "them, so there is nobody to hand their work to.")
-        return
-
-    params = {"slug": slug, "sid": sid}
-    if sub == "take":
-        params["add"] = args.role
-    elif sub == "drop":
-        params["drop"] = args.role
-    else:  # set
-        params["roles"] = args.roles
-    res = post("declare_roles", params)
-    print(_role_line(res))
-    prev = res.get("previous") or []
-    if prev != (res.get("roles") or []):
-        print(f"(was: {', '.join(prev) or '(none)'})")
 
 
 def cmd_morph(args) -> None:
@@ -9738,10 +9443,6 @@ def build_parser() -> argparse.ArgumentParser:
     # brief
     br = sub.add_parser("brief",
                         help="print full orientation on demand (product + protocol + role + bindings) — T-0203")
-    br.add_argument("--role", choices=_SPAWNABLE_ROLES,
-                    help="print THIS role's contract instead of your own — how "
-                         "a session holding several roles pulls the other "
-                         "contracts on demand (T-0943)")
     br.set_defaults(func=cmd_brief)
 
     # compact
@@ -9841,29 +9542,6 @@ def build_parser() -> argparse.ArgumentParser:
                      help="assignment kind (default: task)")
     awr.add_argument("--sid", help="session SID (default: derived from tmux)")
     awr.set_defaults(func=cmd_assignment_write_result)
-
-    # role (T-0943) — DECLARE the set of roles this session holds
-    rl = sub.add_parser(
-        "role",
-        help="declare/inspect the SET of roles this session holds — the system "
-             "routes notifications and guidance by role, not by session (T-0943)")
-    rl_sub = rl.add_subparsers(dest="sub")
-    rls = rl_sub.add_parser("show", help="what you hold, and what that combination is called")
-    rls.add_argument("--sid", help="session SID (default: derived from tmux)")
-    rls.set_defaults(func=cmd_role)
-    rlt = rl_sub.add_parser("take", help="add a role to the set you hold")
-    rlt.add_argument("role", help="role to take")
-    rlt.add_argument("--sid", help="session SID (default: derived from tmux)")
-    rlt.set_defaults(func=cmd_role)
-    rld = rl_sub.add_parser("drop", help="give a role up (budding does this for you)")
-    rld.add_argument("role", help="role to drop")
-    rld.add_argument("--sid", help="session SID (default: derived from tmux)")
-    rld.set_defaults(func=cmd_role)
-    rlx = rl_sub.add_parser("set", help="replace the whole set ('' = the explicit no-roles tombstone)")
-    rlx.add_argument("roles", help="comma-separated roles, or '' for none")
-    rlx.add_argument("--sid", help="session SID (default: derived from tmux)")
-    rlx.set_defaults(func=cmd_role)
-    rl.set_defaults(func=cmd_role, sub="show")
 
     # morph (T-0509, M11/F11.2) — morph THIS user session's role in place
     mo = sub.add_parser(

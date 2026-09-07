@@ -3318,10 +3318,6 @@ def _action_peer_send(params: dict[str, Any]) -> dict[str, Any]:
     result = _is.send(
         cfg, delivery_slug, params["from_sid"], to, params["text"],
         user=params.get("user"),
-        # T-0943: a DECLARED block (T-0977) addressed to a role nobody holds is
-        # refused rather than reported as delivered — the sender is telling the
-        # watchdog it is stopped until an answer that can never arrive.
-        blocked=bool(params.get("blocked")),
     )
     # T-0827: an over-cap message is refused whole rather than delivered
     # truncated, and the CLI caller is the one that can act on it. Raised
@@ -5920,53 +5916,6 @@ _MORPH_SESSION_ALLOWED = _MORPH_SESSION_REQUIRED | {
 }
 
 
-_DECLARE_ROLES_REQUIRED = {"slug", "sid"}
-_DECLARE_ROLES_ALLOWED = _DECLARE_ROLES_REQUIRED | {
-    "roles", "add", "drop", "claude_uuid",
-}
-
-
-def _action_declare_roles(params: dict[str, Any]) -> dict[str, Any]:
-    """T-0943: a session DECLARES the set of roles it holds.
-
-    «И в итоге сессии должны сообщать просто эти роли системе, и система должна
-    в ту сессию, которая выполняет роль, давать правильный guidance.» This is
-    the write side of :func:`sessions.roles_of`, which every role-based route
-    reads.
-
-    Required params: slug, sid. Then EITHER ``roles`` (the full set — ``[]`` is
-    the explicit "I hold nothing" tombstone) OR ``add``/``drop`` (adjust the set
-    on disk). Optional: claude_uuid, to resolve a renamed md.
-
-    Returns ``{ok, sid, roles, label, previous}``. ``tmux_only`` — like
-    ``morph_session`` it writes only this session's OWN SessionMd frontmatter.
-    """
-    extra = set(params) - _DECLARE_ROLES_ALLOWED
-    if extra:
-        raise ActionError(f"declare_roles got unexpected params: {sorted(extra)}")
-    missing = _DECLARE_ROLES_REQUIRED - set(params)
-    if missing:
-        raise ActionError(
-            f"declare_roles missing required params: {sorted(missing)}")
-
-    def _as_list(v):
-        if v is None:
-            return None
-        if isinstance(v, str):
-            return [x.strip() for x in v.split(",") if x.strip()]
-        return [str(x).strip() for x in v if str(x).strip()]
-
-    cfg = _get_config()
-    from bot_squad_worker import sessions as _sessions
-    return _sessions.declare_roles(
-        cfg, params["slug"], params["sid"],
-        roles=_as_list(params.get("roles")),
-        add=tuple(_as_list(params.get("add")) or ()),
-        drop=tuple(_as_list(params.get("drop")) or ()),
-        claude_uuid=params.get("claude_uuid"),
-    )
-
-
 def _action_morph_session(params: dict[str, Any]) -> dict[str, Any]:
     """T-0509 (M11/F11.2): morph a user session's role IN PLACE.
 
@@ -6733,8 +6682,6 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     # T-0466: per-session cache-window recycle postpone (bsq postpone).
     # T-0509 (M11/F11.2): user-session role morph (user→dev/teamlead/operator).
     "morph_session": _action_morph_session,
-    # T-0943: a session declares the SET of roles it holds (bsq role).
-    "declare_roles": _action_declare_roles,
     "unbind_task": _action_unbind_task,
     # T-0324 (H2): safe primary re-home — the repair bind/unbind can't do.
     "rehome_primary": _action_rehome_primary,
@@ -6960,10 +6907,6 @@ ACTION_MODES: dict[str, str] = {
     # frontmatter (filesystem-local) — tmux_only, like set_drift_paused. The
     # operator-singleton guard reads mds + a tmux pane scan, both user-local.
     "morph_session": "tmux_only",
-    # T-0943: same shape as morph_session — a session stamps its OWN SessionMd
-    # frontmatter (filesystem-local), and the operator singleton it can trip is
-    # read from the same mds + pane scan, all user-local.
-    "declare_roles": "tmux_only",
     "unbind_task": "coordinator_only",
     # T-0324 (H2): walks every SessionMd + the backlog under the claim flock —
     # single-writer semantics, same as the other binding mutators/reconcilers.

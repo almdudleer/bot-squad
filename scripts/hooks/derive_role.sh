@@ -66,29 +66,3 @@ bsq_derive_role() {
             printf 'dev' ;;
     esac
 }
-
-# T-0943: WHICH CONTRACT does this window read?
-#
-# Third mirror of the same rule (python: `sessions.roles_of` + bsq's
-# `_contract_files_for`). A session alone in a project holds
-# user-conversation + operator + dev at once — «solo universal session [...]
-# in fact it's user-session, operator and dev all at once» — so pointing it at
-# `user-conversation.md`, whose head says the build work "stays offloaded to
-# dev/TL sessions", is what told a live session to hand its work to sessions
-# that did not exist.
-#
-# The ROLE enum is deliberately unchanged: `bsq_derive_role` still answers
-# `user-conversation`, because every lifecycle gate keys on that. Only the
-# CONTRACT NAME moves, which is the thing the session actually reads.
-bsq_contract_role() {
-    _bcr_window="${1:-}"
-    _bcr_role="$(bsq_derive_role "$_bcr_window")"
-    if [ "$_bcr_role" = "user-conversation" ]; then
-        case "$_bcr_window" in
-            universal-bsq-session|universal_bsq_session|universal-bsq-session[-_]*|universal_bsq_session[-_]*)
-                printf 'solo-session'
-                return 0 ;;
-        esac
-    fi
-    printf '%s' "$_bcr_role"
-}

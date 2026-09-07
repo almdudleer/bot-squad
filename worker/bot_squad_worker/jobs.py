@@ -861,15 +861,13 @@ def _peer_to_operators(cfg: Config, slug: str, text: str) -> None:
     on the stakeholder DM leg, and a silent zero here is the thing that would let
     a broken roster look like a delivered alert.
     """
-    # T-0943: routing — a deploy alert wants whoever HOLDS the operator role,
-    # which on a solo project is the one session running (it is the operator).
-    from bot_squad_worker.dispatch import operator_role_holders
+    from bot_squad_worker.dispatch import live_operator_sids
     from bot_squad_worker import intersession as _is
 
     try:
-        sids = operator_role_holders(cfg, slug)
+        sids = live_operator_sids(cfg, slug)
     except Exception:
-        log.exception("deploy_monitor: operator_role_holders failed for %s", slug)
+        log.exception("deploy_monitor: live_operator_sids failed for %s", slug)
         return
     if not sids:
         log.warning(

@@ -48,12 +48,6 @@ records the full binding set; the SessionStart hook surfaces it on resume.
   his go-ahead" step to your own ticket.
 - If you're blocked: `bsq peer send` to your teamlead first; only TG the
   stakeholder directly if there's no TL or you've been stuck.
-- **A hand-off needs a recipient that EXISTS (T-0943).** `bsq peer send
-  operator` — and a `--blocked` send to `teamlead` — REFUSES with
-  `role-unfilled` when no live session holds that role. That refusal is the
-  answer, not an obstacle to route around: an unfilled role has no inbox
-  anyone will ever drain, so the work is yours. `bsq team status` says who is
-  actually live, and `bsq brief` names every role YOU hold.
 - **Declare a block; a report declares nothing (T-0977).** `bsq peer send
   --blocked <to> "<what you need>"` is what tells the stall-watchdog you are
   STOPPED until that message is answered: it escalates upstream if nobody

@@ -144,16 +144,8 @@ def live_operator_sids(cfg: Any, slug: str) -> list[str]:
             # T-0509: honor a stored ``role`` (a user session morphed to
             # operator stamps it without renaming its window), so the singleton
             # guard sees morphed operators too.
-            #
-            # T-0943: DEDICATED means the operator role is the ONLY one this
-            # session holds — ``roles_of`` reduces to ``(_role_of(...),)`` for
-            # every md that declares no ``roles``, so this is byte-identical
-            # for them and widens only to a session that DECLARED itself a
-            # plain operator. A multi-role holder is deliberately NOT counted
-            # here: this list is the singleton guard, and counting it would
-            # refuse the `bsq bud operator` handover. Routing asks
-            # :func:`operator_role_holders` instead.
-            if S.roles_of(meta) == ("operator",):
+            role = S._role_of(meta)
+            if role == "operator":
                 sid = meta.get("sid", md.stem)
                 if sid not in seen:
                     seen.add(sid)
@@ -161,53 +153,6 @@ def live_operator_sids(cfg: Any, slug: str) -> list[str]:
 
     # (2) Canonical / unregistered operator — live claude pane, no session md.
     out.extend(_live_operator_sids_from_tmux(slug, seen))
-    return out
-
-
-def operator_role_holders(cfg: Any, slug: str) -> list[str]:
-    """Who is ACTUALLY driving this board right now — the ROUTING answer.
-
-    T-0943 splits a question :func:`live_operator_sids` was answering twice at
-    once. Two different callers ask about "the operator" and they want opposite
-    fallbacks:
-
-      * **the singleton GUARD** ("may I spawn/claim another operator?") must
-        keep asking :func:`live_operator_sids` — a session that merely HOLDS
-        the operator role among others is exactly what ``bsq bud operator``
-        exists to relieve, so counting it there would refuse the handover the
-        stakeholder asked for («далее уже делать budding в оператора, на
-        которого перейдет драйв»).
-      * **ROUTING** (re-drive continue-vs-respawn, ``peer_send operator``,
-        deploy notices, instant-tweak placement) must ask THIS one. A solo
-        universal session holds the operator role (``sessions.roles_of``), so
-        the drive drives IT and an escalation addressed to ``operator``
-        reaches it — instead of respawning a second driver behind it, or
-        reaching nobody and being reported as delivered.
-
-    PREFERENCE, not a union: a DEDICATED operator always wins. Only when none
-    is live does a multi-role holder answer. So this never returns two
-    dispatchers, and the moment an operator is budded off the drive moves to
-    it by construction — which is the second half of the ask.
-
-    Fail-open like :func:`live_operator_sids`: an unreadable md is skipped, a
-    broken tmux server yields no canonical operators.
-    """
-    dedicated = live_operator_sids(cfg, slug)
-    if dedicated:
-        return dedicated
-    out: list[str] = []
-    sess_dir = cfg.data_dir / slug / "sessions"
-    if not sess_dir.exists():
-        return out
-    for md in sorted(sess_dir.glob("*.md")):
-        meta = S._read_session_metadata(md)
-        if meta is None or not S._is_live_holder(meta):
-            continue
-        if "operator" not in S.roles_of(meta):
-            continue
-        sid = str(meta.get("sid") or md.stem)
-        if sid not in out:
-            out.append(sid)
     return out
 
 
@@ -1114,10 +1059,7 @@ def decide_placement(
     }
 
     if cls["kind"] == "instant_tweak":
-        # T-0943: routing, so the ROLE holder — a solo session is the control
-        # plane for its own project and "ensure an operator" would spawn one
-        # behind it.
-        ops = operator_role_holders(cfg, slug)
+        ops = live_operator_sids(cfg, slug)
         out["route"] = "apply_live"
         out["target_sid"] = ops[0] if ops else None
         out["reason"] = (

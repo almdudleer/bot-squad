@@ -184,8 +184,11 @@ done-or-not judgement — *«Это должна решать сама сесс�
   dev / TL, a bound task alive      nudge          «продолжать только пока
                                                    какая-то из их задач жива»
   dev / TL, no bound task alive     handoff_exit   handoff → exit, NO compact
-  routine-handler (T-0952)          handoff_exit   handoff → exit, NO compact
-                                                   (into its OWN role
+  routine-handler, a monitor        nudge          keeps triage-ready; never
+  still routes to it                               dies on the timeout
+                                                   (T-1064)
+  routine-handler, nothing routes   handoff_exit   handoff → exit, NO compact
+  to it                                            (into its OWN role
                                                    artifact — the next breach's
                                                    fresh handler reads it
                                                    instead of starting blind)
@@ -419,6 +422,33 @@ def dev_nudge_sec() -> int:
     return DEFAULT_DEV_NUDGE_SEC
 
 
+# T-1064: the routine-handler's own keep-alive cadence. Neither the dev's 5
+# min (it has no bound task to make progress against — nudging that fast
+# would just be paying for turns with nothing to report) nor the operator's
+# 40 min borrowed verbatim (a distinct knob so retuning one never silently
+# retunes the other). 30 min: long enough that an idle-but-armed handler is
+# cheap, short enough that its handoff artifact never goes far stale between
+# writes.
+DEFAULT_ROUTINE_HANDLER_NUDGE_SEC = 1800
+
+
+def routine_handler_nudge_sec() -> int:
+    """The routine-handler keep-alive cadence (30 min default) while
+    :func:`routines.handler_needed` holds — see :func:`recycle_plan`'s
+    ``routine-handler`` row. Overridable via
+    ``BOT_SQUAD_ROUTINE_HANDLER_NUDGE_SEC``; same non-positive/garbage
+    fallback posture as its siblings."""
+    raw = os.environ.get("BOT_SQUAD_ROUTINE_HANDLER_NUDGE_SEC")
+    if raw:
+        try:
+            v = int(raw)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_ROUTINE_HANDLER_NUDGE_SEC
+
+
 # --- T-0948: the nudge ESCALATION CAP ---------------------------------------
 #
 # The nudge had a cadence and no end. `_maybe_worker_nudge`'s own docstring
@@ -628,81 +658,10 @@ def worker_tasks_alive(cfg: Any, slug: str, task_ids: list[str], *,
         return False
 
 
-def board_pending(cfg: Any, slug: str) -> bool:
-    """True when the board has work the OPERATOR role could still move — the
-    input :func:`multi_role_plan`'s operator arm needs (T-0943).
-
-    Delegates to :mod:`operator_redrive`'s own pending count and pause flag
-    rather than re-deriving "is there work", so the drive nudge a multi-role
-    holder gets and the re-drive tick's own idle verdict can never disagree
-    about whether the board is moving.
-
-    Fails CLOSED (``False``): an unreadable board must degrade to "nothing to
-    nudge about", never to a nudge loop nobody can stop.
-    """
-    try:
-        from bot_squad_worker import operator_redrive as _ord
-        if _ord.is_paused(cfg, slug):
-            return False
-        return _ord.count_pending_backlog(cfg, slug) > 0
-    except Exception:  # noqa: BLE001 — a board read never breaks a tick
-        log.debug("idle_timeout: board_pending read failed for %s", slug,
-                  exc_info=True)
-        return False
-
-
-def multi_role_plan(*, roles, meta: dict | None, tasks_alive: bool,
-                    board_pending: bool, nudge_capped: bool = False,
-                    ) -> tuple[str | None, str | None]:
-    """``(plan, deciding_role)`` for a session holding MORE THAN ONE role — or
-    ``(None, None)`` when this table has nothing to say and the single-role
-    precedence in :func:`recycle_plan` applies unchanged.
-
-    T-0943. The stakeholder asked for the nudges to follow the ROLE, not the
-    session: «Та сессия, на которой висит роль оператора, должна получать
-    nudges, что движения по проекту нет, если drive on. Та сессия, на которой
-    висит роль девелопера по задаче, должна получать nudges по этой задаче».
-    A solo session holds all three, and its single derived role is
-    ``user-conversation`` — which :func:`recycle_plan` sends straight to
-    ``compact_exit``. So the session that IS the operator and IS the dev got
-    neither of the two nudges he named, and the board it was driving simply
-    stopped moving while the session waited to be recycled.
-
-    Deliberately NARROW, for cost (T-0948): it fires only for a holder of more
-    than one role, so every single-role session keeps its existing plan
-    byte-for-byte, and each arm needs REAL work to point at —
-
-      * ``operator`` + drive on + something actually pending on the board.
-        ``board_pending`` is an INPUT (this function stays pure, like
-        ``tasks_alive``): without it the arm would fire on every solo session
-        forever, since both the md ``drive`` field and the project drive block
-        default to ON, and «nudge forever» is the loop T-0948 exists to break.
-      * ``dev``/``teamlead`` + live bound work — T-0930's rule, reached through
-        the held role instead of the derived one.
-
-    ``nudge_capped`` short-circuits BOTH arms, so a multi-role holder that has
-    produced no progress across the escalation cap stops being nudged and falls
-    through to its ordinary plan. The dedicated-operator branch has no such cap
-    and is untouched here — widening a role's reach is not the place to change
-    what that role already does.
-    """
-    held = tuple(roles or ())
-    if len(held) < 2 or nudge_capped:
-        return None, None
-    if ("operator" in held and board_pending
-            and recycle_gate.operator_drive_on(role="operator", meta=meta)):
-        return PLAN_NUDGE, "operator"
-    if tasks_alive:
-        for r in held:
-            if r in WORKER_ROLES:
-                return PLAN_NUDGE, r
-    return None, None
-
-
 def recycle_plan(*, role: str | None, window: str | None, meta: dict | None,
                  attached: bool, tasks_alive: bool,
-                 nudge_capped: bool = False, roles=None,
-                 board_pending: bool = False) -> str:
+                 nudge_capped: bool = False,
+                 routines_pending: bool = False) -> str:
     """THE per-role criterion (T-0945). Pure — no I/O, no clock — so the policy
     can be read and tested as a table rather than traced through the executor.
 
@@ -734,20 +693,30 @@ def recycle_plan(*, role: str | None, window: str | None, meta: dict | None,
        :func:`worker_nudge_max`. This is the one place the "nudge forever"
        loop is broken, and it is broken by a real terminal action rather than
        by a longer cadence.
-    6. **routine-handler (T-0952)** — always ``handoff_exit``. The single
-       shared handler (T-0933) is never task-bound — the routine it is mid-
-       triage on is not a ticket this session owns, so ``tasks_alive`` has
-       nothing to read and :data:`WORKER_ROLES`'s "nudge while alive" case
-       does not apply. This is NOT "leave it out and let it fall through to
-       step 7" by accident: without its own step it silently rode the ``dev``
-       default before its role was recognised at all, which is the exact gap
-       this ticket closes — an explicit row here is what keeps it in the
-       table if ``WORKER_ROLES`` semantics change later. Recycling it is
-       intentional, not a bug to route around: T-0933's shared-handler dedup
-       (``routines._live_routine_handler``) spawns a fresh one on the next
-       breach if none is live, and that fresh incarnation reads this one's
-       handoff (its role artifact) instead of starting blind — see
-       :func:`routines._handler_brief`.
+    6. **routine-handler (T-0952/T-1064)** — ``nudge`` while
+       ``routines_pending`` (T-1064: the caller's cheap read of
+       ``routines.handler_needed`` — at least one ACTIVE monitor still routes
+       its breach to this handler), else ``handoff_exit``. The single shared
+       handler (T-0933) is never task-bound — the routine it is mid-triage on
+       is not a ticket this session owns, so ``tasks_alive`` has nothing to
+       read and :data:`WORKER_ROLES`'s "nudge while alive" case does not
+       apply; it is kept as its OWN branch rather than folded into that set
+       for the same reason T-0952 gave (no escalation cap makes sense for a
+       session with no "no progress" to detect). This is NOT "leave it out
+       and let it fall through to step 7" by accident: without its own step
+       it silently rode the ``dev`` default before its role was recognised at
+       all, which is the exact gap T-0952 closed — an explicit row here is
+       what keeps it in the table if ``WORKER_ROLES`` semantics change later.
+       T-0952 made this UNCONDITIONAL ``handoff_exit``, reasoning that T-0933's
+       shared-handler dedup (``routines._live_routine_handler``) would spawn a
+       fresh one on the next breach — true, but the stakeholder's repeated
+       finding it dead (T-1064) is exactly the gap between "the handler died"
+       and "the next breach happens to fire": for as long as a monitor is
+       armed, that gap is unmonitored triage, not idle capacity being freed.
+       The fresh-incarnation-reads-its-predecessor's-handoff mechanism
+       (:func:`routines._handler_brief`) is UNCHANGED and still the bootstrap
+       path — first-ever spawn, a crash, or a project whose last monitor was
+       just added.
     7. anything else ⇒ ``handoff_exit`` (the pre-T-0945 default for every
        non-exempt session, unchanged).
 
@@ -761,16 +730,6 @@ def recycle_plan(*, role: str | None, window: str | None, meta: dict | None,
     if not recycle_gate.role_exempt(r) and recycle_gate.user_session_exempt(
             role=r, window=window, meta=meta):
         return PLAN_STAY
-    # T-0943: a session holding SEVERAL roles is asked about each of them
-    # before the single derived role decides. ``roles=None`` (every caller
-    # before this ticket, and every single-role session) is a no-op — see
-    # :func:`multi_role_plan`.
-    multi, _deciding = multi_role_plan(
-        roles=roles, meta=meta, tasks_alive=tasks_alive,
-        board_pending=board_pending, nudge_capped=nudge_capped,
-    )
-    if multi is not None:
-        return multi
     if recycle_gate.role_exempt(r):                       # user-conversation
         return PLAN_COMPACT_EXIT if uc_exit_sec() > 0 else PLAN_STAY
     if r == "operator":
@@ -778,7 +737,7 @@ def recycle_plan(*, role: str | None, window: str | None, meta: dict | None,
             return PLAN_NUDGE
         return PLAN_COMPACT_EXIT if uc_exit_sec() > 0 else PLAN_HANDOFF_EXIT
     if r == "routine-handler":
-        return PLAN_HANDOFF_EXIT
+        return PLAN_NUDGE if routines_pending else PLAN_HANDOFF_EXIT
     if r in WORKER_ROLES:
         if not tasks_alive:
             return PLAN_HANDOFF_EXIT
@@ -1050,43 +1009,29 @@ def _maybe_recycle_leased(cfg: Any, slug: str, sid: str, row: dict, md_path,
                       exc_info=True)
 
     attached = recycle_gate.is_attached(pane, sid=sid, now=now)
-    # T-0943: the roles this session HOLDS. For every single-role session this
-    # is ``(role,)`` and nothing below changes; a solo session holds
-    # user-conversation + operator + dev at once, and the two nudge rules the
-    # stakeholder named have to reach it through the roles it holds rather than
-    # through the one role its window derives.
-    held = sessions.roles_of(meta, window=window)
     tasks_alive = False
-    worker_role = next((r for r in held if r in WORKER_ROLES), "")
-    if worker_role:
+    if (role or "") in WORKER_ROLES:
         tasks_alive = worker_tasks_alive(
-            cfg, slug, bound_task_ids(row, meta), role=worker_role,
+            cfg, slug, bound_task_ids(row, meta), role=role,
             initiative=(row.get("initiative") or meta.get("initiative")))
     # T-0948: the streak is re-checked against the ticket BEFORE the plan is
     # taken, so a session that reported progress since its last nudge has its
     # streak cleared and is never escalated on a stale count.
     _reset_streak_if_progressed(cfg, slug, row, meta, role=role)
     nudge_capped = worker_nudge_capped(meta, role)
-    # Only read the board for a multi-role holder that actually holds the
-    # operator role — every other session pays nothing for this ticket.
-    pending = (board_pending(cfg, slug)
-               if len(held) > 1 and "operator" in held else False)
+    # T-1064: only a routine-handler pays for this read (cached, mtime-gated
+    # per :func:`routines._monitor_routines`), every other role skips it
+    # entirely.
+    routines_pending = False
+    if (role or "") == "routine-handler":
+        from bot_squad_worker import routines as _routines
+        routines_pending = _routines.handler_needed(cfg, slug)
     plan = recycle_plan(role=role, window=window, meta=meta, attached=attached,
                         tasks_alive=tasks_alive, nudge_capped=nudge_capped,
-                        roles=held, board_pending=pending)
-    # Which HELD role produced a multi-role nudge — the cadence and the nudge
-    # text follow it, not the derived role. Without this a solo session driving
-    # the board would be nudged on the dev's 5-minute clock (`worker_nudge_sec`
-    # maps every non-coordinator role there), which is the T-0930 defect the
-    # operator's own 40-minute cadence exists to avoid.
-    _multi, nudge_role = multi_role_plan(
-        roles=held, meta=meta, tasks_alive=tasks_alive,
-        board_pending=pending, nudge_capped=nudge_capped,
-    )
-    acting_role = nudge_role or role
+                        routines_pending=routines_pending)
     if (plan == PLAN_HANDOFF_EXIT and nudge_capped and tasks_alive
             and idle_due(_idle_age(row, meta, user_home, now),
-                         worker_nudge_sec(acting_role))):
+                         worker_nudge_sec(role))):
         # Page the owner ONCE, at the moment the cap converts the nudge loop
         # into an exit — "N nudges produced no progress" is the fact nobody was
         # ever told before, and an exit nobody hears about is a silent give-up.
@@ -1181,11 +1126,14 @@ def _maybe_recycle_leased(cfg: Any, slug: str, sid: str, row: dict, md_path,
             if _maybe_compact_and_stay(cfg, slug, sid, row, meta, md_path, now,
                                        pane, user_home, role=role):
                 return True
-        if (acting_role or "") == "operator":
+        if (role or "") == "operator":
             return _maybe_keepalive_nudge(cfg, slug, sid, row, meta, md_path,
                                           now, pane, user_home)
+        if (role or "") == "routine-handler":
+            return _maybe_routine_handler_nudge(cfg, slug, sid, row, meta,
+                                                md_path, now, pane, user_home)
         return _maybe_worker_nudge(cfg, slug, sid, row, meta, md_path, now,
-                                   pane, user_home, role=acting_role)
+                                   pane, user_home, role=role)
 
     # PLAN_COMPACT_EXIT / PLAN_HANDOFF_EXIT — decide whether to START this tick.
     # The deadline differs only by name: `uc_exit_sec()` defaults to
@@ -2139,6 +2087,68 @@ def _maybe_keepalive_nudge(cfg: Any, slug: str, sid: str, row: dict, meta: dict,
                           now=now, reason="idle_window_keepalive")
     log.info("idle_timeout: sent keep-alive nudge to drive=on operator %s — "
              "session stays, no recycle", sid)
+    return True
+
+
+def _routine_handler_nudge_text() -> str:
+    """T-1064: unlike the operator's keepalive text, there is no judgement
+    call to prompt for — an idle routine-handler between breaches is not
+    "maybe out of work", it is doing exactly what it exists to do, and the
+    quota-utilization steering that applies to a drive=on operator has no
+    analogue here."""
+    return (
+        "continue — your ~1h cache window is about to expire while idle. "
+        "You are this project's shared routine-handler and at least one "
+        "active monitor still routes its breach to you, so the system is "
+        "keeping you resident instead of recycling you (T-1064: a dead "
+        "handler between breaches is a triage gap, not freed capacity). "
+        "There is nothing to do until the next [ROUTINE BREACH R-NNNN] "
+        "message arrives in your composer — staying idle-ready IS the job "
+        "right now. If your context is large, a compact-in-place may run "
+        "instead of this nudge; either way, do not exit."
+    )
+
+
+def _maybe_routine_handler_nudge(cfg: Any, slug: str, sid: str, row: dict,
+                                 meta: dict, md_path, now: float,
+                                 pane: str | None, user_home: str) -> bool:
+    """T-1064: the shared routine-handler's own keep-alive — same shape as
+    :func:`_maybe_keepalive_nudge` (postpone/tracked-job/composer-ready
+    gates, once-per-cadence anti-loop guard, NEVER terminates) but on its own
+    :func:`routine_handler_nudge_sec` cadence and with its own text.
+    ``routine_handler_keepalive_last_at`` is its own field, separate from the
+    operator's ``operator_keepalive_last_at`` — the two nudges must never
+    share a cadence guard even though the SID could theoretically hold both
+    stamps across a role change."""
+    idle_age = _idle_age(row, meta, user_home, now)
+    cadence = routine_handler_nudge_sec()
+    if not idle_due(idle_age, cadence):
+        return False
+    if not keepalive_due(meta.get("routine_handler_keepalive_last_at"), now,
+                         cadence):
+        return False  # already nudged once this cadence window
+    if tracking_long_job(cfg, slug, sid):
+        log.info("idle_timeout: routine-handler keepalive auto-postpone %s — "
+                 "waiting on a tracked long job", sid)
+        return False
+    if not pane or not autocompact.composer_free(
+            autocompact._capture_pane(pane), sid=sid, now=now, cfg=cfg,
+            slug=slug, pane_id=pane):
+        return False
+
+    try:
+        _send_keepalive_nudge(sid, _routine_handler_nudge_text())
+    except Exception:
+        log.exception("idle_timeout: routine-handler keepalive send failed "
+                      "for %s (will retry)", sid)
+        return False
+    meta["routine_handler_keepalive_last_at"] = _now_iso()
+    sessions._write_session_metadata(md_path, meta, atomic=True)
+    lifecycle_events.emit(cfg, slug, sid, lifecycle_events.SESSION_TIMEOUT,
+                          now=now, reason="idle_window_routine_handler_keepalive")
+    log.info("idle_timeout: sent keep-alive nudge to routine-handler %s — "
+             "session stays, no recycle (T-1064: a monitor still routes to "
+             "it)", sid)
     return True
 
 

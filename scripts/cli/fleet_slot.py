@@ -282,6 +282,13 @@ DEFAULT_STATE_DIR = Path(BOT_SQUAD) / "data" / "_worker" / "fleet_slots"
 #: one-key edit to config.json, not a code change and not a deploy.
 DEFAULT_SLOTS = 2
 
+#: T-0968 DoD 2, the "one suite per lane" clause: how many slots ONE LANE may
+#: hold in a single pool at once. The fleet ceiling alone does not give this —
+#: with three containerless slots, one lane starting three suites is inside the
+#: ceiling and has starved the other four lanes to zero. The ceiling bounds the
+#: HOST; this bounds one lane's share of it, which is why the ticket names both.
+DEFAULT_PER_LANE = 1
+
 #: A build's measured hold is ~14 min, so a default wait shorter than that
 #: would make every lane queued behind a deploy time out and route around —
 #: which is the defect this module exists to remove.
@@ -612,6 +619,26 @@ def slots(sd: Path) -> int:
         return max(1, int(_config(sd).get("slots", DEFAULT_SLOTS)))
     except (ValueError, TypeError):
         return DEFAULT_SLOTS
+
+
+def per_lane_cap(sd: Path) -> int | None:
+    """Slots ONE LANE may hold in ONE pool, or None to disarm the clause.
+
+    ``BOT_SQUAD_FLEET_PER_LANE`` overrides ``config.json``; ``0``, ``none`` or
+    the empty string disarm it, and the refusal reason then says the cap is
+    off rather than leaving a reader to infer it from silence.
+
+    Re-read on every acquire, like :func:`slots`, so the operator can widen it
+    while lanes are already queued.
+    """
+    env = os.environ.get("BOT_SQUAD_FLEET_PER_LANE")
+    raw = env if env is not None else _config(sd).get("per_lane", DEFAULT_PER_LANE)
+    if raw is None or raw == "" or str(raw).strip().lower() in ("none", "off", "0"):
+        return None
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_PER_LANE
 
 
 # --------------------------------------------------------------------------
@@ -1327,7 +1354,9 @@ def _declaration_reason(d: dict) -> str:
 def _grantable(kind: str, holders: list[dict], waiters: list[dict],
                token: str, n_slots: int, n_cl: int | None,
                declarations: list[dict] | None = None,
-               under: str | None = None) -> tuple[bool, str]:
+               under: str | None = None,
+               lane: str | None = None,
+               per_lane: int | None = None) -> tuple[bool, str]:
     """Whether ``token`` may take a slot now, and the reason either way.
 
     Two INDEPENDENT pools, because they are two different resources:
@@ -1351,6 +1380,26 @@ def _grantable(kind: str, holders: list[dict], waiters: list[dict],
     there is no second policy to keep in step with this one. ``under`` excludes
     the caller's OWN window, so a lane does not queue behind itself — without
     that, the first command an owner ran inside its own window would deadlock.
+
+    **ONE SUITE PER LANE** (T-0968 DoD 2) is the second clause of the ticket
+    and a separate control from the ceiling: three containerless slots taken by
+    one lane are inside the fleet ceiling and have still starved four peers to
+    zero. ``per_lane`` bounds one lane's share; ``lane`` is who is asking.
+
+    Two decisions in that term, both derived rather than assumed:
+
+    * **It is PER POOL, not global across pools.** A global cap would create a
+      starvation class that does not exist today: a *build* waiter forms the
+      FIFO barrier below, so a lane holding a long containerless slot could
+      queue its own deploy and stall every other lane's container work behind a
+      barrier that cannot clear until its own unrelated run ends. Per-pool adds
+      no such class — a build blocked by its own lane's container slot was
+      already blocked by "a build drains the pool", so the term is a no-op for
+      builds and binds only where it was measured to be needed.
+    * **An empty lane label is EXEMPT, and the reason says so.** Every
+      unlabelled run shares the label ``""``; counting those as one lane would
+      silently serialise the whole fleet to one suite. A visible exemption is a
+      rule with a hole in it; a silent one is a rule nobody can audit.
     """
     declarations = declarations or []
     mine = covering_declaration(declarations, under, kind) if under else None
@@ -1359,8 +1408,29 @@ def _grantable(kind: str, holders: list[dict], waiters: list[dict],
                        f"covers {kind} work. It expired, was ended, or never existed.")
     holders = list(holders) + [d for d in declarations
                                if not (mine and d.get("token") == mine.get("token"))]
+
+    def _lane_full(pool: list[dict], pool_name: str) -> str | None:
+        """The refusal reason if this lane is at its own cap in ``pool``."""
+        if per_lane is None or not lane:
+            return None
+        ours = [h for h in pool if (h.get("lane") or "") == lane]
+        if len(ours) < per_lane:
+            return None
+        first = ours[0]
+        held = (f"{first.get('note') or first.get('token')} "
+                f"(pgid {first.get('pgid')}, "
+                f"{round(time.time() - float(first.get('since') or 0))}s elapsed)")
+        return (f"one suite per lane: {lane} already holds "
+                f"{len(ours)}/{per_lane} {pool_name} slot(s) — {held}. "
+                f"The fleet has room; YOUR LANE does not. Let that run finish, "
+                f"or raise per_lane in config.json / $BOT_SQUAD_FLEET_PER_LANE "
+                f"if a lane genuinely needs two at once.")
+
     if kind == "containerless":
         cl = [h for h in holders if h.get("kind") == "containerless"]
+        blocked = _lane_full(cl, "containerless")
+        if blocked:
+            return False, blocked
         if n_cl is None:
             return True, f"{len(cl)} containerless run(s), unbounded"
         if len(cl) >= n_cl:
@@ -1395,6 +1465,10 @@ def _grantable(kind: str, holders: list[dict], waiters: list[dict],
             return False, (f"{len(daemon)} container slot(s) still held; a build "
                            f"drains the pool before it starts")
         return True, "pool empty"
+
+    blocked = _lane_full(daemon, "container")
+    if blocked:
+        return False, blocked
 
     if len(daemon) >= n_slots:
         decl = next((h for h in daemon if h.get("declared")), None)
@@ -1496,7 +1570,9 @@ def acquire(kind: str, *, pgid: int, lane: str | None, note: str | None,
                         f"are: peers may already be in this pool.")
                 ok, reason = _grantable(kind, holders, waiters, token, n,
                                         containerless_slots(sd),
-                                        declarations=decls, under=under)
+                                        declarations=decls, under=under,
+                                        lane=rec["lane"],
+                                        per_lane=per_lane_cap(sd))
                 if ok:
                     hrec = dict(rec)
                     hrec["since"] = time.time()
@@ -1685,6 +1761,7 @@ def snapshot(sd: Path | None = None) -> dict:
         "state_dir": str(sd),
         "slots": n,
         "containerless_slots": containerless_slots(sd),
+        "per_lane": per_lane_cap(sd),
         "containerless_held": sum(1 for h in holders + declarations
                                   if h.get("kind") == "containerless"),
         "holders": [_fmt(h) for h in holders],
@@ -1701,7 +1778,9 @@ def snapshot(sd: Path | None = None) -> dict:
             "/proc/<pid>/stat field 5; dead groups are reclaimed and appended to "
             "reclaims.log. TWO INDEPENDENT POOLS: container+build share the daemon "
             "pool (a build is exclusive and drains it); containerless has its own "
-            "pool and a build does NOT block it. A DECLARED WINDOW counts as a "
+            "pool and a build does NOT block it. ONE SUITE PER LANE is enforced "
+            "PER POOL, not globally across pools, and an unlabelled lane is "
+            "exempt from it. A DECLARED WINDOW counts as a "
             "holder of its pool and is held on a renewable LEASE rather than a "
             "process group, because the interval it exists to cover — the gap "
             "between an owner's commands — is exactly the interval with no "
@@ -1888,6 +1967,11 @@ def _cmd_status(args) -> int:
     print(f"fleet slots: {daemon}/{snap['slots']} container+build, "
           f"{cl}/{cl_cap if cl_cap is not None else '∞'} containerless"
           + ("  [BUILD — exclusive]" if snap["build_held"] else ""))
+    # Print the per-lane clause even when it is DISARMED. A cap that is off is
+    # a policy decision a reader should see, not an absence they must infer.
+    _pl = snap.get("per_lane")
+    print(f"  per lane: {_pl} slot(s) per pool" if _pl is not None
+          else "  per lane: DISARMED — one lane may take the whole pool")
     print(f"  state: {snap['state_dir']}")
     for h in snap["holders"]:
         print(f"  HOLD  {h['kind']:<10} {h['age_s']:>7.1f}s  pgid {h['pgid']:<8} "

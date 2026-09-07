@@ -50,7 +50,8 @@ pytestmark = pytest.mark.skipif(
 # helpers
 # ---------------------------------------------------------------------------
 
-def _env(state: Path, slots: int | None = None, dstate_max: str | None = "") -> dict:
+def _env(state: Path, slots: int | None = None, dstate_max: str | None = "",
+         per_lane: str | None = "") -> dict:
     """Environment for a gate invocation.
 
     ``dstate_max=""`` DISARMS the D-state ceiling, which is the right default
@@ -63,6 +64,14 @@ def _env(state: Path, slots: int | None = None, dstate_max: str | None = "") -> 
     memory event would otherwise decide these tests. The suite that exercises
     THOSE gates is test_t1031_memory_admission.py, which injects readings
     rather than hoping for a condition.
+
+    ``per_lane=""`` DISARMS the one-suite-per-lane cap, and must stay the
+    default for the same class of reason with a sharper edge: every process
+    this suite spawns inherits the SAME ``$BOT_SQUAD_SID``, so to the gate they
+    are all ONE LANE. Armed by default, the cap would refuse the second run in
+    every multi-run test here and those tests would go red against a correct
+    gate. The cap's own tests arm it explicitly and pass distinct ``--lane``
+    values, which is the only way to fixture a per-lane rule honestly.
     """
     env = dict(os.environ)
     env["BOT_SQUAD_FLEET_SLOTS_DIR"] = str(state)
@@ -79,14 +88,19 @@ def _env(state: Path, slots: int | None = None, dstate_max: str | None = "") -> 
         env["BOT_SQUAD_FLEET_DSTATE_MAX"] = dstate_max
     env["BOT_SQUAD_FLEET_RSTATE_MAX"] = ""
     env["BOT_SQUAD_FLEET_PSI_MEM_MAX"] = ""
+    if per_lane is None:
+        env.pop("BOT_SQUAD_FLEET_PER_LANE", None)
+    else:
+        env["BOT_SQUAD_FLEET_PER_LANE"] = per_lane
     return env
 
 
 def _run(state: Path, *argv: str, slots: int | None = None,
-         dstate_max: str | None = "", timeout: float = 90):
+         dstate_max: str | None = "", timeout: float = 90,
+         per_lane: str | None = ""):
     return subprocess.run([sys.executable, str(SLOT), *argv],
-                          env=_env(state, slots, dstate_max), capture_output=True,
-                          text=True, timeout=timeout)
+                          env=_env(state, slots, dstate_max, per_lane),
+                          capture_output=True, text=True, timeout=timeout)
 
 
 def _status(state: Path, slots: int | None = None) -> dict:
@@ -150,13 +164,16 @@ def _sleeper(seconds: float) -> list[str]:
 def _spawn_run(state: Path, kind: str, cmd: list[str], *, note: str,
                slots: int | None = None, wait: float = 90,
                dstate_max: str | None = "",
-               cl_slots: str | None = None) -> subprocess.Popen:
-    env = _env(state, slots, dstate_max)
+               cl_slots: str | None = None,
+               per_lane: str | None = "",
+               lane: str | None = None) -> subprocess.Popen:
+    env = _env(state, slots, dstate_max, per_lane)
     if cl_slots is not None:
         env["BOT_SQUAD_FLEET_CONTAINERLESS_SLOTS"] = cl_slots
+    lane_argv = ["--lane", lane] if lane is not None else []
     return subprocess.Popen(
         [sys.executable, str(SLOT), "run", "--kind", kind, "--note", note,
-         "--wait", str(wait), "--", *cmd],
+         *lane_argv, "--wait", str(wait), "--", *cmd],
         env=env, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, start_new_session=True)
 
@@ -791,3 +808,163 @@ def test_containerless_run_also_holds_a_legacy_stopgap_fd(tmp_path):
         env=env, capture_output=True, text=True, timeout=90)
     assert out2.returncode == 0, out2.stderr
     assert "also holding legacy" not in out2.stderr
+
+
+# ---------------------------------------------------------------------------
+# 6. ONE SUITE PER LANE — T-0968 DoD 2
+#
+# The ceiling bounds the HOST; this bounds one lane's share of it. They are
+# genuinely two controls: with three containerless slots, one lane running
+# three suites never touches the ceiling and has still starved four peers to
+# zero. Every test here arms the cap explicitly (``per_lane="1"``) and passes
+# distinct ``--lane`` values, because a per-lane rule fixtured with one lane
+# label cannot tell "the cap works" from "the ceiling works".
+# ---------------------------------------------------------------------------
+
+def _fleet_slot_module():
+    sys.path.insert(0, str(SLOT.parent))
+    try:
+        import fleet_slot  # noqa: PLC0415
+    finally:
+        sys.path.pop(0)
+    return fleet_slot
+
+
+def _holder(kind: str, lane: str, token: str = "t") -> dict:
+    return {"token": token, "kind": kind, "lane": lane, "note": kind,
+            "pgid": 1234, "since": time.time()}
+
+
+def test_the_cap_does_NOT_serialise_DIFFERENT_lanes(tmp_path):
+    """THE HEALTHY CASE, FIRST: two lanes still run at once under the cap.
+
+    This is the control that makes the next test mean something. A per-lane cap
+    implemented against the wrong key — the note, the pgid, an empty lane label
+    — reduces the fleet to one suite and every "the cap blocks a second run"
+    assertion below stays green while it does. So prove the fleet still
+    parallelises BEFORE proving the cap bites.
+    """
+    state = tmp_path / "slots"
+    a, b = tmp_path / "a.json", tmp_path / "b.json"
+
+    # Two slots, two DIFFERENT lanes, cap of 1 each: both must run together.
+    first = _spawn_run(state, "container", _rendezvous_first(a, b, 60.0),
+                       note="lane-a", slots=2, per_lane="1", lane="LANE-A")
+    second = _spawn_run(state, "container", _rendezvous_second(b),
+                        note="lane-b", slots=2, per_lane="1", lane="LANE-B")
+    try:
+        assert first.wait(timeout=120) == 0
+        assert second.wait(timeout=120) == 0
+    finally:
+        for p in (first, second):
+            if p.poll() is None:
+                p.kill()
+
+    assert json.loads(a.read_text())["overlap"] is True, (
+        "two DIFFERENT lanes did not overlap under a per-lane cap of 1 — the "
+        "cap is keyed on something that is the same for both, which turns a "
+        "per-lane rule into a fleet-wide serialiser")
+
+
+def test_one_lane_cannot_take_two_slots_in_a_pool(tmp_path):
+    """The clause itself: the SAME lane's second run WAITS, and says why.
+
+    Two slots are FREE for the fleet the whole time this blocks, which is the
+    point — the refusal has to come from the lane's own share, not from the
+    ceiling. So the reason string is asserted too: a wait produced by the
+    ceiling would be indistinguishable from this one by timing alone.
+    """
+    state = tmp_path / "slots"
+    a, b = tmp_path / "a.json", tmp_path / "b.json"
+
+    first = _spawn_run(state, "container", _rendezvous_first(a, b, 15.0),
+                       note="suite-1", slots=2, per_lane="1", lane="LANE-A")
+    second = _spawn_run(state, "container", _rendezvous_second(b),
+                        note="suite-2", slots=2, per_lane="1", lane="LANE-A")
+    try:
+        assert first.wait(timeout=120) == 0
+        assert second.wait(timeout=120) == 0
+        err = second.stderr.read()
+    finally:
+        for p in (first, second):
+            if p.poll() is None:
+                p.kill()
+
+    assert json.loads(a.read_text())["overlap"] is False, (
+        "one lane held two slots at once — the per-lane clause did not bind")
+    # It WAITED rather than skipping, and it SAID SO naming the clause. A gate
+    # that blocks silently is the gate lanes routed around (T-0968 DoD 1).
+    assert "one suite per lane" in err, err
+    assert "LANE-A" in err, err
+    # And it eventually ran: the cap is a queue, not a refusal.
+    assert json.loads(b.read_text())["ran"] is True
+
+
+def test_an_unlabelled_lane_is_exempt_and_the_reason_says_so(tmp_path):
+    """The documented hole, pinned as a POSITIVE test.
+
+    Every unlabelled run shares the label ``""``. Counting those as one lane
+    would serialise the fleet to one suite the first time a caller forgot
+    ``--lane``, so they are exempt — deliberately, and therefore worth a test
+    that fails if someone "tightens" it without noticing what it costs.
+    """
+    fs = _fleet_slot_module()
+    held = [_holder("containerless", "")]
+    ok, reason = fs._grantable("containerless", held, [], "me", 2, 3,
+                               lane="", per_lane=1)
+    assert ok is True, reason
+    assert "one suite per lane" not in reason
+
+
+def test_the_cap_is_per_pool_not_global(tmp_path):
+    """A lane holding containerless may still take a container slot.
+
+    Derived, not preferred: a GLOBAL cap creates a starvation class this one
+    does not have. A ``build`` waiter forms the FIFO barrier, so under a global
+    cap a lane holding a 20-minute containerless slot could queue its own
+    deploy and stall EVERY other lane's container work behind a barrier that
+    cannot clear until its own unrelated run ends. Per-pool adds no such class:
+    a build blocked by its own lane's container slot was already blocked by "a
+    build drains the pool".
+    """
+    fs = _fleet_slot_module()
+    held = [_holder("containerless", "LANE-A")]
+
+    ok, reason = fs._grantable("container", held, [], "me", 2, 3,
+                               lane="LANE-A", per_lane=1)
+    assert ok is True, f"a containerless hold blocked container work: {reason}"
+
+    # ...and the same lane is still capped WITHIN its own pool.
+    ok2, reason2 = fs._grantable("containerless", held, [], "me", 2, 3,
+                                 lane="LANE-A", per_lane=1)
+    assert ok2 is False
+    assert "one suite per lane" in reason2
+
+    # A build is unaffected by the term — it was already exclusive of the pool.
+    ok3, reason3 = fs._grantable("build", held, [], "me", 2, 3,
+                                 lane="LANE-A", per_lane=1)
+    assert ok3 is True, reason3
+
+
+def test_the_cap_can_be_disarmed_and_status_says_which(tmp_path):
+    """Disarming is a config flip, and the status line states it either way.
+
+    A cap that is off is a policy decision a reader should SEE. The status
+    header printing nothing when disarmed would make an armed and a disarmed
+    fleet byte-identical to look at, which is the defect this suite already
+    caught once on the admission pass line.
+    """
+    fs = _fleet_slot_module()
+    held = [_holder("containerless", "LANE-A")]
+    ok, reason = fs._grantable("containerless", held, [], "me", 2, 3,
+                               lane="LANE-A", per_lane=None)
+    assert ok is True, reason
+
+    state = tmp_path / "slots"
+    armed = _run(state, "status", per_lane="2")
+    assert armed.returncode == 0, armed.stderr
+    assert "per lane: 2 slot(s) per pool" in armed.stdout, armed.stdout
+
+    off = _run(state, "status", per_lane="0")
+    assert off.returncode == 0, off.stderr
+    assert "per lane: DISARMED" in off.stdout, off.stdout

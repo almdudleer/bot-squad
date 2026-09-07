@@ -263,6 +263,29 @@ DEFAULT_BRIEF_LIMIT = 8
 #: priority field claims. Matched case-insensitively on word boundaries.
 DEFERRAL_WORDS = ("deferred", "parked", "wontfix", "superseded", "on hold")
 
+#: T-0853: the gate vocabulary already in use on this board (T-0640: "GATED on
+#: stakeholder confirmation"; T-0328: "STAKEHOLDER-GO REQUIRED, do not auto-pick"
+#: / "do NOT start"). Matched case-insensitively, TITLE ONLY — never Context or
+#: Progress. Two measured reasons title is the only safe surface:
+#:
+#: * this ticket's OWN title contains the bare word "GATED" (it is a bug report
+#:   ABOUT gated tickets, not one itself) — proof that a free-text scan over
+#:   prose the board routinely quotes-to-discuss will false-positive; Context
+#:   and Progress quote these words even more often than titles do.
+#: * two of the four instances this ticket's own triage note names (T-0742,
+#:   T-0766) carry their hold ONLY in a Progress note, nowhere in title or
+#:   Context — so scanning those sections would not even have caught them.
+#:
+#: This is why it is wired below as a TRIAGE signal (surfaced, ranked down,
+#: never silently dropped) rather than a hard exclude: an exclude that can
+#: false-positive would HIDE a ticket, which is this module's own stated
+#: invariant ("Three deliberate non-decisions" #3, above) and exactly the
+#: failure mode T-0853 was filed over. The hard-excluding, false-positive-free
+#: mechanism is the durable ``gated`` field below, which this vocabulary is a
+#: safety net for — a not-yet-migrated prose gate is still visible as SUSPECT
+#: rather than offered as plain takeable work.
+GATE_WORDS = ("gated", "stakeholder-go required", "do not auto-pick", "do not start")
+
 #: A ``P<n>`` declared inside the TITLE. T-0388 reads ``P3 DEFERRED: …`` in its
 #: title while its frontmatter says ``priority: P1``; whoever wrote the title was
 #: recording a decision, and the two cannot both be right.
@@ -337,6 +360,13 @@ def deferral_words(title: str) -> list[str]:
     return [w for w in DEFERRAL_WORDS if re.search(rf"(?<![\w-]){re.escape(w)}(?![\w-])", low)]
 
 
+def gate_words(title: str) -> list[str]:
+    """:data:`GATE_WORDS` present in a title — see there for why this is
+    title-only and why it triages rather than excludes."""
+    low = str(title or "").lower()
+    return [w for w in GATE_WORDS if re.search(rf"(?<![\w-]){re.escape(w)}(?![\w-])", low)]
+
+
 def classify_ticket(
     meta: dict,
     *,
@@ -357,6 +387,12 @@ def classify_ticket(
 
     ``scope_statuses`` (T-0829) is the configured drive SCOPE as a set of
     statuses — see :data:`SCOPE_STATUSES`. None means no scope filter at all.
+
+    ``meta["gated"]`` (T-0853) is the durable, mechanical hold — a ticket with
+    it truthy is EXCLUDED regardless of status/scope/held/blocked state, with
+    ``meta["gate_reason"]`` (free text) folded into ``reject`` when present. A
+    gate recorded only in the title's own PROSE (the pre-T-0853 convention) is
+    caught too, but only as a TRIAGE signal — see :data:`GATE_WORDS`.
 
     Returns ``{id, title, status, priority, effective_priority, band, reject,
     sanity, idle_days, rank}``. ``reject`` is the ONE mechanical reason for an
@@ -387,6 +423,16 @@ def classify_ticket(
     deferrals = deferral_words(title)
     if deferrals:
         sanity.append("title-says-deferred:" + ",".join(deferrals))
+        demotions.append(UNRANKED_BAND)
+
+    # T-0853: a NOT-YET-MIGRATED prose gate. The durable ``gated`` field below
+    # already excluded this ticket if it fired, so reaching here means either
+    # the field is absent (an un-migrated gate — genuinely the case this exists
+    # for) or a false positive on ordinary prose (this module's own title is
+    # one). Either way: surfaced, never hidden.
+    gates = gate_words(title)
+    if gates:
+        sanity.append("prose-gate-in-title:" + ",".join(gates))
         demotions.append(UNRANKED_BAND)
 
     if str(meta.get("kind") or "").strip().lower() in CONTAINER_KINDS:
@@ -421,6 +467,18 @@ def classify_ticket(
         reject = "archived"
     elif status in TERMINAL_STATUSES:
         reject = f"terminal:{status}"
+    elif _truthy(meta.get("gated")):
+        # T-0853: the durable, machine-readable gate. Checked ahead of the
+        # status/scope filters below because a deliberate hold is a more
+        # informative reason than "not a pickup status" or "out of scope" would
+        # be, and ahead of held_by/lane_held_by/blocked_by for the same reason
+        # a gate is not incidental busy-ness, it is a decision that this ticket
+        # does not go out regardless of who is free. ``gate_reason`` is free
+        # text for the reader; the mechanism is the boolean alone, exactly like
+        # ``archived`` above — a reason field with no reliable "on" spelling
+        # would be a control nobody could depend on.
+        reason = str(meta.get("gate_reason") or "").strip()
+        reject = "gated:" + (reason if reason else "unspecified")
     elif status not in PICKUP_STATUSES:
         # ``totest`` is the real member of this set: review work, not pickup
         # work. An unrecognised status is named as itself rather than assumed.

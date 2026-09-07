@@ -149,6 +149,46 @@ def test_a_direct_holder_is_reported_ahead_of_a_lane_holder():
     assert row["reject"] == "held-by:S-dev-p1"
 
 
+# --- T-0853: the durable gate field ------------------------------------------
+
+@pytest.mark.parametrize("status", sorted(pickup.PICKUP_STATUSES))
+def test_a_gated_ticket_is_excluded_regardless_of_its_pickup_status(status):
+    """T-0640/T-0328's real shape: a ticket a session dispatched from PICKUP
+    would otherwise happily take (``paused``, ``open`` …). The gate must hold
+    independent of which pickup status the ticket sits in — that independence
+    is the whole point, since a status change (auto-pause, a reopen) must not
+    silently lift a deliberate hold."""
+    row = _classify(status=status, gated="true")
+    assert row["band"] == pickup.BAND_EXCLUDED
+    assert row["reject"] == "gated:unspecified"
+
+
+def test_a_gate_reason_is_folded_into_the_reject_string():
+    row = _classify(gated="true", gate_reason="stakeholder go required")
+    assert row["reject"] == "gated:stakeholder go required"
+
+
+def test_gated_false_or_absent_does_not_exclude():
+    assert _classify(gated="false")["band"] == pickup.BAND_PICKUP
+    assert _classify()["band"] == pickup.BAND_PICKUP
+
+
+def test_gated_beats_held_by_and_blocked_by_as_the_reported_reason():
+    """A gate is a decision, not incidental busy-ness — it outranks the world
+    facts a session or a blocker would otherwise report."""
+    row = pickup.classify_ticket(_meta(gated="true", gate_reason="see T-0706"),
+                                 held_by="S-dev-p1", open_blockers=["T-9"],
+                                 now_epoch=NOW)
+    assert row["reject"] == "gated:see T-0706"
+
+
+def test_gated_beats_terminal_only_the_other_way():
+    """The converse: a genuinely DONE ticket reports terminal, not gated —
+    finished outranks held."""
+    row = _classify(status="closed", gated="true")
+    assert row["reject"] == "terminal:closed"
+
+
 # --- judgement signals: triaged, never dropped ------------------------------
 
 def test_stale_goes_to_triage_not_excluded_and_names_the_age():
@@ -249,6 +289,45 @@ def test_each_deferral_word_demotes_to_the_bottom_band(word):
 def test_a_deferral_word_inside_a_longer_word_does_not_fire():
     """Word-boundary matching: ``unparked`` is not ``parked``."""
     assert _classify(title="unparked the queue and reparked it")["sanity"] == []
+
+
+# --- T-0853: an UN-migrated prose gate is a triage signal, never a hard drop --
+
+@pytest.mark.parametrize("word", pickup.GATE_WORDS)
+def test_each_gate_word_in_a_title_triages_without_excluding(word):
+    """The safety net for a gate recorded only in prose (the pre-T-0853
+    convention). Triaged, not excluded: this scan can false-positive (see the
+    next test) and an exclude that can false-positive would HIDE a ticket,
+    which is the exact defect T-0853 was filed over."""
+    row = _classify(title=f"some work — {word.upper()}, needs a look")
+    assert row["reject"] is None
+    assert row["band"] == pickup.BAND_TRIAGE
+    assert f"prose-gate-in-title:{word}" in row["sanity"]
+    assert row["effective_priority"] == pickup.UNRANKED_BAND
+
+
+def test_a_title_merely_discussing_gates_is_triaged_not_hidden():
+    """Regression fixture: T-0853's OWN title contains the bare word "gated"
+    while describing the bug, not exhibiting it. A naive substring exclude
+    would have hidden this very ticket from the pickup queue — proof, found
+    during this fix's own design, that GATE_WORDS must never hard-exclude."""
+    row = _classify(title="The pickup queue offers GATED tickets as takeable")
+    assert row["reject"] is None
+    assert row["band"] == pickup.BAND_TRIAGE
+
+
+def test_a_gate_word_inside_a_longer_word_does_not_fire():
+    assert _classify(title="the aggregated totals look fine")["sanity"] == []
+
+
+def test_the_durable_gated_field_supersedes_the_prose_signal_in_the_reject():
+    """Once a ticket is migrated onto the real field, the reject reason is the
+    durable one, not the title scan — the prose signal still shows up in
+    ``sanity`` (harmless), but ``reject`` is what a dispatcher acts on."""
+    row = _classify(title="WS-3 gated NEXT step — do not auto-pick", gated="true",
+                    gate_reason="stakeholder go required")
+    assert row["reject"] == "gated:stakeholder go required"
+    assert row["band"] == pickup.BAND_EXCLUDED
 
 
 def test_effective_priority_only_ever_demotes():

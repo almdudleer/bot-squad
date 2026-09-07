@@ -171,6 +171,33 @@ def _wait_until(pred, timeout=30.0, poll=0.1):
     return None
 
 
+def _wait_for_adopted_pgid(state: Path, wrapper_pid: int, *,
+                           slots: int | None = None, timeout: float = 30.0) -> int:
+    """The holder's pgid, but only once it is the WORK's — not the wrapper's.
+
+    ``acquire()`` writes the holder record with the wrapper's own pgid (it has
+    no other pgid yet); ``_cmd_run`` overwrites it via ``adopt()`` only after
+    ``Popen`` returns. That gap is real (a process spawn), and a status query
+    landing inside it hands back the wrapper's group — the exact wrong value
+    this fix exists to stop killing. So poll until the reading diverges from
+    the wrapper's own group rather than trusting the first non-empty holder.
+    """
+    wrapper_pgid = os.getpgid(wrapper_pid)
+    end = time.time() + timeout
+    last = None
+    while time.time() < end:
+        holders = _status(state, slots)["holders"]
+        if holders:
+            pgid = holders[0]["pgid"]
+            last = pgid
+            if pgid and pgid != wrapper_pgid:
+                return pgid
+        time.sleep(0.05)
+    raise AssertionError(
+        f"holder pgid never adopted away from the wrapper's group {wrapper_pgid} "
+        f"(last read {last}) — adopt() did not land within {timeout}s")
+
+
 # ---------------------------------------------------------------------------
 # 1. THE HEALTHY CASE — run it first
 # ---------------------------------------------------------------------------
@@ -339,7 +366,10 @@ def test_containerless_admit_takes_no_slot_and_a_build_does_not_block_it(tmp_pat
 
     rec = json.loads((state / "admissions.ndjson").read_text().strip().splitlines()[-1])
     assert rec["kind"] == "containerless" and rec["slot"] is False
-    os.killpg(os.getpgid(p1.pid), signal.SIGKILL)
+    # Kill the WORK's group, read from the holder record — not the wrapper's
+    # (_cmd_run spawns the work with its own start_new_session=True, so the
+    # wrapper's group is a different, harmless one to kill).
+    os.killpg(_wait_for_adopted_pgid(state, p1.pid, slots=2), signal.SIGKILL)
 
 
 # ---------------------------------------------------------------------------
@@ -566,7 +596,10 @@ def test_status_reports_the_queue_and_its_method(tmp_path):
     text = _run(state, "status", slots=1).stdout
     assert "HOLD" in text and "build" in text and "T-0974 staging deploy" in text
     assert "checked:" in text
-    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+    # Kill the WORK's group, not the wrapper's — re-read rather than reuse
+    # h["pgid"]: that first read can land before adopt() overwrites it (see
+    # _wait_for_adopted_pgid).
+    os.killpg(_wait_for_adopted_pgid(state, p.pid, slots=1), signal.SIGKILL)
 
 
 def test_timeout_is_reported_as_not_measured(tmp_path):

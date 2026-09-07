@@ -1222,11 +1222,17 @@ def _idle_age(row: dict, meta: dict, user_home: str, now: float) -> float | None
     anchor_age = system_wake_anchor_age(meta, now)
     hook_age = lifecycle_events.hook_idle_age(cwd, sid, now)
     if hook_age is not None:
-        # 0.0 is how the hook signal says A TURN IS IN PROGRESS (an `.active`
-        # marker at or after the Stop). The anchor must never speak over that:
-        # it would report a session that is mid-answer as idle for an hour and
-        # recycle it out from under its own reply.
-        return hook_age if hook_age <= 0.0 else max(hook_age, anchor_age or 0.0)
+        # ...but never over a session that is MID-ANSWER. A running turn is the
+        # one state the anchor must not lengthen: it would report a session that
+        # is composing a reply as idle for an hour and recycle it out from under
+        # itself, and on this role that reply is the stakeholder's conversation.
+        # Asked of the markers (`hook_turn_in_progress`) rather than inferred
+        # from `hook_idle_age`'s folded 0.0, which a turn that ended this very
+        # instant returns too — the proxy read a just-finished turn as running
+        # and pinned the very session the anchor exists to release.
+        if lifecycle_events.hook_turn_in_progress(cwd, sid):
+            return hook_age
+        return max(hook_age, anchor_age or 0.0)
     claude_uuid = row.get("claude_uuid") or meta.get("claude_uuid")
     at = sessions._pane_activity_at(cwd, claude_uuid, user_home)
     if at is None:

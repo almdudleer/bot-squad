@@ -603,6 +603,40 @@ def test_exited_in_progress_dev_no_timestamp_is_not_archived(tmp_path, monkeypat
     assert "archived" not in S._read_session_metadata(p)
 
 
+def test_exited_stale_reap_notes_death_on_the_ticket(tmp_path, monkeypatch):
+    """T-1055: before this, an ``exited-stale`` reap's only trace was the now-
+    archived session md's ``archive_reason`` field and the internal reap-log
+    jsonl — neither of which a human reads unprompted ("a session ended... and
+    nothing records how"). The ticket itself must now carry the same fact."""
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "in_progress")
+    p = _seed_session(cfg, "S-u-feat-dev-p1", window="feat-dev", task_id="T-0001",
+                      status="suspended", suspended_at=_seed_old_ts(48 * 3600))
+    monkeypatch.setenv("BOT_SQUAD_SESSION_STALE_SEC", str(24 * 3600))
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 1
+    assert S._read_session_metadata(p)["archive_reason"] == "auto-archive:exited-stale"
+    ticket_body = (cfg.data_dir / "test-project" / "backlog" / "T-0001-thing.md").read_text()
+    assert "## Progress" in ticket_body
+    assert "S-u-feat-dev-p1" in ticket_body
+    assert "exited-stale" in ticket_body
+    assert "no handoff" in ticket_body
+
+
+def test_fresh_exited_dev_within_grace_notes_nothing(tmp_path, monkeypatch):
+    """The twin negative: within the grace window nothing is reaped, so no
+    death note is written either — the note tracks the reap, not the crash."""
+    cfg = _make_cfg(tmp_path)
+    _seed_task(cfg, "T-0001", "in_progress")
+    _seed_session(cfg, "S-u-feat-dev-p1", window="feat-dev", task_id="T-0001",
+                  status="suspended", suspended_at=_seed_old_ts(120))
+    monkeypatch.setenv("BOT_SQUAD_SESSION_STALE_SEC", str(24 * 3600))
+    res = archive_dead_teammates(cfg, "test-project")
+    assert res["archived"] == 0
+    ticket_body = (cfg.data_dir / "test-project" / "backlog" / "T-0001-thing.md").read_text()
+    assert "## Progress" not in ticket_body
+
+
 def test_stale_reap_respects_env_threshold(tmp_path, monkeypatch):
     """The grace is env-tunable; a moderately-aged session is reaped only once
     the threshold drops below its age."""

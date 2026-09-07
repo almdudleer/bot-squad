@@ -91,6 +91,40 @@ def test_merge_task_update_noop_status_never_restamps(tmp_path: Path):
     assert new_fm["status_since"] == "2020-01-01T00:00:00Z"
 
 
+def test_merge_task_update_reentry_within_same_second_gets_monotonic_stamp(
+    tmp_path: Path, monkeypatch
+):
+    """T-1016: status_since is stamped at whole-second resolution (the exact
+    twin of scripts/cli/bsq's writer), so two real transitions landing inside
+    one wall-clock second must not collapse to an identical stamp —
+    status_deadlines.py's alert dedup is keyed on
+    (ticket_id, status, status_since), so an unchanged stamp on re-entry reads
+    as "still the same stay" and swallows the alert. Freeze the clock rather
+    than rely on wall-clock luck to land in the same second."""
+    import app.markdown_writer as mw
+    from datetime import datetime, timezone
+
+    frozen = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen
+
+    monkeypatch.setattr(mw, "datetime", _FrozenDatetime)
+    p = tmp_path / "T-0011e-x.md"
+    write_task(p, {"id": "T-0011e", "title": "X", "status": "in_progress",
+                   "status_since": "2020-01-01T00:00:00Z"}, "body\n")
+    first_fm = merge_task_update(p, {"status": "blocked_on_user"})
+    first = first_fm["status_since"]
+    second_fm = merge_task_update(p, {"status": "in_progress"})
+    third_fm = merge_task_update(p, {"status": "blocked_on_user"})
+    second = third_fm["status_since"]
+    assert first == "2025-01-01T00:00:00Z"
+    assert second != first
+    assert second == "2025-01-01T00:00:02Z"  # two same-second collisions, each bumped 1s
+
+
 def test_merge_task_update_unrelated_field_never_touches_status_since(tmp_path: Path):
     """A body/title edit bumps `updated` but must NOT reset the status clock —
     that is precisely the confusion T-0950's deadline sweep exists to avoid."""

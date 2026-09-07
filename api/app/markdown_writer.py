@@ -7,7 +7,7 @@ import os
 import re
 import tempfile
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.frontmatter import dump_frontmatter
@@ -72,6 +72,32 @@ def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _fresh_since_stamp(prev: object, now: str) -> str:
+    """A ``status_since``-style stamp guaranteed to differ from ``prev`` (T-1016).
+
+    Both status_since writers (this one and scripts/cli/bsq's
+    ``cmd_ticket_update``) stamp at whole-SECOND resolution. That is not just
+    imprecise — status_deadlines.py's alert dedup is keyed on
+    ``(ticket_id, status, status_since)``, so a re-entry into the same gated
+    status that lands in the same wall-clock second as the stay it just left
+    would collide with the value already recorded and silently read as "still
+    the same stay," swallowing the fresh alert its own docstring promises.
+    Bumping by whole seconds (never sub-second) keeps the on-disk format and
+    every existing regex/consumer of it unchanged; only re-entries fast enough
+    to collide ever see a bump, and each one is exactly 1s past the last."""
+    prev_s = str(prev or "").strip()
+    if not prev_s:
+        return now
+    try:
+        prev_dt = datetime.strptime(prev_s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        now_dt = datetime.strptime(now, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return now  # an unparseable prior stamp has nothing to collide with
+    if now_dt > prev_dt:
+        return now
+    return (prev_dt + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def write_task(path: Path, frontmatter: dict, body: str) -> None:
     """Write a task file atomically — UNIQUE tmp then os.replace.
 
@@ -126,7 +152,7 @@ def merge_task_update(path: Path, updates: dict, body: str | None = None) -> dic
         # audit finding is about.
         now = _now_utc_iso()
         if "status" in updates and updates["status"] != fm.get("status"):
-            fm["status_since"] = now
+            fm["status_since"] = _fresh_since_stamp(fm.get("status_since"), now)
 
         # Apply updates
         for k, v in updates.items():

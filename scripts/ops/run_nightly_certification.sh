@@ -24,9 +24,31 @@
 # every arm passed; a nonzero exit is the routine's breach signal, and the
 # routine's `on_breach: spawn` is what gets a dev looking at a real failure,
 # same job a red GitHub check would have done.
+#
+# T-1067: bash reads a script BY BYTE OFFSET as it executes, not into memory
+# up front — a live edit of THIS file's own tracked path while a run is
+# mid-flight (this run is ~30-45+ minutes) reaches the running interpreter
+# silently, no error, no diagnostic. R-0010's routine `cmd` now invokes this
+# script through `scripts/ops/run_from_copy.sh`, which snapshots it to a
+# private path before it ever starts running, so THIS script's own bytes are
+# frozen for the run's whole duration regardless of what happens afterward to
+# the tracked path. Run it directly (`bash scripts/ops/run_nightly_certification.sh`)
+# only for a quick manual check — a direct run reads the live tracked path
+# and is exposed to the hazard for as long as it runs. See T-1067 for the
+# positive control and for what this mitigation does NOT cover (anything
+# reached by path AFTER this script starts — e.g. `$BSQ` below — is read live,
+# not frozen; `scripts/cli/bsq` already has its own separate protection,
+# T-0972).
 set -uo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# T-1067: when run through run_from_copy.sh, ${BASH_SOURCE[0]} is a flat
+# snapshot path (e.g. /tmp/tmp.XXXX/run_nightly_certification.sh) — this
+# script's own bytes are deliberately relocated, but the REPO it needs to
+# find (worker/, api/, $BSQ, web/) is not, and never should be (see the
+# header comment on what the copy does and does not cover). Derive REPO from
+# RUN_FROM_COPY_SRC (the original tracked path the wrapper copied FROM) when
+# set, falling back to BASH_SOURCE for a direct, unwrapped run.
+REPO="$(cd "$(dirname "${RUN_FROM_COPY_SRC:-${BASH_SOURCE[0]}}")/../.." && pwd)"
 BSQ="$REPO/scripts/cli/bsq"
 
 # Mount-root sentinel (AGENT_INSTRUCTIONS.md): a wrong REPO fails silently
@@ -134,6 +156,16 @@ mkdir -p "$PYTEST_TMP"
 exec > >(tee -a "$LOG") 2>&1
 echo "=== T-1046 host-side nightly certification — run $RUN_ID ($(date -u -Iseconds)) ==="
 
+# T-1067: record which bytes this run actually executed, in THIS run's own
+# dated log (not just run_from_copy.sh's own stdout, which nothing else
+# reads). RUN_FROM_COPY_* is exported by scripts/ops/run_from_copy.sh before
+# it exec's into the snapshot — set only when invoked that way.
+if [ -n "${RUN_FROM_COPY_PATH:-}" ]; then
+  echo "T-1067: running from a snapshot copy — src=${RUN_FROM_COPY_SRC:-?} copy=$RUN_FROM_COPY_PATH sha256=${RUN_FROM_COPY_SHA256:-?}"
+else
+  echo "T-1067: NOT running from a copy — reading the live tracked path directly ($0). Exposed to the mid-run-rewrite hazard for this run's full duration. Prefer: scripts/ops/run_from_copy.sh $0"
+fi
+
 # `--with-git` is LOAD-BEARING beyond the T-1010 reason (scripts-cli needs a
 # real .git): TMPDIR above sits under /home/www/bot-squad, which is itself
 # inside an ambient git repo. `--with-git` takes the "materialise as a real
@@ -235,8 +267,8 @@ run_arm web bash -c "cd '$DEST/web' && npm test"
 rm -rf "${PYTEST_TMP:?}"/* 2>/dev/null || true
 run_arm scripts-cli bash -c "cd '$DEST' && TMPDIR='$PYTEST_TMP' '$REPO/worker/.venv/bin/python' -m pytest --basetemp='$PYTEST_TMP' -q scripts/cli"
 
-# shell-tests — T-1039's six scripts, no installs, plain bash from the
-# isolated checkout.
+# shell-tests — T-1039's six scripts plus T-1067's run_from_copy.sh test, no
+# installs, plain bash from the isolated checkout.
 run_arm shell-tests bash -c "
   cd '$DEST' &&
   git config user.email ci@bot-squad.local &&
@@ -246,7 +278,8 @@ run_arm shell-tests bash -c "
   bash .githooks/test_push_policy.sh &&
   bash scripts/hooks/test_derive_role.sh &&
   bash scripts/hooks/test_worktree_guard.sh &&
-  bash scripts/ops/test_smoke_with_backoff.sh
+  bash scripts/ops/test_smoke_with_backoff.sh &&
+  bash scripts/ops/test_run_from_copy.sh
 "
 
 echo "=== SUMMARY ($(date -u -Iseconds)) ==="

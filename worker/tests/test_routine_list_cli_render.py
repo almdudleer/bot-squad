@@ -127,3 +127,67 @@ def test_no_observation_yet_still_renders_pass_leg(bsq, capsys):
     assert "last=—" in out
     assert "error" not in out
     assert "BROKEN" not in out
+
+
+# --- T-1023: a project-wide drive-pause must not render like a healthy or a
+# broken routine — its own marker, carrying the live paused state ----------
+
+def test_default_call_renders_no_stand_down_marker(bsq, capsys):
+    """Backward compat: every pre-T-1023 call site (and every test above)
+    calls ``_routine_print_row(r)`` with no second argument. The default must
+    keep rendering exactly as before — no marker invented from thin air."""
+    out = _row(bsq, _base(), capsys)
+    assert "STOOD DOWN" not in out
+
+
+def test_healthy_monitor_under_paused_drive_gets_stood_down_not_silently_ok(bsq, capsys):
+    """The defect itself: errors=0 + a paused drive used to render EXACTLY
+    like a healthy, actively-probed monitor. The live paused flag (never
+    inferred from staleness) must now say so, carrying last_probe_at — the
+    freshness fact the pass leg alone doesn't surface."""
+    r = _base(last_probe_at="2026-08-31T09:00:00+00:00")
+    bsq._routine_print_row(r, automation_paused=True)
+    out = capsys.readouterr().out
+    assert "STOOD DOWN" in out
+    assert "drive paused" in out
+    assert "2026-08-31T09:00:00+00:00" in out
+    assert "BROKEN" not in out
+
+
+def test_broken_monitor_under_paused_drive_shows_both_facts_not_merged(bsq, capsys):
+    """BROKEN (a fact about past probes) and STOOD DOWN (a fact about right
+    now) are independent — the ticket's own point is that a deliberate
+    stand-down and a dead mechanism must NOT render the same, so when both
+    are true, both words must appear rather than one swallowing the other."""
+    r = _base(consecutive_errors=10, broken=True,
+              last_value_at="2026-08-31T09:00:00+00:00",
+              last_probe_at="2026-08-31T09:00:00+00:00")
+    bsq._routine_print_row(r, automation_paused=True)
+    out = capsys.readouterr().out
+    assert "BROKEN" in out
+    assert "STOOD DOWN" in out
+
+
+def test_paused_status_routine_is_not_double_marked(bsq, capsys):
+    """A routine already ``[paused]`` (its OWN status, a different and already
+    visible fact) is not additionally flagged STOOD DOWN just because the
+    project drive also happens to be paused — that would conflate two
+    distinct pause concepts into one marker."""
+    r = _base()
+    r["status"] = "paused"
+    bsq._routine_print_row(r, automation_paused=True)
+    out = capsys.readouterr().out
+    assert "STOOD DOWN" not in out
+    assert "[paused]" in out
+
+
+def test_schedule_row_under_paused_drive_gets_stood_down(bsq, capsys):
+    """The schedule (non-monitor) branch gets the same treatment, carrying
+    last_run_at rather than last_probe_at."""
+    r = {"id": "R-0002", "status": "active", "trigger": "schedule",
+         "schedule": "0 9 * * *", "next_run_at": "2026-07-06T09:00:00+00:00",
+         "last_run_at": "2026-07-05T09:00:00+00:00", "title": "daily digest"}
+    bsq._routine_print_row(r, automation_paused=True)
+    out = capsys.readouterr().out
+    assert "STOOD DOWN" in out
+    assert "2026-07-05T09:00:00+00:00" in out

@@ -3916,7 +3916,18 @@ _ROUTINE_LIST_ALLOWED = _ROUTINE_LIST_REQUIRED
 
 
 def _action_routine_list(params: dict[str, Any]) -> dict[str, Any]:
-    """List declared Routines for a project (T-0464). Returns {ok, routines:[...]}."""
+    """List declared Routines for a project (T-0464).
+
+    Returns ``{ok, routines:[...], automation_paused: bool}``. T-1023:
+    ``automation_paused`` is a LIVE read of the same T-0929 SSOT
+    ``automation.gate`` checks before every schedule tick / monitor sweep — not
+    inferred from any routine's own staleness, which is the exact conflation
+    this ticket exists to remove (a wedged sweep looks stale too). Without it,
+    a project-wide drive-pause and a genuinely dead mechanism were
+    indistinguishable here: both leave every routine's last reading frozen with
+    errors=0, and only the worker's log carried the fact that firing had been
+    deliberately stood down.
+    """
     extra = set(params) - _ROUTINE_LIST_ALLOWED
     if extra:
         raise ActionError(f"routine_list got unexpected params: {sorted(extra)}")
@@ -3924,13 +3935,18 @@ def _action_routine_list(params: dict[str, Any]) -> dict[str, Any]:
     if missing:
         raise ActionError(f"routine_list missing required params: {sorted(missing)}")
 
+    from bot_squad_worker import automation as _automation
     from bot_squad_worker import routines as _routines
 
     cfg = _get_config()
     slug = params["slug"]
     if cfg.projects.get(slug) is None:
         raise ActionError(f"routine_list: unknown project slug {slug!r}")
-    return {"ok": True, "routines": _routines.list_routines(cfg, slug)}
+    return {
+        "ok": True,
+        "routines": _routines.list_routines(cfg, slug),
+        "automation_paused": not _automation.allowed(cfg, slug),
+    }
 
 
 _ROUTINE_MUTE_REQUIRED = {"slug", "rid", "duration_s"}

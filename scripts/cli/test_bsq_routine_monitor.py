@@ -181,6 +181,47 @@ def test_list_renders_monitor_columns_and_mute(monkeypatch, capsys):
     assert "schedule:0 9 * * *" in sched_line and "MUTED" not in sched_line
 
 
+def test_list_no_banner_when_not_paused(monkeypatch, capsys):
+    """T-1023: the default (no ``automation_paused`` key, matching a worker
+    predating this ticket) prints exactly as before — no banner invented."""
+    _record_post(monkeypatch, result={"ok": True, "routines": [
+        {"id": "R-0002", "status": "active", "trigger": "schedule",
+         "schedule": "0 9 * * *", "next_run_at": "2026-07-06T09:00:00+00:00",
+         "title": "daily digest"},
+    ]})
+    bsq.cmd_routine_list(SimpleNamespace())
+    out = capsys.readouterr().out
+    assert "PAUSED" not in out
+    assert "STOOD DOWN" not in out
+
+
+def test_list_banner_and_row_marker_when_drive_paused(monkeypatch, capsys):
+    """T-1023: the defect was a project-wide drive-pause rendering identically
+    to a broken routine — stale reading, errors=0, nothing distinguishing it.
+    A live ``automation_paused`` flag on the action response must now print a
+    banner once and mark each active routine's row."""
+    _record_post(monkeypatch, result={"ok": True, "automation_paused": True,
+        "routines": [
+        {"id": "R-0001", "status": "active", "trigger": "monitor",
+         "title": "disk watch",
+         "monitor": {"probe": "shell", "interval_s": 30, "judge": "numeric_gt",
+                     "threshold": 85, "last_value": 91, "breach": False,
+                     "consecutive_errors": 0, "broken": False,
+                     "last_probe_at": "2026-07-05T19:00:00+00:00",
+                     "last_fired_at": None}},
+        {"id": "R-0002", "status": "active", "trigger": "schedule",
+         "schedule": "0 9 * * *", "next_run_at": "2026-07-06T09:00:00+00:00",
+         "last_run_at": "2026-07-05T09:00:00+00:00", "title": "daily digest"},
+    ]})
+    bsq.cmd_routine_list(SimpleNamespace())
+    out = capsys.readouterr().out
+    lines = out.strip().splitlines()
+    assert "PAUSED" in lines[0]
+    mon_line, sched_line = lines[1], lines[2]
+    assert "STOOD DOWN" in mon_line and "2026-07-05T19:00:00+00:00" in mon_line
+    assert "STOOD DOWN" in sched_line and "2026-07-05T09:00:00+00:00" in sched_line
+
+
 def test_list_monitor_absent_state_renders_dashes(monkeypatch, capsys):
     _record_post(monkeypatch, result={"ok": True, "routines": [
         {"id": "R-0001", "status": "active", "trigger": "monitor", "title": "t",

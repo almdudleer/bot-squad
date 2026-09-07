@@ -1603,6 +1603,34 @@ def test_list_routines_carries_the_error_REASON_from_the_first_error_T0999(
     assert row["last_value"] == 6
 
 
+def test_routine_list_action_surfaces_live_automation_paused_T1023(mcfg, monkeypatch):
+    """T-1023: a project-wide T-0929 drive-pause used to leave every routine's
+    reading exactly where it stopped, with the pause fact visible only in the
+    worker's log — a drive-paused project and a genuinely dead mechanism
+    rendered identically. ``automation_paused`` on the ``routine_list`` action
+    response is a LIVE read of the same pause flag ``automation.gate`` checks,
+    not something derived from any routine's own staleness (a wedged sweep
+    goes stale exactly the same way, so that inference would just move the
+    conflation rather than remove it)."""
+    from bot_squad_worker import actions as A
+    from bot_squad_worker import operator_redrive as OR
+
+    cfg, slug, _ = mcfg
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    R.declare(cfg, slug, instruction="daily", schedule="0 9 * * *", now=T0)
+
+    res = A._action_routine_list({"slug": slug})
+    assert res["automation_paused"] is False
+
+    OR.pause(cfg, slug, by="test", reason="T-1023 test")
+    res = A._action_routine_list({"slug": slug})
+    assert res["automation_paused"] is True
+
+    OR.resume(cfg, slug)
+    res = A._action_routine_list({"slug": slug})
+    assert res["automation_paused"] is False
+
+
 def test_list_routines_schedule_rows_unchanged(mcfg):
     """Schedule routines keep the pre-T-0604 summary shape — no monitor key,
     no mute keys."""

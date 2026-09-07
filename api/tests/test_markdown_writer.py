@@ -65,6 +65,16 @@ def test_merge_task_update_rejects_unknown_keys(tmp_path: Path):
         merge_task_update(p, {"secret": "hax"})
 
 
+def test_merge_task_update_rejects_filed_by(tmp_path: Path):
+    # T-1052: `filed_by` (task_new's filer stamp) is create-time-only, like
+    # `provenance`/`owner` — never silently widen the PATCH allowlist to
+    # cover it, so a later caller can't overwrite the true filer.
+    p = tmp_path / "T-1052x-x.md"
+    write_task(p, {"id": "T-1052x", "title": "X", "status": "open"}, "body\n")
+    with pytest.raises(ValueError, match="disallowed"):
+        merge_task_update(p, {"filed_by": "S-someone"})
+
+
 def test_merge_task_update_bumps_updated_timestamp(tmp_path: Path):
     p = tmp_path / "T-0011-x.md"
     write_task(p, {"id": "T-0011", "title": "X", "status": "open"}, "body\n")

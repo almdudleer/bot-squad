@@ -409,6 +409,19 @@ def composer_text(buf: str) -> str | None:
     return block.text
 
 
+def looks_generating(buf: str) -> bool:
+    """Is this pane mid-turn — producing output, with no composer to read?
+
+    :func:`observe` has always branched on this; it was private, so the two
+    delivery-confirmation readers in ``input_mux`` could not ask. They called
+    :func:`composer_text` instead, which returns ``None`` here, and read that
+    absence as "the composer cleared" — i.e. as proof of submission. Exposing
+    the predicate is what lets a confirmation say "I cannot see" instead of
+    "it went".
+    """
+    return bool(buf) and _GENERATING_MARK in buf.lower()
+
+
 def looks_like_dialog(buf: str, live: str | None = None) -> bool:
     """True when the ``❯`` belongs to a permission/choice prompt, not a composer.
 

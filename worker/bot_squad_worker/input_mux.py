@@ -503,7 +503,8 @@ def _paste_block(pane_id: str, text: str) -> None:
     _run(["tmux", "paste-buffer", "-t", pane_id, "-b", buf_name, "-p", "-d"])
 
 
-def _deliver_to_pane(pane_id: str, text: str) -> None:
+def _deliver_to_pane(pane_id: str, text: str, *,
+                     capture: Callable[[str], str] | None = None) -> None:
     """Deliver a (possibly multi-line) payload as ONE composer message.
 
     Uses a bracketed paste (``paste-buffer -p``) so embedded newlines insert as
@@ -524,32 +525,24 @@ def _deliver_to_pane(pane_id: str, text: str) -> None:
     existing exception handler requeues the batch instead of reporting it
     delivered.
     """
-    from bot_squad_worker import composer_watch
+    capture = capture or _capture_pane
+    was_generating = _pane_is_generating(pane_id, capture)
     _paste_block(pane_id, text)
     time.sleep(0.4)
 
-    for attempt in range(_DELIVER_CONFIRM_MAX_RETRIES):
-        raw_keys(pane_id, "Enter")
-        deadline = time.monotonic() + _DELIVER_CONFIRM_TIMEOUT_SEC
-        while time.monotonic() < deadline:
-            time.sleep(_DELIVER_CONFIRM_POLL_INTERVAL_SEC)
-            if not (composer_watch.composer_text(_capture_pane(pane_id)) or "").strip():
-                if attempt:
-                    log.info("input_mux: %s's composer cleared after %d retry "
-                             "Enter(s) — the first was swallowed", pane_id,
-                             attempt)
-                return
-        log.warning("input_mux: %s's composer still shows the payload %d.%ds "
-                    "after Enter (attempt %d/%d) — resending", pane_id,
-                    int(_DELIVER_CONFIRM_TIMEOUT_SEC),
-                    int(_DELIVER_CONFIRM_TIMEOUT_SEC * 10) % 10, attempt + 1,
-                    _DELIVER_CONFIRM_MAX_RETRIES)
-    log.error("input_mux: %s's composer never cleared after %d Enter "
-             "attempts — requeuing rather than reporting delivered", pane_id,
-             _DELIVER_CONFIRM_MAX_RETRIES)
+    # T-0913: ONE confirmation for both lanes. This loop used to be a second
+    # copy, and it carried the same defect — it read "no composer to look at"
+    # as "the composer cleared", which on a generating pane is a false
+    # positive. Sharing :func:`_submit_confirmed` means that fix cannot drift
+    # back apart, and it also gains the permission-dialog stop the queued lane
+    # never had.
+    outcome = _submit_confirmed(pane_id, text, capture,
+                                was_generating=was_generating)
+    if outcome == "cleared":
+        return
     raise DeliveryNotConfirmed(
-        f"composer for {pane_id} never cleared after "
-        f"{_DELIVER_CONFIRM_MAX_RETRIES} Enter attempts")
+        f"composer for {pane_id} did not confirm the payload submitted "
+        f"(outcome={outcome})")
 
 
 # Direct-lane knobs (read at call time so tests can monkeypatch them):
@@ -676,8 +669,24 @@ def _preview(text: str, limit: int = 60) -> str:
     return flat if len(flat) <= limit else flat[:limit] + "…"
 
 
+def _pane_is_generating(pane_id: str, capture: Callable[[str], str]) -> bool:
+    """Was this pane mid-turn BEFORE we touched it? (T-0913.)
+
+    Fails to ``True`` — a capture we could not take means we cannot claim the
+    pane was idle, and claiming idle is what licenses reading a later
+    generating frame as proof of submission. The safe direction here is to end
+    up reporting ``unknown``, never to invent a ``cleared``.
+    """
+    from bot_squad_worker import composer_watch
+    try:
+        return composer_watch.looks_generating(capture(pane_id))
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _submit_confirmed(pane_id: str, what: str,
-                      capture: Callable[[str], str]) -> str:
+                      capture: Callable[[str], str], *,
+                      was_generating: bool = False) -> str:
     """Press Enter until the composer confirms it cleared. Returns the outcome.
 
     T-0957 DoD 2: an Enter can be swallowed (it lands inside tmux's
@@ -688,9 +697,31 @@ def _submit_confirmed(pane_id: str, what: str,
     rune is its own outcome: the retry stops rather than blasting Enter into a
     prompt that is not this session's to answer.
 
-    ``"cleared"`` | ``"dialog"`` | ``"unconfirmed"``.
+    T-0913 (2026-09-07), and this is the defect the FIRST version of this
+    function had: ``composer_watch.composer_text`` returns ``None`` on a pane
+    that is mid-turn — a generating pane shows no composer box at all — and
+    ``(None or "").strip()`` is falsy, so **"there is nothing to look at" was
+    read as "it cleared", i.e. as proof of submission.** That is a false
+    positive by construction, and it fires in exactly the state where a nudge
+    is most likely to park: a busy session. Measured live on this fleet at
+    14:11:51Z — an operator hold was typed into a generating pane, `inject_input`
+    returned 200 with no warning logged anywhere, and the session did not read
+    its inbox for 10m16s.
+
+    The fix is a zero captured BEFORE the keystroke, not a better reading after
+    it. ``was_generating`` says what the pane was doing before we pressed
+    Enter, because "the pane is generating now" means opposite things depending
+    on it:
+
+    * pane was IDLE, is generating now — only our Enter can have started that
+      turn, so it submitted. This is the common case and it must stay cheap.
+    * pane was ALREADY generating — the same frame tells us nothing at all, and
+      the honest outcome is ``"unknown"``, never ``"cleared"``.
+
+    ``"cleared"`` | ``"dialog"`` | ``"unknown"`` | ``"unconfirmed"``.
     """
     from bot_squad_worker import composer_watch
+    saw_unknown = False
     for attempt in range(_DELIVER_CONFIRM_MAX_RETRIES):
         raw_keys(pane_id, "Enter")
         deadline = time.monotonic() + _DELIVER_CONFIRM_TIMEOUT_SEC
@@ -704,7 +735,16 @@ def _submit_confirmed(pane_id: str, what: str,
             if composer_watch.looks_like_dialog(buf):
                 outcome = "dialog"
                 break
-            if not (composer_watch.composer_text(buf) or "").strip():
+            live = composer_watch.composer_text(buf)
+            if live is None or composer_watch.looks_generating(buf):
+                # No composer to read. Evidence of submission ONLY if this pane
+                # was not already in that state before we typed.
+                if not was_generating:
+                    outcome = "cleared"
+                    break
+                saw_unknown = True
+                continue
+            if not live.strip():
                 outcome = "cleared"
                 break
         if outcome == "cleared":
@@ -719,6 +759,13 @@ def _submit_confirmed(pane_id: str, what: str,
                         "stopping retries (payload may be unsubmitted)",
                         pane_id, _preview(what))
             return "dialog"
+    if saw_unknown:
+        log.warning(
+            "input_mux: %s was ALREADY mid-turn when %r was typed, so its "
+            "composer was never visible to confirm against — reporting "
+            "unknown, NOT delivered. The session may never have been woken.",
+            pane_id, _preview(what))
+        return "unknown"
     log.error("input_mux: %s's %r never confirmed submitted after %d "
               "Enter attempts — it may still be sitting in the composer "
               "(direct lane has no queue to requeue into)", pane_id,
@@ -767,11 +814,16 @@ def _type_lines(pane_id: str, text: str, *,
     """
     capture = capture or _capture_pane
     lines = text.split("\n")
+    # T-0913: the reference for "did it submit" has to be taken BEFORE the
+    # keystrokes. A pane that is generating AFTERWARDS proves submission only
+    # if it was not already generating BEFORE — see :func:`_submit_confirmed`.
+    was_generating = _pane_is_generating(pane_id, capture)
 
     if len(lines) > 1 and _direct_paste_enabled():
         _paste_block(pane_id, text)
         time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
-        outcome = _submit_confirmed(pane_id, text, capture)
+        outcome = _submit_confirmed(pane_id, text, capture,
+                                    was_generating=was_generating)
         return DirectDelivery(len(lines), outcome)
 
     # T-0913: the WORST outcome wins. Under the pre-T-1038 kill switch a payload
@@ -781,9 +833,11 @@ def _type_lines(pane_id: str, text: str, *,
     for line in lines:
         raw_keys(pane_id, "--", line)
         time.sleep(_DIRECT_INTERLINE_PAUSE_SEC)
-        outcome = _submit_confirmed(pane_id, line, capture)
+        outcome = _submit_confirmed(pane_id, line, capture,
+                                    was_generating=was_generating)
         if outcome != "cleared" and worst == "cleared":
             worst = outcome
+        was_generating = _pane_is_generating(pane_id, capture)
     return DirectDelivery(len(lines), worst)
 
 

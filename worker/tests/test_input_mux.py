@@ -485,8 +485,14 @@ def test_codex_composer_rune_defeats_the_swallowed_enter_safety_net(monkeypatch)
 
     sent = input_mux._type_lines("%1", "check mail", capture=capture)
 
-    assert sent == 1          # reported delivered ...
-    assert calls["n"] == 1    # ... after a SINGLE poll, no retries attempted
+    # STILL reported delivered, and that is the point of pinning it. T-0913's
+    # was_generating fix does NOT close this: it separates "no composer
+    # because the pane is mid-turn" from "no composer because it cleared", and
+    # a codex pane is neither — its composer is simply unparseable, which is
+    # indistinguishable from empty at this layer.
+    assert sent.outcome == "cleared"        # ...the net does not even fire
+    assert sent.submitted is True           # ...and the caller is told it went
+    assert "unconfirmed" not in (sent.outcome or "")
 
 
 # ---------------------------------------------------------------------------
@@ -884,7 +890,7 @@ def test_the_worst_line_decides_a_multi_submission_payload(monkeypatch):
     monkeypatch.setattr(input_mux, "time", _NoSleep())
     outcomes = iter(["unconfirmed", "cleared"])   # line 1 parks, line 2 goes
     monkeypatch.setattr(input_mux, "_submit_confirmed",
-                        lambda pane, what, capture: next(outcomes))
+                        lambda pane, what, capture, **kw: next(outcomes))
 
     sent = input_mux._type_lines("%1", "one\ntwo", capture=lambda p: _BUF_EMPTY)
 
@@ -915,3 +921,137 @@ def test_inject_input_does_not_report_a_parked_nudge_as_delivered(tmp_path, monk
     assert res["lines_sent"] == 1        # unchanged: it WAS one line
     assert res["submitted"] is False     # ...that never became a turn
     assert res["outcome"] == "unconfirmed"
+
+
+# ---------------------------------------------------------------------------
+# T-0913, the deeper half — measured live 2026-09-07 14:11:51Z.
+#
+# An operator hold was typed into this session's composer while the session was
+# MID-TURN. `inject_input` returned 200, the worker logged nothing at all, and
+# the session did not read its inbox for 10 minutes 16 seconds.
+#
+# The mechanism is not the transport. `composer_watch.composer_text` returns
+# None on a generating pane — there is no composer box on screen — and the
+# confirmation did `(composer_text(buf) or "").strip()`, so "there is nothing
+# to look at" evaluated exactly like "the box is empty", i.e. like proof of
+# submission. A false positive by construction, firing in precisely the state
+# where a nudge is most likely to park.
+#
+# The fix is a zero captured BEFORE the keystroke, because "the pane is
+# generating now" means opposite things depending on what it was doing before.
+# ---------------------------------------------------------------------------
+
+_BUF_GENERATING = (
+    "✻ Cerebrating… (12s · esc to interrupt)\n"
+    "  ⎿  running a long journalctl\n"
+)
+
+
+def test_a_pane_that_was_ALREADY_generating_reports_unknown_not_delivered(monkeypatch):
+    """THE 14:11:51Z FAILURE. The pane was busy before the nudge and busy
+    after; nothing about that frame says the payload submitted. Before this,
+    the same frames returned "cleared"."""
+    _fast_confirm(monkeypatch)
+    monkeypatch.setattr(input_mux, "raw_keys", lambda *a, **k: None)
+
+    sent = input_mux._type_lines("%1", "check mail",
+                                 capture=lambda p: _BUF_GENERATING)
+
+    assert sent.outcome == "unknown"
+    assert sent.submitted is False
+
+
+def test_an_idle_pane_that_starts_generating_IS_a_confirmed_submit(monkeypatch):
+    """THE POSITIVE CONTROL, and it is what stops the fix over-correcting: a
+    successful Enter CAUSES generation. If a generating frame never counted,
+    every nudge to an idle pane would report unconfirmed and blast retries —
+    the opposite defect, and a worse one."""
+    _fast_confirm(monkeypatch)
+    monkeypatch.setattr(input_mux, "raw_keys", lambda *a, **k: None)
+    frames = iter([_BUF_EMPTY])          # idle BEFORE; generating after
+
+    sent = input_mux._type_lines("%1", "check mail",
+                                 capture=lambda p: next(frames, _BUF_GENERATING))
+
+    assert sent.outcome == "cleared"
+    assert sent.submitted is True
+
+
+def test_the_reference_is_taken_before_the_keystrokes_not_after(monkeypatch):
+    """The zero must be captured BEFORE Enter. Reading it afterwards is the
+    moving-origin defect: by then our own submission has changed the state we
+    are using to interpret our own submission."""
+    _fast_confirm(monkeypatch)
+    order: list[str] = []
+    monkeypatch.setattr(input_mux, "raw_keys",
+                        lambda pane, *a, **k: order.append("key"))
+
+    def capture(pane_id):
+        order.append("look")
+        return _BUF_GENERATING
+
+    input_mux._type_lines("%1", "check mail", capture=capture)
+
+    assert order[0] == "look", "the pane was typed into before it was read"
+
+
+def test_a_probe_that_cannot_read_the_pane_fails_to_generating(monkeypatch):
+    """Fails to True on purpose. Claiming the pane was IDLE is what licenses
+    reading a later generating frame as proof of submission, so a capture we
+    could not take must never produce that claim — it ends at "unknown"."""
+    monkeypatch.setattr(input_mux, "raw_keys", lambda *a, **k: None)
+
+    def boom(pane_id):
+        raise RuntimeError("tmux went away")
+
+    assert input_mux._pane_is_generating("%1", boom) is True
+
+
+def test_the_queued_lane_shares_the_one_confirmation(monkeypatch):
+    """`_deliver_to_pane` used to carry a SECOND copy of the confirm loop with
+    the same defect in it. One implementation means the fix cannot drift back
+    apart — so the queued lane refuses to report a busy pane delivered too."""
+    _fast_confirm(monkeypatch)
+    monkeypatch.setattr(input_mux, "raw_keys", lambda *a, **k: None)
+    monkeypatch.setattr(input_mux, "_paste_block", lambda *a, **k: None)
+
+    with pytest.raises(input_mux.DeliveryNotConfirmed) as e:
+        input_mux._deliver_to_pane("%1", "his words",
+                                   capture=lambda p: _BUF_GENERATING)
+
+    assert "unknown" in str(e.value)
+
+
+def test_an_unknown_wake_earns_no_quiet_from_T0979(tmp_path, monkeypatch):
+    """The two tickets compose, and this is where. T-0979 suppresses a repeat
+    nudge only when the previous one was CONFIRMED submitted; an "unknown"
+    outcome is not confirmed, so the next peer_send re-nudges instead of
+    inheriting a silence nobody earned."""
+    from bot_squad_worker import actions as A
+    from bot_squad_worker import sessions as S
+    from bot_squad_worker import boot_orientation as B
+
+    cfg = type("C", (), {"data_dir": tmp_path})()
+    pane = S.PaneInfo(pane_id="%6", window="w", pid="123",
+                      cwd=str(tmp_path), command="claude")
+    sid = S.compute_sid("u", pane.window, pane.pane_id)
+    monkeypatch.setattr(A, "_get_config", lambda: cfg)
+    monkeypatch.setattr(S, "_get_current_user", lambda: "u")
+    monkeypatch.setattr(S, "list_panes", lambda: [pane])
+    monkeypatch.setattr("bot_squad_worker.park._slug_for_sid",
+                        lambda c, s: "bot-squad")
+    monkeypatch.setattr(A, "_provider_for_pane", lambda *a, **k: "claude")
+    chat = tmp_path / "bot-squad" / "_chat"
+    chat.mkdir(parents=True)
+    delivered: list[str] = []
+    monkeypatch.setattr(
+        input_mux, "deliver_direct",
+        lambda *a, **k: (delivered.append(1),
+                         input_mux.DirectDelivery(1, "unknown"))[1])
+
+    for msg in ("one", "two"):
+        with (chat / f"inbox-{sid}.log").open("a", encoding="utf-8") as fh:
+            fh.write(msg + "\n")
+        A._action_inject_input({"sid": sid, "text": B.MAIL_SIGNAL})
+
+    assert len(delivered) == 2

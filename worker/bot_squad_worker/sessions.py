@@ -750,7 +750,10 @@ def _derive_role(
     extra_initiatives: list | None = None,
 ) -> str:
     """Map a session's identity fields → role enum:
-    ``operator|prod-teamlead|qa|teamlead|dev``.
+    ``operator|prod-teamlead|qa|teamlead|dev``. (The single shared
+    ``routine-handler`` role, T-0952, is layered on top of this by
+    :func:`_role_of` — keyed on ``owner``, not a window marker — so it is not
+    a case here.)
 
     Precedence (first match wins):
       1. operator window marker (`operator`, `<x>-operator`) → ``operator``
@@ -835,11 +838,32 @@ def _role_of(
     never carried a ``role`` field) are unchanged. The explicit ``window`` /
     ``task_id`` / ``initiative`` kwargs let a live-pane caller pass the live
     tmux window instead of the persisted one.
+
+    T-0952: BEFORE window-derivation, an ``owner`` matching the single shared
+    routine-handler (T-0933, ``routines.ROUTINE_HANDLER_OWNER``) maps to its
+    own ``routine-handler`` role. Keyed on ``owner`` — the property T-0933
+    already stamps and ``routines._live_routine_handler`` already matches on —
+    rather than a new window regex: its window happens to be the same literal
+    string today, but the property is what the runtime treats as this
+    session's identity, and a property does not rot the way a hand-added
+    window-name pattern would (T-0989/T-0990 is the same lesson for the
+    monitor footgun guard). Without this, the handler's window (``routine-
+    handler``) matches none of the marker regexes below and falls to the
+    ``dev`` default — invisible to anything that keys behavior on role
+    (``recycle_plan``'s per-role table, ``bind_task``'s dev-only guard).
     """
     m = meta or {}
     stored = m.get("role")
     if stored and stored != "~":
         return str(stored)
+    owner = m.get("owner")
+    if owner:
+        try:
+            from bot_squad_worker.routines import ROUTINE_HANDLER_OWNER
+        except Exception:  # noqa: BLE001 — never let this derivation raise
+            ROUTINE_HANDLER_OWNER = "routine-handler"
+        if owner == ROUTINE_HANDLER_OWNER:
+            return "routine-handler"
     return _derive_role(
         window if window is not None else m.get("window"),
         task_id if task_id is not None else m.get("task_id"),

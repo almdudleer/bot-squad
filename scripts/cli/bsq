@@ -6513,14 +6513,26 @@ def _image_stamp(created: str):
     return dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def _image_retain_tag(reference: str, info: dict):
+def _image_retain_tag(reference: str, info: dict, prefix: str = "cert"):
     """The retain tag for an image, or None when it cannot be named.
 
-    Byte-identical to what the T-1001-IMAGE-RETAIN shell block produces for the
-    same image, and pinned to it by test_t1005_retain_parity.py. Both
-    coordinates come FROM THE IMAGE — its build time and the ref it was built
-    from — never from the clock, so retaining the same image twice is idempotent
-    rather than a second tag for the same bytes.
+    With the default ``prefix="cert"``, byte-identical to what the
+    T-1001-IMAGE-RETAIN shell block produces for the same image, and pinned to
+    it by test_t1005_retain_parity.py. Both coordinates come FROM THE IMAGE —
+    its build time and the ref it was built from — never from the clock, so
+    retaining the same image twice is idempotent rather than a second tag for
+    the same bytes.
+
+    T-1027: ``prefix`` exists because ``cert-`` is not just storage — it is
+    the OBSERVABLE the T-1001/T-1005 two-deploy survival check reads, which
+    depends on the first ``cert-`` tag to appear being one a DEPLOY wrote.
+    ``_image_retain_tag`` is a pure function of the image, so a hand retain
+    that also wrote ``cert-`` would compute the SAME tag a deploy would later
+    write — accurate, idempotent, and indistinguishable from the deploy's own
+    retention, which is exactly what would mask a broken one. Callers writing
+    into the namespace the instrument reads (``verify-isolated``, the deploy)
+    keep the default; callers retaining by hand (``bsq build-api``) pass a
+    different prefix so the two can never collide.
     """
     repo = _image_repo(reference)
     if repo is None:
@@ -6534,10 +6546,10 @@ def _image_retain_tag(reference: str, info: dict):
     sha = (info.get("git_sha") or "").strip()
     if not sha or sha == "unknown":
         sha = info["id"].split(":")[-1]
-    return f"{repo}:cert-{stamp}-{sha[:12]}"
+    return f"{repo}:{prefix}-{stamp}-{sha[:12]}"
 
 
-def _retain_image(reference: str, info: dict):
+def _retain_image(reference: str, info: dict, prefix: str = "cert"):
     """Tag ``info['id']`` so a later rebuild of ``reference`` cannot orphan it.
 
     Returns ``(tag, error)``. A failure is REPORTED, never raised: refusing to
@@ -6545,8 +6557,13 @@ def _retain_image(reference: str, info: dict):
     for a bookkeeping entry. But it is reported ON THE ENVIRONMENT LINE, beside
     the verdict, because a certification whose image was not retained is
     precisely as fragile as every certification taken before this existed.
+
+    ``prefix`` (T-1027): see ``_image_retain_tag`` — the default ``"cert"`` is
+    the namespace the deploy and ``verify-isolated`` write and the survival
+    check reads; a caller retaining for its own sake, not as a certification,
+    must pass a different one.
     """
-    tag = _image_retain_tag(reference, info)
+    tag = _image_retain_tag(reference, info, prefix=prefix)
     if not tag:
         return (None, "the image reference names no repository, so no retain "
                       "tag can be derived from it")
@@ -6748,6 +6765,18 @@ def cmd_build_api(args) -> None:
 
     It deliberately does NOT reclaim anything. The deploy stays the single
     reclaimer with one bounded window.
+
+    T-1027: retains under ``handretain-``, NOT ``cert-``. ``cert-`` is the
+    OBSERVABLE the T-1001/T-1005 two-deploy survival check reads — it depends
+    on the first tag to appear there being one a deploy wrote. This verb's
+    retain is a pure function of the image (T-1005), so a run of it would
+    compute the exact same ``cert-`` tag a deploy later would: accurate,
+    idempotent, and therefore indistinguishable from real deploy retention —
+    which is precisely what would mask a broken one. This happened once
+    already (T-1004 step 2, reported and undone by hand). A distinct namespace
+    also resolves T-1004's own plan contradiction — "retain via this verb"
+    and "never retain into cert-" — by making both true of the same command
+    rather than merely documenting that they should be.
     """
     repo_root = _repo_root()
     ref = args.image
@@ -6756,7 +6785,7 @@ def cmd_build_api(args) -> None:
         print(f"build-api: {ref} does not resolve yet — nothing to retain "
               f"(first build on this host?)")
     else:
-        tag, err = _retain_image(ref, info)
+        tag, err = _retain_image(ref, info, prefix="handretain")
         if tag:
             print(f"build-api: RETAINED the outgoing image as {tag} "
                   f"({info['id']})")

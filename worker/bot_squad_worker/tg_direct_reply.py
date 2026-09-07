@@ -34,11 +34,13 @@ has not fixed this."* So this module has two halves and they are not separable:
 Two measurements from the manual walkthrough shaped both halves, and neither is
 guesswork — see the ticket for the transcripts:
 
-* ``inject_input``'s transport (``input_mux.deliver_direct``) sends one Enter
-  **per line**, so his own 3-line message already arrives as 3 separate
-  composer submissions. A multi-line envelope on that transport would be
+* ``inject_input``'s transport (``input_mux.deliver_direct``) sent one Enter
+  **per line**, so his own 3-line message already arrived as 3 separate
+  composer submissions. A multi-line envelope on that transport would have been
   strictly worse than the bare text it replaces, which is why delivery goes
-  through the paste primitive (``inject_prompt``) instead.
+  through the paste primitive (``inject_prompt``) instead. (T-1038, 2026-09-07:
+  the split is fixed in ``deliver_direct`` itself; this path keeps the explicit
+  block verb, which now says what it means rather than being the only way.)
 * The destination MUST be spelled out. ``bsq tg ping`` resolves it by lookup
   (``actions._own_topic_binding`` → ``tg_bindings.find_by_session``), which
   returns the FIRST binding naming the session. p70 held both 220 and 517, so a
@@ -333,9 +335,10 @@ def compose_light_envelope(
 
     Delivered by ``inject_prompt`` (one composer submission), never
     ``inject_input`` — see :func:`compose_envelope`'s note on the one-Enter-per-
-    line transport. That measurement is the reason this ticket exists at all:
-    both paths were already splitting his multi-line messages line by line,
-    envelope or no envelope.
+    line transport (fixed at the transport by T-1038; the explicit block verb
+    stays). That measurement is the reason this ticket exists at all: both
+    paths were splitting his multi-line messages line by line, envelope or no
+    envelope.
 
     ``quote`` (T-0780): the message being replied to. THIS path is where it
     matters most — ``origin="reply"`` means he is answering a question the

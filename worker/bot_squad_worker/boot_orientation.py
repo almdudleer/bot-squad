@@ -66,8 +66,10 @@ MAIL_SIGNAL_SELF_DESCRIBING = (
     "check mail = bot-squad peer bus, not email: run bsq inbox check"
 )
 
-#: Nudge budget. ``inject_input`` sends one send-keys + Enter PER LINE, so the
-#: nudge must be one line; this keeps it inside one 80-column DISPLAY line too.
+#: Nudge budget. The nudge is one line — since T-1038 ``inject_input`` would
+#: deliver a multi-line one as a single submission anyway, but the measured
+#: codex finding above is about the SHAPE that submits at all; this also keeps
+#: it inside one 80-column DISPLAY line.
 MAIL_NUDGE_MAX_LEN = 76
 
 

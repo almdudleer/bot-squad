@@ -20,14 +20,14 @@ exactly how the next reformat quietly drops the ids from four of them.
 Why the convention is ONE LINE
 ------------------------------
 A boxed multi-line block would be more prominent on four of the five surfaces.
-It is unusable on the fifth: the attendant's nudge is delivered by
-``input_mux.deliver_direct``, which sends **one Enter per line**, so every line
-of a block becomes a separate composer submission. That transport is not a
-detail to route around — splitting a human's multi-line message into N
-submissions was itself the defect T-0773 fixed on the sibling paths, and
-re-introducing it in the ping ABOUT the message would be the same bug wearing a
-highlight. A single line is prominent on both transports: it stands alone in a
-paste-delivered block, and it leads the sentence in a one-line nudge.
+It was unusable on the fifth: the attendant's nudge is delivered by
+``input_mux.deliver_direct``, which sent **one Enter per line**, so every line
+of a block became a separate composer submission — the same defect T-0773 fixed
+on the sibling paths. T-1038 closed that in the transport itself (a payload
+with a newline is now pasted as ONE message), so the convention survives on its
+OTHER leg rather than on transport necessity: a single line is prominent on
+both transports — it stands alone in a paste-delivered block, and it leads the
+sentence in a one-line nudge.
 
 Prominence without colour
 -------------------------

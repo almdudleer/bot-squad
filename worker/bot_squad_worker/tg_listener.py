@@ -2497,11 +2497,13 @@ def handle_update(cfg, update: dict) -> dict:
             # possible at all — the store is keyed (slug, global_user_id).
             #
             # T-0773: and it goes as ONE composer submission inside a light
-            # provenance envelope. Until now this path handed the session the
-            # bare text over `inject_input`, whose transport sends one Enter PER
+            # provenance envelope. Until then this path handed the session the
+            # bare text over `inject_input`, whose transport sent one Enter PER
             # LINE — measured at a real pane: his 3-line answer arrived as 3
             # separate submissions, so the session began answering line 1 while
-            # 2 and 3 were still landing. The envelope carries NO answer-owed
+            # 2 and 3 were still landing. (T-1038 fixed that split inside
+            # `deliver_direct`; the envelope below is why this path still uses
+            # the block verb.) The envelope carries NO answer-owed
             # debt (operator ruling, see `compose_light_envelope`): here he is
             # ANSWERING a question the session asked him, and nagging it to post
             # "понял" back into his thread is this branch's harm inverted.

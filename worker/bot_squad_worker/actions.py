@@ -2611,11 +2611,11 @@ def _action_ensure_user_conversation(params: dict[str, Any]) -> dict[str, Any]:
                 # (the message is already durable in the store).
                 nudge_text = "A new message arrived in your user-conversation thread — read it and respond."
                 # T-0795: the topic id LEADS the nudge in the shared highlighted
-                # rendering instead of sitting mid-sentence. This text must stay
-                # ONE LINE — `inject_input` below is one-Enter-per-line, so a
-                # multi-line block here would arrive as N composer submissions
-                # (the transport measurement behind tg_direct_reply/T-0773),
-                # which is why the convention is a single line everywhere.
+                # rendering instead of sitting mid-sentence. This text stays
+                # ONE LINE by convention (prominence on both transports — see
+                # ping_ids). It is no longer a correctness requirement: T-1038
+                # made `inject_input` deliver a multi-line payload as ONE
+                # submission instead of N.
                 from bot_squad_worker import ping_ids as _ping_ids
                 ids = _ping_ids.render(thread_id=thread_id)
                 if ids:
@@ -2766,17 +2766,22 @@ def _provider_for_pane(cfg: Any, sid: str, pane: Any) -> str | None:
 
 
 def _action_inject_input(params: dict[str, Any]) -> dict[str, Any]:
-    """Send text to the tmux pane for a SID (one Enter per line).
+    """Send text to the tmux pane for a SID.
 
     Required params: sid, text
     Returns: {ok: true, pane_id, lines_sent: int}
 
     T-0578: the transport is ``input_mux.deliver_direct`` — content lands
-    byte-identical (verbatim, uncaptioned, one submission per line: "check
-    mail" stays "check mail", "/compact" stays a bare slash command), but the
-    keystrokes are serialised under the per-sid delivery lock so a nudge can
-    never interleave with a concurrent ``send_input`` flush, and briefly gate
-    on live user typing.
+    byte-identical (verbatim, uncaptioned: "check mail" stays "check mail",
+    "/compact" stays a bare slash command), but the keystrokes are serialised
+    under the per-sid delivery lock so a nudge can never interleave with a
+    concurrent ``send_input`` flush, and briefly gate on live user typing.
+
+    T-1038: a payload CONTAINING A NEWLINE arrives as ONE composer message
+    (bracketed paste + one Enter), not one per line. It used to split — which
+    is how T-1032's harness marker ended up submitted alone, as its own
+    contentless turn, ahead of an unmarked body. ``lines_sent`` still counts
+    LINES, so it is 21 for a payload that produced a single submission.
     """
     extra = set(params) - _INJECT_INPUT_ALLOWED
     if extra:
@@ -2834,11 +2839,15 @@ def _action_inject_prompt(params: dict[str, Any]) -> dict[str, Any]:
     Required params: sid, text. Returns ``{ok: true, pane_id}``.
 
     WHY THIS EXISTS BESIDE ``inject_input`` (T-0770, measured, not assumed).
-    ``inject_input``'s transport sends one send-keys + Enter PER LINE — correct
+    ``inject_input``'s transport sent one send-keys + Enter PER LINE — correct
     for the single-line nudges it was written for ("check mail", "/compact"),
-    and wrong for anything with a newline in it: a 3-line payload becomes THREE
-    separate composer submissions, so the session starts answering line 1 while
-    lines 2-3 are still arriving. That is already true of the stakeholder's own
+    and wrong for anything with a newline in it: a 3-line payload became THREE
+    separate composer submissions, so the session started answering line 1
+    while lines 2-3 were still arriving. (T-1038 closed that at the transport
+    in 2026-09: ``inject_input`` now pastes a multi-line payload as one message
+    too. This action stays the explicit BLOCK verb — same contract, and the
+    callers below say what they mean — but it is no longer the only way to get
+    one submission.) That is already true of the stakeholder's own
     multi-line messages on the direct-mode topic path, and a multi-line
     provenance envelope on that transport would have been strictly worse than
     the bare text it replaces.
@@ -6326,9 +6335,9 @@ ACTION_REGISTRY: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     # T-0924: `bsq compact` — arm the system's own handoff instead of a bare
     # /compact whenever the session has a resolvable destination.
     "compact": _action_compact,
-    # T-0770: the BLOCK sibling — a multi-line payload as ONE composer
-    # submission (inject_input submits one line at a time, which splits an
-    # envelope into N turns).
+    # T-0770: the explicit BLOCK verb — a multi-line payload as ONE composer
+    # submission. (It was the ONLY way to get that until T-1038 fixed the
+    # split in inject_input's own transport.)
     "inject_prompt": _action_inject_prompt,
     # T-0469 (M1/F1.6): multiplexed queue-backed input (coalesce + caption +
     # defer-on-busy). Agents write via `bsq send-input`, not raw send-keys.

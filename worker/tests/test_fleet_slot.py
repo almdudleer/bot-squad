@@ -968,3 +968,149 @@ def test_the_cap_can_be_disarmed_and_status_says_which(tmp_path):
     off = _run(state, "status", per_lane="0")
     assert off.returncode == 0, off.stderr
     assert "per lane: DISARMED" in off.stdout, off.stdout
+
+
+# ---------------------------------------------------------------------------
+# 7. NESTING — a slot inside a slot must not queue behind its own parent
+#
+# The per-lane cap made this sharp, but it did not create it: "build in
+# progress" already refused container work, so a gated suite inside a deploy's
+# build slot would have hung before DoD 2 existed. It became worth closing when
+# the AGENT_INSTRUCTIONS recipes started wrapping docker runs in the gate,
+# because that is what turns a latent nesting hazard into a live one.
+# ---------------------------------------------------------------------------
+
+def test_covers_is_conservative_about_which_slot_excuses_which(tmp_path):
+    """The coverage matrix, stated as a test so it cannot drift into folklore.
+
+    The asymmetry is the point and it is not a preference: a ``build`` is
+    EXCLUSIVE of the daemon pool, so a container run inside one consumes
+    nothing that was not already reserved. A ``containerless`` slot reserves
+    CPU and page cache and reserves NO container start, so letting it excuse
+    one would exempt precisely the resource the gate exists to bound.
+    """
+    fs = _fleet_slot_module()
+
+    # Reflexive.
+    for k in ("container", "build", "containerless"):
+        assert fs.covers(k, k) is True, k
+    # A build owns the whole daemon pool, so it covers container work.
+    assert fs.covers("build", "container") is True
+    # Nothing else covers anything — especially not across pools.
+    assert fs.covers("container", "build") is False
+    assert fs.covers("containerless", "container") is False
+    assert fs.covers("containerless", "build") is False
+    assert fs.covers("container", "containerless") is False
+    assert fs.covers("build", "containerless") is False
+    # No outer slot at all, and a junk label, both fall through to "queue
+    # normally" — the safe direction. A needless wait costs minutes; a wrongly
+    # granted exemption costs the host.
+    assert fs.covers(None, "container") is False
+    assert fs.covers("", "container") is False
+    assert fs.covers("not-a-kind", "container") is False
+    # Aliases resolve, so a recipe saying --kind suite is not silently uncovered.
+    assert fs.covers("deploy", "container") is True   # deploy == build
+    assert fs.covers("suite", "container") is True    # suite  == container
+
+
+def test_a_nested_run_does_not_take_a_second_slot(tmp_path):
+    """The real shape: ``run`` inside ``run``, one lane, ONE slot held.
+
+    Asserted from INSIDE the nested run rather than after it, because after it
+    both slots are released and a leak and a correct release look identical.
+    The innermost command writes the live holder count, so the evidence is a
+    fact observed while the nesting existed.
+    """
+    state = tmp_path / "slots"
+    seen = tmp_path / "seen.json"
+
+    # innermost: record how many slots are held RIGHT NOW.
+    probe = [sys.executable, "-c",
+             "import json,subprocess,sys,os\n"
+             "out = subprocess.run([sys.executable, sys.argv[1], 'status', '--json'],\n"
+             "                     capture_output=True, text=True)\n"
+             "snap = json.loads(out.stdout)\n"
+             "json.dump({'holders': len(snap['holders']),\n"
+             "           'kinds': [h['kind'] for h in snap['holders']],\n"
+             "           'env_slot': os.environ.get('BOT_SQUAD_FLEET_SLOT'),\n"
+             "           'env_kind': os.environ.get('BOT_SQUAD_FLEET_SLOT_KIND')},\n"
+             "          open(sys.argv[2], 'w'))\n",
+             str(SLOT), str(seen)]
+
+    inner = [sys.executable, str(SLOT), "run", "--kind", "container",
+             "--note", "inner", "--lane", "LANE-A", "--wait", "20", "--", *probe]
+
+    out = subprocess.run(
+        [sys.executable, str(SLOT), "run", "--kind", "container",
+         "--note", "outer", "--lane", "LANE-A", "--wait", "60", "--", *inner],
+        env=_env(state, slots=2, per_lane="1"), capture_output=True,
+        text=True, timeout=180)
+
+    assert out.returncode == 0, out.stderr
+    rec = json.loads(seen.read_text())
+    assert rec["holders"] == 1, (
+        f"nesting took {rec['holders']} slots ({rec['kinds']}) for one lane's "
+        f"one piece of work — the inner call did not recognise its parent")
+    # It recognised the parent BECAUSE the token was inherited, not by luck.
+    assert rec["env_slot"], "the outer slot's token never reached the child"
+    assert rec["env_kind"] == "container"
+    assert "already inside container slot" in out.stderr, out.stderr
+    # And the outer slot really was released afterwards.
+    assert _status(state, slots=2)["holders"] == []
+
+
+def test_the_one_nesting_that_can_NEVER_succeed_is_refused_at_once(tmp_path):
+    """container -> build cannot be granted, so it must not be queued.
+
+    A build drains the daemon pool before it starts, and the pool is held by
+    this run's own parent. No amount of waiting clears that, so queueing it
+    spends the entire ``--wait`` to arrive at the same answer with less of the
+    reason attached. This is the ONLY uncovered pair with that property, which
+    is why it is the only one refused — the rest legitimately take a second
+    slot in the other pool, and the warning for those says exactly that instead
+    of crying deadlock at a case that works.
+    """
+    state = tmp_path / "slots"
+    inner = [sys.executable, str(SLOT), "run", "--kind", "build",
+             "--note", "inner-build", "--lane", "LANE-A", "--wait", "300",
+             "--", sys.executable, "-c", "print('SHOULD NOT RUN')"]
+
+    t0 = time.time()
+    out = subprocess.run(
+        [sys.executable, str(SLOT), "run", "--kind", "container",
+         "--note", "outer", "--lane", "LANE-A", "--wait", "60", "--", *inner],
+        env=_env(state, slots=2, per_lane="1"), capture_output=True,
+        text=True, timeout=180)
+    elapsed = time.time() - t0
+
+    assert "NESTED DEADLOCK REFUSED" in out.stderr, out.stderr
+    assert "NOT MEASURED" in out.stderr
+    assert "SHOULD NOT RUN" not in out.stdout
+    # Refused AT ONCE: nowhere near the inner --wait of 300s. The whole point
+    # is not spending a wait on an answer that was knowable immediately.
+    assert elapsed < 60, f"took {elapsed:.0f}s to refuse something unqueueable"
+
+
+def test_an_uncovered_but_legal_nesting_takes_a_second_slot_and_says_so(tmp_path):
+    """containerless -> container is fine: different pools, no deadlock.
+
+    Included because the refusal above must not generalise. A guard that
+    refuses every uncovered pair would break this one, which is legal, common
+    (a containerless wrapper shelling out to a docker suite) and correct.
+    """
+    state = tmp_path / "slots"
+    inner = [sys.executable, str(SLOT), "run", "--kind", "container",
+             "--note", "inner", "--lane", "LANE-A", "--wait", "30",
+             "--", sys.executable, "-c", "print('INNER_RAN')"]
+
+    out = subprocess.run(
+        [sys.executable, str(SLOT), "run", "--kind", "containerless",
+         "--note", "outer", "--lane", "LANE-A", "--wait", "60", "--", *inner],
+        env=_env(state, slots=2, per_lane="1"), capture_output=True,
+        text=True, timeout=180)
+
+    assert out.returncode == 0, out.stderr
+    assert "INNER_RAN" in out.stdout
+    assert "does NOT cover" in out.stderr, out.stderr
+    assert "your lane will hold two" in out.stderr
+    assert "DEADLOCK" not in out.stderr

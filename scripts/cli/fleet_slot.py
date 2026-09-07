@@ -298,6 +298,40 @@ DEFAULT_WAIT = 1800.0
 _KINDS = ("container", "build", "containerless")
 _KIND_ALIASES = {"suite": "container", "exclusive": "build", "deploy": "build"}
 
+#: Set into a gated child's environment so a NESTED gate does not queue behind
+#: its own parent. Without it, ``run`` inside ``run`` from one lane deadlocks:
+#: the inner call is the same lane, so the per-lane cap (T-0968 DoD 2) refuses
+#: it for the whole --wait, and build-then-container deadlocked even BEFORE
+#: that cap existed, because "build in progress" refuses container work. That
+#: hazard went from latent to live the moment the AGENT_INSTRUCTIONS recipes
+#: started wrapping docker runs in the gate, so it is closed here rather than
+#: left for whoever nests first.
+ENV_SLOT = "BOT_SQUAD_FLEET_SLOT"
+ENV_SLOT_KIND = "BOT_SQUAD_FLEET_SLOT_KIND"
+
+
+def covers(outer: str | None, inner: str) -> bool:
+    """Whether a held ``outer`` slot already accounts for ``inner`` work.
+
+    Same kind covers itself. A ``build`` additionally covers ``container``,
+    because a build is EXCLUSIVE of the daemon pool — the lane already owns
+    every container start the pool can serve, so a container run inside it
+    consumes nothing that was not already reserved.
+
+    Nothing else covers anything: a containerless slot reserves CPU and page
+    cache, and using it to justify a container start would exempt exactly the
+    resource the gate exists to bound. When in doubt this returns False and the
+    inner call queues normally, which is the safe direction — a needless wait
+    costs minutes, a wrongly-granted exemption costs the host.
+    """
+    if not outer:
+        return False
+    try:
+        outer = normalise_kind(outer)
+    except Exception:
+        return False
+    return outer == inner or (outer == "build" and inner == "container")
+
 _POLL = 1.0
 
 #: Print a "this rule may be unsatisfiable — SAY SO" hint after this long.
@@ -1574,6 +1608,21 @@ def acquire(kind: str, *, pgid: int, lane: str | None, note: str | None,
                                         lane=rec["lane"],
                                         per_lane=per_lane_cap(sd))
                 if ok:
+                    # T-1070: a slot being FREE and the host being HEALTHY are
+                    # different questions, and only the first was checked
+                    # here. A caller's own admission_check() (the run/declare
+                    # /acquire verbs) runs once, BEFORE this loop -- however
+                    # long this loop then spends waiting for CAPACITY is a
+                    # window the ceiling never sees again, and a grant that
+                    # only ever re-samples the readings for the log (rather
+                    # than re-deciding on them) admits on a pass that already
+                    # expired. Re-run the real check at the one moment a grant
+                    # actually happens, and treat a refusal here exactly like
+                    # a capacity refusal: loop back and keep waiting.
+                    ok, reason, adm = admission_check(sd)
+                    if not ok:
+                        reason = f"a slot is free but {reason}"
+                if ok:
                     hrec = dict(rec)
                     hrec["since"] = time.time()
                     hrec["waited_s"] = round(time.time() - now, 1)
@@ -1594,7 +1643,6 @@ def acquire(kind: str, *, pgid: int, lane: str | None, note: str | None,
                         os.unlink(wpath)
                     except OSError:
                         pass
-                    adm = admission_readings(sd)
                     adm.update({"kind": kind, "note": note or "",
                                 "lane": rec["lane"], "token": token,
                                 "granted": True,
@@ -1838,6 +1886,57 @@ def _cmd_run(args) -> int:
             print(_ask_hint(args.kind, args.note, waited), file=sys.stderr, flush=True)
 
     t0 = time.time()
+
+    # ALREADY INSIDE A SLOT? Do not take a second one. Say so loudly, with the
+    # token, so a reader can tell "covered by an outer slot" from "never gated"
+    # — those two look identical in a log that prints nothing, and the second
+    # is the defect this module exists to remove.
+    inherited = os.environ.get(ENV_SLOT)
+    inherited_kind = os.environ.get(ENV_SLOT_KIND)
+    kind_now = normalise_kind(args.kind)
+    if inherited and covers(inherited_kind, kind_now):
+        print(f"fleet-slot: already inside {inherited_kind} slot {inherited} — "
+              f"NOT taking a second {kind_now} slot (it would queue behind its "
+              f"own parent). The outer slot covers this run.",
+              file=sys.stderr, flush=True)
+        rc = subprocess.run(args.cmd).returncode
+        print(f"fleet-slot: nested run finished in {time.time() - t0:.1f}s "
+              f"(rc {rc}) under slot {inherited}", file=sys.stderr, flush=True)
+        return rc
+    if inherited and not covers(inherited_kind, kind_now):
+        # NOT covered. Say WHICH uncovered case this is, because they are not
+        # equally bad and a warning that treats them alike gets ignored.
+        outer_norm = ""
+        try:
+            outer_norm = normalise_kind(inherited_kind or "")
+        except Exception:
+            outer_norm = ""
+        if outer_norm == "container" and kind_now == "build":
+            # The one that CANNOT succeed: a build drains the daemon pool, and
+            # the pool is held by this run's own parent. Waiting cannot clear
+            # it, so refuse immediately rather than burning --wait to reach the
+            # same answer with less of the reason attached.
+            print(f"fleet-slot: NESTED DEADLOCK REFUSED — asking for a build "
+                  f"from inside container slot {inherited}. A build drains the "
+                  f"daemon pool before it starts, and your own parent is "
+                  f"holding it, so this can never be granted: waiting would "
+                  f"spend the whole --wait to reach this same answer. Run the "
+                  f"build OUTSIDE the container slot, or take the outer slot "
+                  f"as --kind build (which covers container work).",
+                  file=sys.stderr, flush=True)
+            print("fleet-slot: NOT MEASURED — the run did not start.",
+                  file=sys.stderr, flush=True)
+            print(_ask_hint(kind_now, args.note, 0.0, what="refused"),
+                  file=sys.stderr, flush=True)
+            return 75
+        # Every other uncovered pair is legal and simply takes a SECOND slot in
+        # a different pool. That is not an error, but it is worth printing:
+        # a lane holding two slots at once should know it is doing so.
+        print(f"fleet-slot: note — nested inside a {inherited_kind} slot "
+              f"({inherited}), which does NOT cover {kind_now}. Taking a "
+              f"second slot in the other pool; your lane will hold two.",
+              file=sys.stderr, flush=True)
+
     # Admission first, then the queue: there is no point holding a slot for a
     # run the host cannot afford, and a lane refused here has learned the
     # reason before it spent 30 minutes in a queue.
@@ -1919,7 +2018,10 @@ def _cmd_run(args) -> int:
                   file=sys.stderr, flush=True)
 
     try:
-        child = subprocess.Popen(args.cmd, start_new_session=True)
+        child_env = dict(os.environ)
+        child_env[ENV_SLOT] = token
+        child_env[ENV_SLOT_KIND] = kind_now
+        child = subprocess.Popen(args.cmd, start_new_session=True, env=child_env)
         # Liveness moves to the work. If THIS wrapper is SIGKILLed the slot
         # stays held while the child lives — correct, because the IO is still
         # happening — and is reclaimed on the record once the group is gone.

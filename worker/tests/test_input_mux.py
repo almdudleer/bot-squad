@@ -1352,6 +1352,69 @@ def test_t1062_whitespace_normalisation_does_not_widen_the_match():
     assert input_mux._looks_like_our_payload("   ", ours) is False
 
 
+def test_t1062_a_short_draft_in_the_MIDDLE_of_our_payload_is_never_cleared():
+    """The predicate is a PREFIX test, and the difference is his writing.
+
+    T-1062 follow-up (operator, 2026-09-08). As a SUBSTRING test the box only
+    had to appear SOMEWHERE in our payload, so a short draft he had just
+    started -- the kind that is two or three characters for a second or two --
+    matched by coincidence and was cleared. Text a human types grows left to
+    right, so anything of ours that partially landed is a PREFIX; a match in
+    the MIDDLE is evidence of nothing.
+
+    Each case below is a string that IS inside the payload and is NOT its
+    start. Under the old rule every one of them returned True and cost him
+    what he had typed.
+    """
+    # Each pair is (our payload, what HE had typed). Every draft below really
+    # does occur inside the payload and really is not its start -- asserted,
+    # because a case that fails EITHER of those tests proves nothing about the
+    # predicate and would sit here looking like coverage.
+    cases = [
+        ("wake up, mail is waiting", "up"),
+        ("wake up, mail is waiting", "mail"),
+        ("wake up, mail is waiting", "il is wait"),
+        # The operator's own example, in his words: a two-character draft that
+        # happens to sit in the middle of what we were sending.
+        ("проверь, всё ок в очереди", "ок"),
+    ]
+    for ours, his in cases:
+        assert his in ours, f"fixture broken: {his!r} must sit inside the payload"
+        assert not ours.startswith(his), f"fixture broken: {his!r} must not be a prefix"
+        assert not ours.endswith(his), f"fixture broken: {his!r} must not be a suffix"
+        assert input_mux._looks_like_our_payload(his, ours) is False, (
+            f"{his!r} sits in the MIDDLE of {ours!r} -- clearing it deletes "
+            f"his draft")
+
+    # ...and the end-anchored cases still clear, or one failed delivery locks
+    # the lane -- which is the defect DoD 7 exists to prevent.
+    ours = "wake up, mail is waiting"
+    assert input_mux._looks_like_our_payload("wake", ours) is True      # prefix
+    assert input_mux._looks_like_our_payload(ours, ours) is True        # whole
+
+
+def test_t1062_the_real_takeback_case_is_a_SUFFIX():
+    """A prefix-only rule would disable the takeback on the commonest path.
+
+    MEASURED 2026-09-08 while tightening the predicate: what we actually type
+    is `format_batch` output, which carries a header LINE above the body. When
+    the composer takes that header as its own line and keeps the rest, the box
+    holds the TAIL of our payload. Under a prefix-only test that box matches
+    nothing, `_clear_our_unsent_payload` declines, and the lane stays locked
+    behind text only we put there -- the exact failure DoD 7 removed.
+
+    So the rule is end-anchored, not left-anchored, and this is the case that
+    says why.
+    """
+    payload = input_mux.format_batch(
+        [{"ts": 1.0, "author": "S-lab", "text": "the alarm nobody heard"}])
+    assert payload.startswith("[input from S-lab]"), payload
+    box = "the alarm nobody heard"
+    assert not payload.startswith(box), "fixture broken: box must NOT be a prefix"
+    assert payload.endswith(box), "fixture broken: box must be the tail"
+    assert input_mux._looks_like_our_payload(box, payload) is True
+
+
 def test_t1062_a_dialog_is_never_cleared(monkeypatch):
     # The rune belongs to a permission prompt, not to a composer: C-u there
     # would ANSWER it.

@@ -1452,3 +1452,105 @@ def test_t1062_stalled_input_queue_rings_once_and_rearms_on_recovery(
     _surface_stalled_inputs(cfg, None)
     _surface_stalled_inputs(cfg, {})
     assert alerts == []
+
+
+def _cfg_two_projects(tmp_path: Path) -> Config:
+    """A config shaped like the real install: bot-squad PLUS another project.
+
+    One project cannot see this defect at all — the old constant and the
+    correct answer coincide — so the fixture has to differ along the axis
+    under test.
+    """
+    cfg_dir = tmp_path / "config2"
+    cfg_dir.mkdir(exist_ok=True)
+    body = ""
+    for slug in ("bot-squad", "watchrobot"):
+        body += (
+            f'[projects.{slug}]\n'
+            f'slug = "{slug}"\n'
+            f'display_name = "{slug}"\n'
+            f'repo_path = "{tmp_path}"\n'
+            f'deploy_branch = "bot_squad/dev"\n'
+            f'master_branch = "master"\n'
+            f'prod_url = ""\n'
+            f'staging_url = ""\n'
+            f'dev_url = ""\n'
+            f'deploy_targets = ["staging"]\n'
+            f'tg_chat = "{slug}-chat"\n'
+            f'created_at = 2026-05-10\n'
+        )
+    (cfg_dir / "projects.toml").write_text(body)
+    (cfg_dir / "secrets.toml").write_text('[telegram]\nbot_token = ""\n')
+    return Config.load(cfg_dir)
+
+
+def test_t1062_stall_alarm_is_addressed_to_the_STALLED_SESSIONS_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The alarm goes to the project whose session went deaf — not a constant.
+
+    Operator, 2026-09-08. The input queue is shared across the install, so the
+    stall record carries sid/pane/records/age and NO slug; the code took the
+    literal "bot-squad". Measured on the live install that day: every live
+    session of the fleet was registered under `watchrobot` and `bot-squad` had
+    no live operator at all, so the one alarm T-1062 exists to raise would have
+    rung in an empty room — worse than silence, because silence is KNOWN
+    blindness and this is believed sight.
+    """
+    from bot_squad_worker.jobs import _surface_stalled_inputs
+    from bot_squad_worker import jobs as J
+
+    cfg = _cfg_two_projects(tmp_path)
+    assert "bot-squad" in cfg.projects, "fixture broken: the old constant must resolve"
+
+    routed: list[tuple[str, str]] = []
+    monkeypatch.setattr(J, "_alert_operators",
+                        lambda c, slug, p, text: routed.append((slug, text)))
+    monkeypatch.setattr(J, "_STALL_SEEN", set())
+
+    # The deaf session belongs to watchrobot, and it SAYS so the only way the
+    # system records it: a session md under that project.
+    sid = "S-almdudleer-routine-handler-p786"
+    md = cfg.data_dir / "watchrobot" / "sessions" / f"{sid}.md"
+    md.parent.mkdir(parents=True, exist_ok=True)
+    md.write_text(f"---\nsid: {sid}\nstatus: active\n---\n")
+
+    _surface_stalled_inputs(cfg, {"stalled": [
+        {"sid": sid, "pane": "%42", "records": 2, "oldest_age_sec": 680.0,
+         "blocked_by": "draft"}]})
+
+    assert len(routed) == 1
+    slug, text = routed[0]
+    assert slug == "watchrobot", (
+        f"the alarm went to {slug!r}; under the old constant it went to "
+        f"'bot-squad', where this fleet has no operator")
+    assert "NOT DETERMINED" not in text
+    assert sid in text and "%42" in text
+
+
+def test_t1062_a_stall_whose_project_is_unknown_SAYS_SO(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No md under any project → still ring, but never claim a project.
+
+    A fallback is needed to have any channel at all; choosing one SILENTLY is
+    what makes the next reader believe a project was named when it was
+    guessed. So the alarm admits it could not tell.
+    """
+    from bot_squad_worker.jobs import _surface_stalled_inputs
+    from bot_squad_worker import jobs as J
+
+    cfg = _cfg_two_projects(tmp_path)
+    routed: list[tuple[str, str]] = []
+    monkeypatch.setattr(J, "_alert_operators",
+                        lambda c, slug, p, text: routed.append((slug, text)))
+    monkeypatch.setattr(J, "_STALL_SEEN", set())
+
+    _surface_stalled_inputs(cfg, {"stalled": [
+        {"sid": "S-orphan-p1", "pane": "%9", "records": 1,
+         "oldest_age_sec": 60.0, "blocked_by": "draft"}]})
+
+    assert len(routed) == 1, "an unattributable stall must still ring"
+    _, text = routed[0]
+    assert "PROJECT NOT DETERMINED" in text
+    assert "S-orphan-p1" in text

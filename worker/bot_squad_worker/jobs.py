@@ -1285,20 +1285,51 @@ def _surface_stalled_inputs(cfg: Config, res: object) -> None:
     _STALL_SEEN.intersection_update(live)          # re-arm what has recovered
     if not stalled:
         return
-    slug = "bot-squad" if "bot-squad" in cfg.projects else next(iter(cfg.projects), "")
-    if not slug:
-        return
-    project = cfg.projects.get(slug)
+    from bot_squad_worker.park import _slug_for_sid
+
     for s in stalled:
         sid = s.get("sid")
         if not sid or sid in _STALL_SEEN:
             continue
         _STALL_SEEN.add(sid)
+
+        # T-1062 follow-up (operator 2026-09-08): ADDRESS THE ALARM TO THE
+        # PROJECT WHOSE SESSION WENT DEAF, resolved from the sid.
+        #
+        # This was the constant "bot-squad", and the input queue is shared
+        # across the whole install, so the stall record carries sid/pane/
+        # records/age and NO slug — the constant was the only routing there
+        # was. Measured on this install 2026-09-08: every live session of the
+        # fleet is registered under `watchrobot`, and `bot-squad` has no live
+        # operator at all. So the one alarm this ticket exists to raise would
+        # have rung in an EMPTY ROOM — strictly worse than no alarm, because
+        # today we KNOW we are blind, and with it we would BELIEVE we can see.
+        slug = _slug_for_sid(cfg, sid)
+        undetermined = slug is None
+        if undetermined:
+            # NEVER pick one silently. A fallback is needed to have any
+            # channel at all, but the alarm has to SAY it could not tell whose
+            # session this is — an alarm that does not know its addressee is
+            # obliged to admit it rather than choose, or the next reader
+            # believes a project was named when it was guessed.
+            slug = ("bot-squad" if "bot-squad" in cfg.projects
+                    else next(iter(cfg.projects), ""))
+        if not slug:
+            log.error("input_flush_tick: %s stalled and there is NO project to "
+                      "alert — the alarm has nowhere to go", sid)
+            continue
+        project = cfg.projects.get(slug)
         mins = (s.get("oldest_age_sec") or 0) / 60.0
+        header = (
+            f"⚠️ input queue STALLED — {sid} " if not undetermined else
+            f"⚠️ input queue STALLED — PROJECT NOT DETERMINED for {sid} (no "
+            f"session md under any registered project; routed to {slug!r} only "
+            f"so this reaches someone — do not read {slug!r} as its project). "
+            f"It ")
         try:
             _alert_operators(
                 cfg, slug, project,
-                f"⚠️ input queue STALLED — {sid} has {s.get('records')} "
+                f"{header}has {s.get('records')} "
                 f"undelivered message(s), the oldest waiting {mins:.0f} min on "
                 f"pane {s.get('pane')}. The pane is NOT generating: text is "
                 f"sitting in its composer and nothing clears it, so every "

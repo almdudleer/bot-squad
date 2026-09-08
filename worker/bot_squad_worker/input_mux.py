@@ -538,7 +538,7 @@ _WS_RUN_RE = re.compile(r"[\s\u00a0]+")
 
 
 def _looks_like_our_payload(box: str, text: str) -> bool:
-    """True only when the composer holds a CONTIGUOUS FRAGMENT of what we typed.
+    """True only when the composer holds a PREFIX of what we typed.
 
     Normalisation is exactly one thing: every run of whitespace, NBSP included,
     becomes a single space -- because the composer re-wraps a pasted block and
@@ -548,13 +548,36 @@ def _looks_like_our_payload(box: str, text: str) -> bool:
 
     The case that decides the shape is not "some other text" but HIS TEXT WITH
     OURS INSIDE IT -- he started typing while our paste landed, so the box
-    holds MORE than we sent. That is not a fragment of our payload, so we keep
+    holds MORE than we sent. That is not a prefix of our payload, so we keep
     our hands off it. An arbitrary foreign string would pass this test far too
     easily to prove anything.
+
+    END-ANCHORED, NOT SUBSTRING (T-1062 follow-up, operator 2026-08 -> measured
+    2026-09-08). As a substring test this deleted short human drafts by
+    coincidence: the box only had to match SOMEWHERE in our payload, so a
+    two-character draft he had just typed was cleared by any payload
+    containing those characters anywhere. The fix is the SHAPE of the
+    predicate, not a minimum length.
+
+    The operator's instruction was "prefix", on the reasoning that text a
+    human types grows left to right, so a partially-landed payload of ours is
+    its PREFIX. That is right about a truncated paste and WRONG about the
+    commonest real case, which is why this is prefix OR SUFFIX. Measured:
+    :func:`format_batch` puts a header line above the body, so what we type is
+    "[input from S-lab]\nthe alarm nobody heard". When the composer takes the
+    header as its own line and keeps the rest, the box holds the TAIL of our
+    payload -- a suffix, not a prefix. Under a prefix-only rule that box
+    stopped matching, the takeback never ran, and one failed delivery locked
+    the lane for good again: precisely the defect DoD 7 exists to prevent.
+    (Pinned by ``test_t1062_the_real_takeback_case_is_a_SUFFIX``.)
+
+    Both ends are anchored, and that is what does the safety work: a foreign
+    string sitting in the MIDDLE of our payload matches neither end, so the
+    coincidence that was costing his writing is gone either way.
     """
     nbox = _WS_RUN_RE.sub(" ", box).strip()
     ntext = _WS_RUN_RE.sub(" ", text).strip()
-    return bool(nbox) and nbox in ntext
+    return bool(nbox) and (ntext.startswith(nbox) or ntext.endswith(nbox))
 
 
 def _clear_our_unsent_payload(pane_id: str, text: str,

@@ -1077,7 +1077,17 @@ def test_composer_free_is_the_typing_aware_gate():
     assert A.composer_free("❯ \n") is True
     assert A.composer_free("❯\n") is True
     assert A.composer_free("❯ его недописанный текст\n") is False
-    assert A.composer_free("… esc to interrupt\n❯ \n") is False  # mid-generation
+    # T-1062 / 1c9da50 -- the marker now counts only BELOW the composer, so this
+    # buffer has to put it where it actually appears. MEASURED 2026-09-08 by the
+    # release TL, independently of the author: 25/25 captures of a live
+    # generating Claude pane (bot-squad:1) put the composer rune on row 45 and
+    # "esc to interrupt" on row 47 -- 2 rows BELOW, never above, never on it.
+    # The author's own sweep agrees (63/63 over 5 panes). The pre-1c9da50
+    # spelling of this fixture put the marker ABOVE the rune, a layout neither
+    # sweep ever observed; read literally it asserted that a session which had
+    # merely PRINTED the marker was mid-generation, which is the T-1062 defect
+    # itself. The ASSERTION is unchanged -- a generating pane is not free.
+    assert A.composer_free("❯ \n… esc to interrupt\n") is False  # mid-generation
     assert A.composer_free("") is False
 
 

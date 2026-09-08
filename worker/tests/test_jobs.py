@@ -1406,3 +1406,49 @@ def test_census_failure_never_costs_the_heartbeat(tmp_config_dir: Path, monkeypa
 
     assert cfg.heartbeat_path.exists()
     assert not (cfg.heartbeat_path.parent / "workers.json").exists()
+
+
+def test_t1062_stalled_input_queue_rings_once_and_rearms_on_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-1062 DoD 2: a queue nothing can drain must ring — once.
+
+    Undeliverability was silent by construction, so a deaf session and a quiet
+    one looked identical and the fleet's alarm handler reported "all quiet" for
+    two hours. The two failure modes of the fix are missing the stall and
+    crying every tick until someone mutes it; this pins both ends.
+    """
+    from bot_squad_worker.jobs import _surface_stalled_inputs
+    from bot_squad_worker import jobs as J
+
+    proj = _make_project_with_repo(tmp_path)
+    cfg = _make_config_with_project(tmp_path, proj)
+
+    alerts: list[str] = []
+    monkeypatch.setattr(J, "_alert_operators", lambda c, s, p, text: alerts.append(text))
+    monkeypatch.setattr(J, "_STALL_SEEN", set())
+
+    stalled = {"stalled": [{"sid": "S-u-routine-handler-p780", "pane": "%42",
+                            "records": 2, "oldest_age_sec": 680.0,
+                            "blocked_by": "draft"}]}
+
+    _surface_stalled_inputs(cfg, stalled)
+    assert len(alerts) == 1
+    assert "S-u-routine-handler-p780" in alerts[0] and "%42" in alerts[0]
+    assert "11 min" in alerts[0]
+
+    # Still stalled on the next tick → NOT a second page.
+    _surface_stalled_inputs(cfg, stalled)
+    assert len(alerts) == 1
+
+    # Recovered (the sweep no longer reports it) → the alarm re-arms, so the
+    # NEXT stall of the same session is heard.
+    _surface_stalled_inputs(cfg, {"stalled": []})
+    _surface_stalled_inputs(cfg, stalled)
+    assert len(alerts) == 2
+
+    # Junk in, no raise, no page.
+    alerts.clear()
+    _surface_stalled_inputs(cfg, None)
+    _surface_stalled_inputs(cfg, {})
+    assert alerts == []

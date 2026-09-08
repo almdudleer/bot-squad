@@ -1094,8 +1094,15 @@ def flush(data_dir: Path | str, sid: str, *,
             return {"delivered": 0, "deferred": True, "reason": "no_pane",
                     "pane": None}
 
-        if not deliverable(capture(pane), pane_id=pane):
+        buf = capture(pane)
+        if not deliverable(buf, pane_id=pane):
+            # T-1062 DoD 2: name WHICH lock closed. `generation` is ordinary
+            # work and ages out on its own; `draft` is text sitting in the box
+            # that nothing in the system will ever clear, and that is the state
+            # that goes silent forever. The sweep alerts on the second only.
             return {"delivered": 0, "deferred": True, "reason": "composer_busy",
+                    "blocked_by": ("generation" if not composer_ready(buf)
+                                   else "draft"),
                     "pane": pane}
 
         # Composer is ready — claim the batch exclusively, then deliver.
@@ -1183,6 +1190,50 @@ def recover_pending(data_dir: Path | str) -> dict[str, Any]:
     return {"sids": sids, "recovered": recovered}
 
 
+def stall_alert_after_sec() -> float:
+    """How long an unclearable deferral may last before it has to ring.
+
+    Ten minutes, matching the T-0954 staleness window: text that has sat in the
+    composer that long is text nobody is writing. ``0`` disables the alert.
+    """
+    try:
+        return float(os.environ.get("BOT_SQUAD_INPUT_STALL_ALERT_SEC", "600"))
+    except ValueError:
+        return 600.0
+
+
+def _stall_report(data_dir: Path | str, sid: str, res: dict[str, Any],
+                  now: float) -> dict[str, Any] | None:
+    """A deferral that has outlived the threshold and cannot clear itself.
+
+    T-1062 DoD 2. Being undeliverable was SILENT: `flush` handed a reason back
+    to a sweep that dropped it, and the only way to learn a session had gone
+    deaf was to open its queue file by hand. Two hours of the fleet's alarm
+    handler reporting "all quiet" is what that cost on 2026-09-07.
+
+    Deliberately narrow, because an alarm that cries during ordinary work gets
+    muted and then it is worse than none:
+      * ``generation`` never rings — a long turn is work, and it ends;
+      * ``no_pane`` never rings — the session is gone, and the reaper owns that;
+      * a draft in the box rings once it has held the queue past the threshold,
+        because NOTHING in the system clears it. That is also DoD 5: unsent text
+        blocking delivery indefinitely now tells someone instead of just
+        blocking.
+    """
+    threshold = stall_alert_after_sec()
+    if threshold <= 0 or res.get("blocked_by") != "draft":
+        return None
+    queued = read_queue(data_dir, sid)
+    if not queued:
+        return None
+    oldest = min((float(m.get("ts") or now) for m in queued), default=now)
+    age = now - oldest
+    if age < threshold:
+        return None
+    return {"sid": sid, "pane": res.get("pane"), "records": len(queued),
+            "oldest_age_sec": age, "blocked_by": "draft"}
+
+
 def flush_pending(data_dir: Path | str) -> dict[str, Any]:
     """Flush every non-empty per-sid queue (deferred-delivery scheduler tick).
 
@@ -1204,6 +1255,8 @@ def flush_pending(data_dir: Path | str) -> dict[str, Any]:
     delivered = 0
     flushed = 0
     deferred = 0
+    stalled: list[dict[str, Any]] = []
+    now = time.time()
     # T-1082: reclaim anything a restart orphaned BEFORE this pass reads the
     # queues, so a recovered batch is delivered by this same tick rather than
     # waiting another 15s.
@@ -1232,5 +1285,8 @@ def flush_pending(data_dir: Path | str) -> dict[str, Any]:
         delivered += res.get("delivered", 0)
         if res.get("deferred"):
             deferred += 1
+            stall = _stall_report(data_dir, sid, res, now)
+            if stall is not None:
+                stalled.append(stall)
     return {"queues": flushed, "delivered": delivered, "deferred": deferred,
-            "recovered": recovered}
+            "recovered": recovered, "stalled": stalled}

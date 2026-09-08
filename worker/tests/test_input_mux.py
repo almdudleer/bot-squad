@@ -7,6 +7,7 @@ the user's live-typed composer text.
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -1201,3 +1202,80 @@ def test_t1062_direct_lane_still_waits_out_real_typed_text(tmp_path, monkeypatch
     elapsed = time.monotonic() - started
 
     assert elapsed >= input_mux._DIRECT_GATE_TIMEOUT_SEC
+
+
+# ---------------------------------------------------------------------------
+# T-1062 DoD 2 + DoD 5: an undeliverable queue stops being silent
+# ---------------------------------------------------------------------------
+
+
+def _queue_aged(tmp_path, sid, age_sec, n=1):
+    """Enqueue n messages and backdate them by `age_sec`."""
+    for i in range(n):
+        input_mux.enqueue(tmp_path, sid, f"held message {i}", "S-routine-handler")
+    path = input_mux.queue_path(tmp_path, sid)
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        rec = json.loads(line)
+        rec["ts"] = rec["ts"] - age_sec
+        rows.append(json.dumps(rec))
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+
+def test_t1062_flush_names_which_lock_deferred_it(tmp_path, monkeypatch):
+    # `composer_busy` covered two states that need opposite treatment: a turn
+    # in progress ends by itself, text in the box does not.
+    _ghost_answering(monkeypatch, False)
+    input_mux.enqueue(tmp_path, "S-a", "x", "S-b")
+    res = input_mux.flush(tmp_path, "S-a", pane_lookup=lambda s: "%1",
+                          capture=lambda p: _BUF_TYPING, deliver=lambda p, t: None)
+    assert res["blocked_by"] == "draft"
+
+    input_mux.enqueue(tmp_path, "S-c", "x", "S-b")
+    res = input_mux.flush(tmp_path, "S-c", pane_lookup=lambda s: "%1",
+                          capture=lambda p: _BUF_BUSY, deliver=lambda p, t: None)
+    assert res["blocked_by"] == "generation"
+
+
+def test_t1062_a_queue_held_past_the_threshold_is_reported(tmp_path, monkeypatch):
+    # The alarm this ticket exists for: the queue grew, nothing cleared it, and
+    # until now the only way to find out was to read the file by hand.
+    _ghost_answering(monkeypatch, False)
+    monkeypatch.setattr(input_mux, "_capture_pane", lambda p: _BUF_TYPING)
+    monkeypatch.setattr(input_mux, "_default_pane_lookup", lambda s: "%1")
+    _queue_aged(tmp_path, "S-deaf-p1", age_sec=1200, n=3)
+
+    res = input_mux.flush_pending(tmp_path)
+
+    assert len(res["stalled"]) == 1
+    stall = res["stalled"][0]
+    assert stall["sid"] == "S-deaf-p1"
+    assert stall["records"] == 3
+    assert stall["oldest_age_sec"] >= 1200
+    assert stall["blocked_by"] == "draft"
+
+
+def test_t1062_a_young_queue_and_a_generating_pane_stay_quiet(tmp_path, monkeypatch):
+    # The two ways to make this alarm useless are to miss the stall and to cry
+    # during ordinary work. A fresh deferral is not a stall...
+    _ghost_answering(monkeypatch, False)
+    monkeypatch.setattr(input_mux, "_capture_pane", lambda p: _BUF_TYPING)
+    monkeypatch.setattr(input_mux, "_default_pane_lookup", lambda s: "%1")
+    _queue_aged(tmp_path, "S-fresh-p2", age_sec=30)
+    assert input_mux.flush_pending(tmp_path)["stalled"] == []
+
+    # ...and a long turn is work, however long the queue has waited behind it.
+    monkeypatch.setattr(input_mux, "_capture_pane", lambda p: _BUF_BUSY)
+    _queue_aged(tmp_path, "S-working-p3", age_sec=99999)
+    assert input_mux.flush_pending(tmp_path)["stalled"] == []
+
+
+def test_t1062_the_stall_alert_can_be_switched_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOT_SQUAD_INPUT_STALL_ALERT_SEC", "0")
+    _ghost_answering(monkeypatch, False)
+    monkeypatch.setattr(input_mux, "_capture_pane", lambda p: _BUF_TYPING)
+    monkeypatch.setattr(input_mux, "_default_pane_lookup", lambda s: "%1")
+    _queue_aged(tmp_path, "S-deaf-p4", age_sec=99999)
+    assert input_mux.flush_pending(tmp_path)["stalled"] == []

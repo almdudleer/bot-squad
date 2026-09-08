@@ -1245,9 +1245,69 @@ def input_flush_tick(cfg: Config) -> None:
         return
     from bot_squad_worker import input_mux as _im
     try:
-        _im.flush_pending(cfg.data_dir)
+        res = _im.flush_pending(cfg.data_dir)
     except Exception:
         log.exception("input_flush_tick error")
+        return
+    try:
+        _surface_stalled_inputs(cfg, res)
+    except Exception:
+        log.exception("input_flush_tick: stall surfacing failed (non-fatal)")
+
+
+_STALL_SEEN: set[str] = set()
+
+
+def _surface_stalled_inputs(cfg: Config, res: object) -> None:
+    """T-1062 DoD 2 + DoD 5: a queue that cannot drain has to RING.
+
+    Being undeliverable was silent by construction — `flush` returned a reason
+    to a sweep that dropped it, so a session that had gone deaf looked exactly
+    like a session nobody had written to, and the only way to tell was to open
+    the queue file by hand. That is what let the fleet's one alarm handler
+    report "all quiet" for two hours on 2026-09-07 while eight messages piled
+    up behind his composer.
+
+    Rings ONCE per stall and re-arms only when that sid's queue clears, because
+    an alarm that repeats every tick gets muted and then it is worse than none.
+    `input_mux._stall_report` decides what counts: ordinary generation and a
+    dead pane never ring; text parked in the composer past the threshold does,
+    since nothing in the system will ever clear it on its own.
+
+    The Telegram half of `_alert_operators` is the load-bearing one HERE — the
+    peer_send half rides the very queue this alert is about. Best-effort; never
+    raises into the tick.
+    """
+    if not isinstance(res, dict):
+        return
+    stalled = res.get("stalled") or []
+    live = {s.get("sid") for s in stalled if s.get("sid")}
+    _STALL_SEEN.intersection_update(live)          # re-arm what has recovered
+    if not stalled:
+        return
+    slug = "bot-squad" if "bot-squad" in cfg.projects else next(iter(cfg.projects), "")
+    if not slug:
+        return
+    project = cfg.projects.get(slug)
+    for s in stalled:
+        sid = s.get("sid")
+        if not sid or sid in _STALL_SEEN:
+            continue
+        _STALL_SEEN.add(sid)
+        mins = (s.get("oldest_age_sec") or 0) / 60.0
+        try:
+            _alert_operators(
+                cfg, slug, project,
+                f"⚠️ input queue STALLED — {sid} has {s.get('records')} "
+                f"undelivered message(s), the oldest waiting {mins:.0f} min on "
+                f"pane {s.get('pane')}. The pane is NOT generating: text is "
+                f"sitting in its composer and nothing clears it, so every "
+                f"message to this session — alarms included — is being held, "
+                f"and its silence looks exactly like 'nothing happened'. Clear "
+                f"the composer or take the session's mail out of the queue file "
+                f"by hand (T-1062).")
+        except Exception:
+            log.exception("input_flush_tick: stall alert failed for %s", sid)
 
 
 def drift_check_tick(cfg: Config) -> None:

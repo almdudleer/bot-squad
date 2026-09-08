@@ -1279,3 +1279,102 @@ def test_t1062_the_stall_alert_can_be_switched_off(tmp_path, monkeypatch):
     monkeypatch.setattr(input_mux, "_default_pane_lookup", lambda s: "%1")
     _queue_aged(tmp_path, "S-deaf-p4", age_sec=99999)
     assert input_mux.flush_pending(tmp_path)["stalled"] == []
+
+
+# ---------------------------------------------------------------------------
+# T-1062 DoD 7: a delivery that typed and could not submit clears up after itself
+# ---------------------------------------------------------------------------
+# The batch is requeued, so nothing is lost -- but what we typed stays in the
+# box, and it is REAL text, not the faint echo. No ghost detector will open a
+# gate over it, and none should. That is how ONE failed delivery turns a
+# recoverable stall into a permanent one.
+
+
+def _parked(monkeypatch, box_text, keys):
+    """A pane whose composer is left holding `box_text` after a failed submit."""
+    from bot_squad_worker import composer_watch
+    seen = {"box": box_text}
+
+    def _composer_text(buf):
+        return seen["box"]
+
+    def _raw_keys(pane_id, *k):
+        keys.append(k)
+        if k and k[-1] == "C-u":
+            seen["box"] = ""          # the drain works, when it is allowed to run
+    monkeypatch.setattr(composer_watch, "composer_text", _composer_text)
+    monkeypatch.setattr(composer_watch, "looks_like_dialog", lambda buf: False)
+    monkeypatch.setattr(input_mux, "raw_keys", _raw_keys)
+    monkeypatch.setattr(input_mux, "_paste_block", lambda pane_id, text: None)
+    monkeypatch.setattr(input_mux, "_pane_is_generating", lambda p, c: False)
+    monkeypatch.setattr(input_mux, "_submit_confirmed",
+                        lambda *a, **kw: "unconfirmed")
+    return seen
+
+
+def test_t1062_a_payload_that_could_not_submit_is_taken_back_out(monkeypatch):
+    keys: list[tuple] = []
+    seen = _parked(monkeypatch, "wake up, mail is waiting", keys)
+
+    with pytest.raises(input_mux.DeliveryNotConfirmed):
+        input_mux._deliver_to_pane("%1", "wake up, mail is waiting",
+                                   capture=lambda p: _BUF_PARKED)
+
+    assert ("C-u",) in keys          # cleared
+    assert seen["box"] == ""
+
+
+def test_t1062_his_text_with_ours_inside_it_is_never_touched(monkeypatch):
+    # THE arm that matters. Not "some other text" -- his text with our paste
+    # landed INSIDE it, which is what happens when he types while we deliver.
+    # The box then holds MORE than we sent, so it is not a fragment of our
+    # payload and the cleanup must keep its hands off.
+    keys: list[tuple] = []
+    seen = _parked(monkeypatch, "я пишу ему wake up, mail is waiting и продолжаю", keys)
+
+    with pytest.raises(input_mux.DeliveryNotConfirmed):
+        input_mux._deliver_to_pane("%1", "wake up, mail is waiting",
+                                   capture=lambda p: _BUF_PARKED)
+
+    assert keys == []                                     # nothing was typed
+    assert seen["box"] == "я пишу ему wake up, mail is waiting и продолжаю"
+
+
+def test_t1062_whitespace_normalisation_does_not_widen_the_match():
+    # The composer re-wraps a pasted block, so rows come back with the wrap in
+    # them and only whitespace may be normalised. Nothing else -- and the wrap
+    # must not turn "his text around ours" into "a fragment of ours".
+    ours = "wake up,\nmail is waiting"
+    assert input_mux._looks_like_our_payload("wake up, mail  is\n waiting", ours) is True
+    assert input_mux._looks_like_our_payload("wake up,", ours) is True
+    assert input_mux._looks_like_our_payload("привет wake up, mail is waiting", ours) is False
+    assert input_mux._looks_like_our_payload("WAKE UP, MAIL IS WAITING", ours) is False
+    assert input_mux._looks_like_our_payload("   ", ours) is False
+
+
+def test_t1062_a_dialog_is_never_cleared(monkeypatch):
+    # The rune belongs to a permission prompt, not to a composer: C-u there
+    # would ANSWER it.
+    keys: list[tuple] = []
+    _parked(monkeypatch, "1. Yes", keys)
+    monkeypatch.setattr(input_mux, "_submit_confirmed", lambda *a, **kw: "dialog")
+
+    with pytest.raises(input_mux.DeliveryNotConfirmed):
+        input_mux._deliver_to_pane("%1", "1. Yes", capture=lambda p: _BUF_DIALOG)
+
+    assert keys == []
+
+
+def test_t1062_flush_still_requeues_the_batch_it_cleared(tmp_path, monkeypatch):
+    # Cleaning up must not become a second way to lose the payload.
+    keys: list[tuple] = []
+    _parked(monkeypatch, "the alarm nobody heard", keys)
+    _ghost_answering(monkeypatch, True)
+
+    input_mux.enqueue(tmp_path, "S-deaf-p9", "the alarm nobody heard", "S-lab")
+    with pytest.raises(input_mux.DeliveryNotConfirmed):
+        input_mux.flush(tmp_path, "S-deaf-p9", pane_lookup=lambda s: "%1",
+                        capture=lambda p: _BUF_PARKED)
+
+    assert ("C-u",) in keys
+    assert len(input_mux.read_queue(tmp_path, "S-deaf-p9")) == 1

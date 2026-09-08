@@ -534,6 +534,79 @@ def _paste_block(pane_id: str, text: str) -> None:
     _run(["tmux", "paste-buffer", "-t", pane_id, "-b", buf_name, "-p", "-d"])
 
 
+_WS_RUN_RE = re.compile(r"[\s\u00a0]+")
+
+
+def _looks_like_our_payload(box: str, text: str) -> bool:
+    """True only when the composer holds a CONTIGUOUS FRAGMENT of what we typed.
+
+    Normalisation is exactly one thing: every run of whitespace, NBSP included,
+    becomes a single space -- because the composer re-wraps a pasted block and
+    tmux hands the rows back with that wrap in them. Nothing else is
+    normalised: no case folding, no punctuation, no reordering. Every widening
+    of THIS predicate is a way to delete his writing.
+
+    The case that decides the shape is not "some other text" but HIS TEXT WITH
+    OURS INSIDE IT -- he started typing while our paste landed, so the box
+    holds MORE than we sent. That is not a fragment of our payload, so we keep
+    our hands off it. An arbitrary foreign string would pass this test far too
+    easily to prove anything.
+    """
+    nbox = _WS_RUN_RE.sub(" ", box).strip()
+    ntext = _WS_RUN_RE.sub(" ", text).strip()
+    return bool(nbox) and nbox in ntext
+
+
+def _clear_our_unsent_payload(pane_id: str, text: str,
+                              capture: Callable[[str], str],
+                              outcome: str) -> bool:
+    """Take our own unsubmitted payload back out of the composer (T-1062 DoD 7).
+
+    Positive evidence only, the same asymmetry the rest of this module runs on:
+    erring towards "left it there" is exactly today's behaviour, while erring
+    towards "wiped his writing" is not recoverable at all.
+
+      * outcome ``dialog`` -- the rune belongs to a prompt, not to a composer.
+        ``C-u`` there would ANSWER it. Never touch.
+      * the box holds anything that is not a fragment of our payload -- his, or
+        his with ours inside it. Never touch, and say so in the log.
+      * otherwise clear it with the existing row-aware drain (T-0978) and
+        record WHAT was cleared: length and opening characters, not the text.
+        Clearing someone's composer without a trace is the very thing this
+        ticket spent a day objecting to.
+    """
+    if outcome == "dialog":
+        return False
+    try:
+        from bot_squad_worker import composer_watch
+        buf = capture(pane_id)
+        if composer_watch.looks_like_dialog(buf):
+            return False
+        box = composer_watch.composer_text(buf) or ""
+    except Exception:  # noqa: BLE001 -- a capture hiccup is not a licence to type
+        return False
+    if not box.strip():
+        return False
+    if not _looks_like_our_payload(box, text):
+        log.warning("input_mux: %s did not submit, and the composer holds %d "
+                    "chars that are NOT a fragment of our payload — leaving it "
+                    "untouched; the batch is requeued (T-1062 DoD 7)",
+                    pane_id, len(box))
+        return False
+    _drain_leftover_rows(pane_id, capture)
+    try:
+        left = composer_watch.composer_text(capture(pane_id)) or ""
+    except Exception:  # noqa: BLE001
+        left = ""
+    log.warning("input_mux: %s did not submit; took our own unsent payload back "
+                "out of the composer (%d chars, starts %r) so one failed "
+                "delivery cannot lock this lane for good — the batch is "
+                "requeued. Composer is now %s (T-1062 DoD 7)",
+                pane_id, len(box), box[:40],
+                "empty" if not left.strip() else "STILL NOT EMPTY")
+    return not left.strip()
+
+
 def _deliver_to_pane(pane_id: str, text: str, *,
                      capture: Callable[[str], str] | None = None) -> None:
     """Deliver a (possibly multi-line) payload as ONE composer message.
@@ -571,6 +644,12 @@ def _deliver_to_pane(pane_id: str, text: str, *,
                                 was_generating=was_generating)
     if outcome == "cleared":
         return
+    # T-1062 DoD 7: the batch is requeued below, so nothing is LOST -- but what
+    # we typed is still sitting in the box, and it is REAL text, not the faint
+    # echo. No ghost detector will ever open a gate over it, and it should not:
+    # that is how one failed delivery turns a recoverable stall into a
+    # permanent one. Clean up after ourselves before handing the failure on.
+    _clear_our_unsent_payload(pane_id, text, capture, outcome)
     raise DeliveryNotConfirmed(
         f"composer for {pane_id} did not confirm the payload submitted "
         f"(outcome={outcome})")

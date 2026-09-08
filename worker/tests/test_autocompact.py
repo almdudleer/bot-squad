@@ -62,6 +62,12 @@ def test_composer_ready_verdicts_unchanged_when_a_sid_is_passed():
                 is A.composer_ready(buf))
 
 
+# T-1062: the two fixtures below render the status line on its OWN row,
+# because that is what a real pane does — measured 2026-09-08, five panes,
+# 75s of live generation: wherever the marker appeared it was exactly two
+# rows below the composer, never on it and never above it. The region rule
+# in `composer_ready` reads that difference, so a one-line fixture would be
+# testing a screen that does not exist.
 def test_composer_ready_logs_a_debounced_skip_naming_the_reason(caplog):
     from bot_squad_worker import recycle_gate
     recycle_gate._last_skip_log.clear()
@@ -69,7 +75,7 @@ def test_composer_ready_logs_a_debounced_skip_naming_the_reason(caplog):
     # a permission dialog / stale render: no ❯ on screen
     assert A.composer_ready("[y/n]?", sid="S-alpha", now=1000.0) is False
     assert A.composer_ready("[y/n]?", sid="S-alpha", now=1000.1) is False  # same tick
-    assert A.composer_ready("❯ · Working… (esc to interrupt)",
+    assert A.composer_ready("❯ \n· Working… (esc to interrupt)",
                             sid="S-alpha", now=1035.0) is False  # window elapsed
     lines = [r.getMessage() for r in caplog.records
              if "not composer-ready" in r.getMessage()]
@@ -86,7 +92,7 @@ def test_composer_ready_logs_nothing_without_a_sid(caplog):
     recycle_gate._last_skip_log.clear()
     caplog.set_level("INFO")
     assert A.composer_ready("") is False
-    assert A.composer_ready("❯ (esc to interrupt)") is False
+    assert A.composer_ready("❯ \n(esc to interrupt)") is False
     assert [r for r in caplog.records if "composer-ready" in r.getMessage()] == []
     assert recycle_gate._last_skip_log == {}
 
@@ -522,3 +528,86 @@ def test_relaunch_survives_a_failed_role_carry(tmp_path, monkeypatch):
     # The successor is running, with its derived role — pre-T-0937 behaviour.
     succ = S._read_session_metadata(S._session_file(data, "p", new_sid))
     assert S._role_of(succ) == "user-conversation"
+
+
+# ---------------------------------------------------------------------------
+# T-1062: the marker counts only BELOW the composer
+# ---------------------------------------------------------------------------
+# Searching the WHOLE visible pane for the mid-generation marker made every
+# session that PRINTED it — a code quote, a report on this very defect, a page
+# of docs — judge itself busy and stop receiving mail while the text stayed on
+# screen. On 2026-09-07 that silenced the fleet's only alarm handler for two
+# hours, and it silenced him BECAUSE he was diagnosing it.
+#
+# The discriminator is structural: Claude Code paints its status line below the
+# input box, everything the session says scrolls above it. Assembled in pieces
+# below so this file cannot spring the trap on whoever displays it.
+
+_MARK = "e" "sc to int" "errupt"
+_RULE = "─" * 40
+
+
+def _pane(*, above="", draft=" ", footer=""):
+    """A pane the way tmux hands it over: output, the composer box, the footer."""
+    return "\n".join([above, _RULE, "❯ " + draft, _RULE, footer])
+
+
+def test_t1062_a_quoted_marker_above_the_composer_is_not_generation():
+    # The whole ticket in one assertion: the session TALKED about the marker.
+    quoted = f"  the gate looks for '{_MARK}' in the captured pane"
+    assert A.composer_ready(_pane(above=quoted)) is True
+
+
+def test_t1062_a_real_generation_still_reads_as_busy():
+    # The control that can fail. Marker below the box = the renderer's own
+    # status line, and that must keep the gate shut exactly as before.
+    assert A.composer_ready(_pane(footer=f"· Working… ({_MARK})")) is False
+
+
+def test_t1062_a_marker_on_a_wrapped_second_footer_row_still_reads_as_busy():
+    # Narrow panes wrap the footer onto a second row (measured live: a footer
+    # carrying "↓ to manage" below the status line). Everything under the box
+    # is in scope, not just the first row under it.
+    footer = f"· Working… ({_MARK})\n  ⏵⏵ bypass permissions on · ↓ to manage"
+    assert A.composer_ready(_pane(footer=footer)) is False
+    # ...and the same when the wrap puts the marker on the LOWER row.
+    footer = f"· Working…\n  ({_MARK})"
+    assert A.composer_ready(_pane(footer=footer)) is False
+
+
+def test_t1062_a_multi_row_composer_box_does_not_hide_the_footer():
+    # T-0978: his draft can occupy several rows. The anchor is the LAST line
+    # that starts with the rune, so the rows of his draft stay above it and the
+    # status line below it is still seen.
+    buf = "\n".join(["", _RULE, "❯ a draft that wrapped",
+                     "  onto a second row", _RULE, f"· Working… ({_MARK})"])
+    assert A.composer_ready(buf) is False
+
+
+def test_t1062_with_no_composer_line_the_old_whole_buffer_rule_stands():
+    # No line STARTS with the rune — a dialog, an alt-screen, a bash pane that
+    # merely mentions it. There is nothing to anchor on, so we keep the old
+    # rule by an explicit path rather than deciding against an empty region.
+    buf = f"the ❯ rune appears mid-line here\n· Working… ({_MARK})"
+    assert A.composer_ready(buf) is False
+
+
+def test_t1062_verdicts_still_match_with_and_without_a_sid():
+    # T-0864's invariant, re-checked over the new region rule.
+    for buf in (_pane(above=f"quoting {_MARK} in output"),
+                _pane(footer=f"· Working… ({_MARK})"),
+                f"no rune at all, just {_MARK}"):
+        assert (A.composer_ready(buf, sid="S-alpha", now=1000.0)
+                is A.composer_ready(buf))
+
+
+def test_t1062_a_marker_split_by_a_narrow_panes_wrap_still_reads_as_busy():
+    # A 24-column pane wraps the status line mid-word, and the marker then
+    # matches no single row. Measured live 2026-09-08: the pre-T-1062 code
+    # called that visibly-generating pane deliverable. Rejoining the rows can
+    # only ever close this gate, so the narrow case costs nobody their draft.
+    split = f"· Working… ({_MARK[:9]}\n{_MARK[9:]})"
+    assert A.composer_ready(_pane(footer=split)) is False
+    # The same wrap ABOVE the box is still the session's own output, not
+    # generation — the region rule decides that before the rejoin is tried.
+    assert A.composer_ready(_pane(above=split)) is True

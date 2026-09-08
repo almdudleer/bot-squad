@@ -200,6 +200,54 @@ def compact_due(level: str, fired_at: dict, now: float, cooldown: int | None = N
         return True
 
 
+_COMPOSER_RUNE = "❯"
+
+
+def _below_the_composer(buf: str) -> str | None:
+    """The slice of the pane BELOW the live composer, or None when there is no
+    composer line to measure from.
+
+    T-1062. The mid-generation marker was searched for across the WHOLE visible
+    pane, so any session that merely PRINTED it — a quote of this code, a
+    report about this defect, a page of documentation — judged itself busy and
+    stopped receiving mail for as long as the text stayed on screen. Diagnosing
+    the trap sprang it: that is how the only alarm handler on the fleet went
+    silently blind for two hours on 2026-09-07.
+
+    The escape is structural, not a blacklist. Claude Code draws its status
+    line BELOW the input box, while everything the session says scrolls ABOVE
+    it — so the two are different REGIONS, not different strings, and a
+    predicate anchored on the region stops depending on what the session is
+    talking about. Measured 2026-09-08 over live panes: wherever the marker was
+    present it sat below the last composer line, never above.
+
+    Returns None when no line STARTS with the composer rune — a bash pane, a
+    dialog, an alt-screen. There is nothing to anchor to, so the caller keeps
+    the old whole-buffer rule rather than deciding against an empty region.
+    """
+    anchor = None
+    lines = buf.splitlines()
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith(_COMPOSER_RUNE):
+            anchor = i
+    if anchor is None:
+        return None
+    return "\n".join(lines[anchor + 1:])
+
+
+def _says_generating(text: str) -> bool:
+    """True when the mid-generation marker is on screen in ``text``.
+
+    A narrow pane WRAPS the status line, and the marker then matches no single
+    row — measured 2026-09-08 on a 24-column pane, where the pre-T-1062 code
+    called a pane that was visibly generating deliverable. Rejoining the rows
+    catches the wrapped spelling; it can only ever CLOSE this gate, never open
+    it, so the narrow case cannot cost anyone their draft.
+    """
+    low = text.lower()
+    return "esc to interrupt" in low or "esc to interrupt" in low.replace("\n", "")
+
+
 def composer_ready(buf: str, *, sid: str | None = None,
                    now: float | None = None) -> bool:
     """True when the captured pane buffer shows the composer ready for input.
@@ -207,6 +255,9 @@ def composer_ready(buf: str, *, sid: str | None = None,
     The ``❯`` rune is rendered by Claude Code's input box only when it accepts
     keystrokes (T-0126). A mid-generation pane shows an "esc to interrupt"
     marker — never /compact then, even if a stale ``❯`` lingers in scrollback.
+    That marker counts only BELOW the composer (T-1062, see
+    :func:`_below_the_composer`): above it is the session's own output, and
+    reading a QUOTE of the marker as generation silenced whole sessions.
 
     T-0864: pass ``sid`` (and the tick's ``now``) from a RECYCLE path to get one
     debounced INFO line naming which of the two reasons deferred this tick — a
@@ -223,7 +274,11 @@ def composer_ready(buf: str, *, sid: str | None = None,
                                 "(empty capture, or a dialog/alt-screen over it)",
                                 now)
         return False
-    if "esc to interrupt" in buf.lower():
+    # T-1062: only the region BELOW the composer counts — the session's own
+    # output can quote this marker, and reading that as generation is what
+    # made every discussion of this gate silence the session discussing it.
+    below = _below_the_composer(buf)
+    if _says_generating(buf if below is None else below):
         _log_not_composer_ready(sid, "pane is mid-generation "
                                 "('esc to interrupt' on screen)", now)
         return False

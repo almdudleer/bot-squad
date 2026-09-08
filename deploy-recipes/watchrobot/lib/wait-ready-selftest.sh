@@ -122,8 +122,12 @@ assert "F unreachable public URL times out" 10 30 \
 # returns 200 even when the backend is dead (measured: `/__wr_selftest_404__`
 # -> 200, `/api/__wr_selftest_404__` -> 404), which is exactly why the public
 # gate probes /api/version and not /.
+# T-1079 (2026-09-08): signal-staging.dev.uzinvestapi.com is retired — any live
+# reachable host works here (the assertion is about the 404, not the hostname),
+# so this now uses the kept staging alias to stay reachable once traefik drops
+# the old name (a different ticket step, not yet done as of this edit).
 assert "G public 404 is not READY" 10 30 \
-    bash "$GATE" public "https://signal-staging.dev.uzinvestapi.com/api/__wr_selftest_404__" 8 selftest-G
+    bash "$GATE" public "https://watchrobot-dev.nolim.finance/api/__wr_selftest_404__" 8 selftest-G
 
 # ── usage errors ─────────────────────────────────────────────────────────────
 assert "H no args is a usage error" 64 10 bash "$GATE"

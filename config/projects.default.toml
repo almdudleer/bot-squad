@@ -26,11 +26,21 @@ topic_abbrev  = "WR"
 # staging domain). This SUPERSEDES the 2026-05-19 decision to keep the slug
 # `signal-tracker` while only the home dir carried the brand — the data dir
 # moved data/signal-tracker → data/watchrobot and a ~30-day /p/signal-tracker
-# redirect covers stale links (App.tsx). The DEPLOY INFRA below is deliberately
-# RETAINED as-is: prod/staging/dev URLs (signal-*.dev.uzinvestapi.com) and the
-# docker service/container names (signal-tracker-staging in deploy/staging.sh)
-# point at watchrobot's real running deployment — renaming those is a separate
-# external-infra task, NOT T-0189.
+# redirect covers stale links (App.tsx). The docker service/container names
+# (signal-tracker-staging in deploy/staging.sh) are unaffected by this file —
+# renaming those is a separate external-infra task, NOT T-0189.
+#
+# T-1079 (2026-09-08): the "DEPLOY INFRA below is deliberately RETAINED as-is"
+# deferral this comment used to make is SUPERSEDED — stakeholder verbatim:
+# "старые имена все везде гасим, никому на них ходить не надо будет". The
+# uzinvestapi hosts below are retired product-wide; prod/staging/dev_url are
+# updated to match. ⛔ This edit is DEAD ON ARRIVAL for THIS install and any
+# install that already has a live config/projects.toml — registry.resolve()
+# (T-0878) only ever reads this tracked seed on an install's first boot, never
+# again. The live values for this install were fixed directly in
+# /home/www/bot-squad/config/projects.toml (git-ignored, install-owned — see
+# that file's own T-1079 comment for the backup/measurement record). This edit
+# exists only so a FUTURE fresh install doesn't seed itself with dead hosts.
 # Dev clone: where agents work. On the deploy_branch (bot_squad/dev), pushes
 # to staging on every deploy queue.
 repo_path     = "/home/almdudleer/watchrobot/dev"
@@ -49,18 +59,14 @@ repo_master   = "/home/almdudleer/watchrobot/master"
 repo_deploy   = "/home/almdudleer/watchrobot/deploy"
 deploy_branch = "bot_squad/dev"
 master_branch = "master"
-# RETAINED (external infra — see note above): real deployment URLs. These
-# are the recipe/smoke-test URLs (prod.sh polls prod_url's /api/version) and
-# stay pinned to the .uzinvestapi.com hosts the deploy tooling has always
-# used. T-0201 (2026-07-06): the REAL prod host is a single `signal-tracker`
-# container, traefik-routed, that answers on FOUR hostnames — this alias
-# plus watchrobot.${DOMAIN}, terminal.nolim.finance (full app), and
-# watchrobot.nolim.finance (news-only render) — see docker-compose.yml's
-# traefik router rule for signal-tracker. There is no separate prod host per
-# vanity domain; they're all the same container/deploy.
-prod_url      = "https://signal-tracker.dev.uzinvestapi.com"
-staging_url   = "https://signal-staging.dev.uzinvestapi.com"
-dev_url       = "https://signal-dev.dev.uzinvestapi.com"
+# T-0201 (2026-07-06): the REAL prod host is a single `signal-tracker`
+# container, traefik-routed, that answers on several hostnames — there is no
+# separate prod host per vanity domain, they're all the same container/deploy;
+# see docker-compose.yml's traefik router rule. T-1079 (2026-09-08): pinned to
+# the surviving product hosts (see the block comment above this section).
+prod_url      = "https://watchrobot.nolim.finance"
+staging_url   = "https://watchrobot-dev.nolim.finance"
+dev_url       = "https://watchrobot-dev.nolim.finance"
 deploy_targets = ["staging", "prod"]
 tg_chat       = "404580642"
 created_at    = 2026-05-10

@@ -72,7 +72,11 @@ DEPLOY_BRANCH="bot_squad/dev"
 
 APP_CONTAINER="signal-tracker-staging"
 APP_INTERNAL_URL="http://localhost:8000/api/version"
-APP_PUBLIC_URL="https://signal-staging.dev.uzinvestapi.com/api/version"
+# T-1079 (2026-09-08): signal-staging.dev.uzinvestapi.com retired along with
+# its nolim.finance alias watchrobot-staging.nolim.finance — same upstream as
+# watchrobot-dev.nolim.finance, confirmed live (/api/version returns the same
+# v0.6.1-staging on all three).
+APP_PUBLIC_URL="https://watchrobot-dev.nolim.finance/api/version"
 STT_CONTAINER="stt"
 STT_INTERNAL_URL="http://localhost:8003/health"
 

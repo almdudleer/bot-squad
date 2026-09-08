@@ -1055,3 +1055,149 @@ def test_an_unknown_wake_earns_no_quiet_from_T0979(tmp_path, monkeypatch):
         A._action_inject_input({"sid": sid, "text": B.MAIL_SIGNAL})
 
     assert len(delivered) == 2
+
+
+# ---------------------------------------------------------------------------
+# T-1062: the gate must ask the renderer whether the "draft" is its own echo
+# ---------------------------------------------------------------------------
+# Claude Code paints the dim replay of the last message delivered to a pane
+# into the composer itself. `user_is_typing` reads that echo as a half-typed
+# draft and defers -- and since every delivery repaints the echo, the deferral
+# never ages out: the session goes silently and permanently blind. Measured
+# live 2026-09-07/08 on four panes (T-1062 Context): the detector answered
+# "my own faint text, the box is empty" while this gate still said busy,
+# because `deliverable(buf)` could not ask it -- no pane in its signature.
+#
+# The rule is deliberately ONE-SIDED: we open on POSITIVE evidence only. `None`
+# (cannot tell) and `False` defer exactly as before, because typing over his
+# half-written message is worse than being late (T-0930, stakeholder).
+
+
+def _ghost_answering(monkeypatch, verdict, seen=None):
+    """Pin the renderer's answer, recording which pane was asked."""
+    def _fake(pane_id, capture_ansi=None):
+        if seen is not None:
+            seen.append(pane_id)
+        return verdict
+    monkeypatch.setattr(input_mux, "_composer_is_ghost", _fake)
+
+
+def test_t1062_gate_opens_over_the_renderers_own_faint_echo(monkeypatch):
+    # ARM A. The composer shows text, but the renderer says it painted it.
+    _ghost_answering(monkeypatch, True)
+    assert input_mux.deliverable(_BUF_PARKED, pane_id="%1") is True
+
+
+def test_t1062_gate_still_defers_over_real_typed_text(monkeypatch):
+    # ARM B, the control that makes ARM A mean something: the renderer says
+    # this is NOT its own text, so it is his -- and his text is untouchable.
+    _ghost_answering(monkeypatch, False)
+    assert input_mux.deliverable(_BUF_TYPING, pane_id="%1") is False
+
+
+def test_t1062_gate_defers_when_the_renderer_cannot_say(monkeypatch):
+    # Tri-state, third branch. Absence of evidence is NOT evidence of absence:
+    # `None` must behave exactly like the pre-T-1062 rule.
+    _ghost_answering(monkeypatch, None)
+    assert input_mux.deliverable(_BUF_PARKED, pane_id="%1") is False
+
+
+def test_t1062_a_ghost_does_not_override_mid_generation(monkeypatch):
+    # The typing lock is not the only lock. A pane that is producing output
+    # stays busy no matter what the composer holds.
+    _ghost_answering(monkeypatch, True)
+    assert input_mux.deliverable(_BUF_BUSY, pane_id="%1") is False
+
+
+def test_t1062_without_a_pane_the_decision_is_byte_for_byte_the_old_one(monkeypatch):
+    # Callers with no pane keep the old behaviour, by an explicit path: the
+    # detector is never even consulted.
+    asked: list[str] = []
+    _ghost_answering(monkeypatch, True, seen=asked)
+    assert input_mux.deliverable(_BUF_PARKED) is False
+    assert input_mux.deliverable(_BUF_EMPTY) is True
+    assert asked == []
+
+
+def test_t1062_flush_hands_the_pane_to_the_gate(tmp_path, monkeypatch):
+    # End to end on the queued lane: this is the path that went blind. The
+    # pane was in `flush`'s hand all along (`pane_lookup` one line above the
+    # gate) and simply never reached the detector.
+    sid = "S-almdudleer-target-p785"
+    asked: list[str] = []
+    _ghost_answering(monkeypatch, True, seen=asked)
+    delivered: list[str] = []
+
+    input_mux.enqueue(tmp_path, sid, "the alarm nobody heard", "S-routine-handler")
+    res = input_mux.flush(tmp_path, sid,
+                          pane_lookup=lambda s: "%785",
+                          capture=lambda p: _BUF_PARKED,
+                          deliver=lambda p, t: delivered.append(t))
+
+    assert asked == ["%785"]           # the gate asked about the RIGHT pane
+    assert res["delivered"] == 1
+    assert "the alarm nobody heard" in delivered[0]
+    assert input_mux.read_queue(tmp_path, sid) == []
+
+
+def test_t1062_flush_leaves_a_real_draft_alone(tmp_path, monkeypatch):
+    # The same path, control arm: nothing is typed and the queue is intact,
+    # so a later flush still has the payload once he submits.
+    sid = "S-almdudleer-target-p786"
+    _ghost_answering(monkeypatch, False)
+    delivered: list[str] = []
+
+    input_mux.enqueue(tmp_path, sid, "must wait", "S-routine-handler")
+    res = input_mux.flush(tmp_path, sid,
+                          pane_lookup=lambda s: "%786",
+                          capture=lambda p: _BUF_TYPING,
+                          deliver=lambda p, t: delivered.append(t))
+
+    assert res["deferred"] is True
+    assert res["reason"] == "composer_busy"
+    assert delivered == []
+    assert len(input_mux.read_queue(tmp_path, sid)) == 1
+
+
+def _direct_lane_stubs(monkeypatch, typed):
+    """Neutralise everything past the wait so the test measures the WAIT."""
+    monkeypatch.setattr(input_mux, "_draft_swap_enabled", lambda: False)
+    monkeypatch.setattr(input_mux, "_type_lines",
+                        lambda pane_id, text, capture=None: typed.append(text)
+                        or input_mux.DirectDelivery(1, "cleared"))
+    monkeypatch.setattr(input_mux, "_DIRECT_GATE_TIMEOUT_SEC", 0.6)
+    monkeypatch.setattr(input_mux, "_DIRECT_GATE_POLL_INTERVAL_SEC", 0.05)
+
+
+def test_t1062_direct_lane_does_not_wait_out_a_ghost(tmp_path, monkeypatch):
+    # The direct lane's wait is bounded, so a ghost never blacked it out --
+    # but it burned the full timeout on every nudge to a pane that had
+    # received mail, and then walked into the draft-swap path that once made
+    # a ghost REAL. Positive evidence ends the wait immediately.
+    typed: list[str] = []
+    _direct_lane_stubs(monkeypatch, typed)
+    _ghost_answering(monkeypatch, True)
+
+    started = time.monotonic()
+    res = input_mux.deliver_direct(tmp_path, "S-almdudleer-target-p787", "%787",
+                                   "wake up", capture=lambda p: _BUF_PARKED)
+    elapsed = time.monotonic() - started
+
+    assert typed == ["wake up"]
+    assert res.lines == 1
+    assert elapsed < input_mux._DIRECT_GATE_TIMEOUT_SEC
+
+
+def test_t1062_direct_lane_still_waits_out_real_typed_text(tmp_path, monkeypatch):
+    # The control. His half-written message must still buy the full bounded
+    # wait -- this arm is what makes the arm above mean something.
+    typed: list[str] = []
+    _direct_lane_stubs(monkeypatch, typed)
+    _ghost_answering(monkeypatch, False)
+
+    started = time.monotonic()
+    input_mux.deliver_direct(tmp_path, "S-almdudleer-target-p788", "%788",
+                             "wake up", capture=lambda p: _BUF_TYPING)
+    elapsed = time.monotonic() - started
+
+    assert elapsed >= input_mux._DIRECT_GATE_TIMEOUT_SEC

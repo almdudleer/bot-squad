@@ -164,13 +164,44 @@ def user_is_typing(buf: str) -> bool:
     return bool(live.strip())
 
 
-def deliverable(buf: str) -> bool:
-    """True when it is safe to inject: composer ready AND user not mid-typing.
+def _typing_blocks(buf: str, pane_id: str | None = None) -> bool:
+    """True when the composer holds text we must not type over.
 
-    Reuses :func:`autocompact.composer_ready` (the ``❯`` rune, no mid-generation
-    "esc to interrupt" marker) and adds the live-typing guard.
+    :func:`user_is_typing` judges the composer by its TEXT — and Claude Code
+    paints its OWN faint suggestion (the dim replay of the last message
+    delivered to this pane) into that very place, T-0962. Read as a draft, that
+    echo holds the delivery gate shut for as long as it is on screen, and
+    because every delivery repaints it, it never ages out: the blackout feeds
+    itself. T-1062 measured that live on four panes on 2026-09-07/08 — the
+    detector said "my own suggestion, the box is empty" while this gate still
+    said busy, because nobody asked it.
+
+    ``pane_id`` is what lets us ask instead of guess, and the answer is
+    tri-state. We act on ONE branch of it: a POSITIVE "this is the renderer's
+    own faint text" clears the gate; ``None`` (cannot tell) and ``False`` defer
+    exactly as before. Opening on the ABSENCE of evidence would type over his
+    half-written message, and losing that is worse than being late — «только не
+    надо ее компактить, когда у меня текст во вводе» (stakeholder, T-0930).
     """
-    return composer_ready(buf) and not user_is_typing(buf)
+    if not user_is_typing(buf):
+        return False
+    if pane_id and _composer_is_ghost(pane_id) is True:
+        log.info("input_mux: %s's composer holds only Claude Code's own faint "
+                 "suggestion — the box is empty, delivering (T-1062)", pane_id)
+        return False
+    return True
+
+
+def deliverable(buf: str, *, pane_id: str | None = None) -> bool:
+    """True when it is safe to inject: composer ready AND nothing to type over.
+
+    Reuses :func:`autocompact.composer_ready` (the composer rune, no
+    mid-generation marker) and adds the live-typing guard. Pass ``pane_id`` —
+    every production caller has one in hand — so the guard can tell his draft
+    from the renderer's own faint echo (:func:`_typing_blocks`). Without it the
+    decision is byte-for-byte the pre-T-1062 rule.
+    """
+    return composer_ready(buf) and not _typing_blocks(buf, pane_id)
 
 
 # ---------------------------------------------------------------------------
@@ -580,7 +611,16 @@ def deliver_direct(data_dir: Path | str, sid: str, pane_id: str, text: str, *,
         # BOT_SQUAD_INPUT_MUX=0 restores the exact legacy timing).
         if os.environ.get("BOT_SQUAD_INPUT_MUX") != "0":
             deadline = time.monotonic() + _DIRECT_GATE_TIMEOUT_SEC
-            while user_is_typing(capture(pane_id)):
+            # T-1062: `_typing_blocks`, not `user_is_typing` — waiting out the
+            # renderer's own faint echo buys nothing and costs the whole
+            # timeout on EVERY nudge to a pane that has received mail. Worse
+            # than the delay is where the timeout leads: straight into the
+            # draft-swap path, which once "restored" a ghost by TYPING it and
+            # parked real unsent text in four panes at once (T-0962). A ghost
+            # turned real locks the queued lane LEGITIMATELY, and no detector
+            # reopens that. His actual draft is unaffected: only a positive
+            # "this is my own faint text" skips the wait.
+            while _typing_blocks(capture(pane_id), pane_id):
                 if time.monotonic() >= deadline:
                     break
                 time.sleep(_DIRECT_GATE_POLL_INTERVAL_SEC)
@@ -1054,7 +1094,7 @@ def flush(data_dir: Path | str, sid: str, *,
             return {"delivered": 0, "deferred": True, "reason": "no_pane",
                     "pane": None}
 
-        if not deliverable(capture(pane)):
+        if not deliverable(capture(pane), pane_id=pane):
             return {"delivered": 0, "deferred": True, "reason": "composer_busy",
                     "pane": pane}
 
